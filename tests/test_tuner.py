@@ -292,9 +292,37 @@ def test_params_schema_serializes_groups() -> None:
     from src.server import params
 
     schema = params.public_schema({})
-    assert schema["schema"] == "toon-exposure-surface/1"
+    assert schema["schema"] == "toon-l0-surface/1"
     ids = [p["id"] for g in schema["groups"] for p in g["params"]]
     assert "color.exposure" in ids
+    assert {"glow.threshold", "glow.strength", "glow.size"} <= set(ids)
     exposure = next(p for g in schema["groups"] for p in g["params"] if p["id"] == "color.exposure")
     assert exposure["minimum"] == -10.0 and exposure["maximum"] == 10.0
+    assert [g["name"] for g in schema["groups"]] == ["曝光", "辉光"]
     assert isinstance(json.loads(json.dumps(schema)), dict)
+
+
+def test_glow_params_are_wired_to_glare_node() -> None:
+    """辉光参数写入后必须落到 Autocel_Glow 对应插座上。"""
+    fake = FakeBpy()
+    code = build_set_code({"glow.threshold": 2.5, "glow.strength": 0.4, "glow.size": 0.2})
+    payload = extract_marker(run_generated_code(code, fake), JSON_MARKER)
+    assert payload["glare"]["Threshold"] == pytest.approx(2.5)
+    assert payload["glare"]["Strength"] == pytest.approx(0.4)
+    assert payload["glare"]["Size"] == pytest.approx(0.2)
+    assert fake.glare_node.inputs.get("Threshold").default_value == pytest.approx(2.5)  # type: ignore[union-attr]
+
+
+def test_glow_enum_params_stay_strings() -> None:
+    fake = FakeBpy()
+    code = build_set_code({"glow.type": "Streaks", "glow.quality": "High"})
+    payload = extract_marker(run_generated_code(code, fake), JSON_MARKER)
+    assert payload["glare"]["Type"] == "Streaks"
+    assert payload["glare"]["Quality"] == "High"
+
+
+def test_missing_glare_node_reports_clear_error() -> None:
+    fake = FakeBpy()
+    fake.node_groups.pop("AI_Compositor")
+    with pytest.raises(RuntimeError, match="Autocel_Glow"):
+        run_generated_code(build_set_code({"glow.threshold": 1.0}), fake)

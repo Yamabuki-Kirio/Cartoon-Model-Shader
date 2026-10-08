@@ -7,7 +7,8 @@
 * 每个参数都声明了**类型、取值范围、绑定位置**；越界/未知 id 一律拒绝，不做静默兜底。
 * 绑定位置（``binding``）在服务端映射为固定的访问表达式，见 ``blender_ops``。
 
-MVP-02 首批只开放「曝光」组（``color.*``）；辉光组在基线恢复经重复测试通过后再加入。
+MVP-02 开放两组 L0「即时」参数：``color.*``（曝光）与 ``glow.*``（辉光）。
+曝光组先单独通过验证，再加入辉光组（见提交历史）。
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from typing import Any
 COMPOSITOR_GROUP_NAME = "AI_Compositor"
 GLARE_NODE_NAME = "Autocel_Glow"
 
-PARAM_SCHEMA_VERSION = "toon-exposure-surface/1"
+PARAM_SCHEMA_VERSION = "toon-l0-surface/1"
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class ParamSpec:
 
 
 GROUP_EXPOSURE = "曝光"
+GROUP_GLOW = "辉光"
 
 
 EXPOSURE_PARAMS: tuple[ParamSpec, ...] = (
@@ -131,8 +133,79 @@ EXPOSURE_PARAMS: tuple[ParamSpec, ...] = (
     ),
 )
 
-# 全部参数（MVP-02 首批 = 曝光组）
-ALL_PARAMS: tuple[ParamSpec, ...] = EXPOSURE_PARAMS
+GLOW_PARAMS: tuple[ParamSpec, ...] = (
+    ParamSpec(
+        id="glow.threshold",
+        group=GROUP_GLOW,
+        label="辉光阈值",
+        type="float",
+        target="AI_Compositor › Autocel_Glow › Threshold",
+        binding="glare.Threshold",
+        minimum=0.0,
+        maximum=5.0,
+        step=0.01,
+        note="低于此亮度的像素不发辉光。调低 → 大面积泛白；调高 → 只有高光边缘发亮。",
+    ),
+    ParamSpec(
+        id="glow.strength",
+        group=GROUP_GLOW,
+        label="辉光强度",
+        type="float",
+        target="AI_Compositor › Autocel_Glow › Strength",
+        binding="glare.Strength",
+        minimum=0.0,
+        maximum=10.0,
+        step=0.01,
+        note="辉光整体叠加量，是过曝的主要来源之一。",
+    ),
+    ParamSpec(
+        id="glow.size",
+        group=GROUP_GLOW,
+        label="辉光尺寸",
+        type="float",
+        target="AI_Compositor › Autocel_Glow › Size",
+        binding="glare.Size",
+        minimum=0.0,
+        maximum=1.0,
+        step=0.01,
+        note="辉光扩散半径。调大 → 整幅蒙纱感；0.5 以上取值范围在 5.x 未系统标定。",
+    ),
+    ParamSpec(
+        id="glow.type",
+        group=GROUP_GLOW,
+        label="辉光类型",
+        type="enum",
+        target="AI_Compositor › Autocel_Glow › Type",
+        binding="glare.Type",
+        options=("Bloom", "Ghosts", "Streaks", "FogGlow", "SimpleStar"),
+        note="辉光算法。Bloom 为源工程所用，视作风格基线，一般不建议改。",
+    ),
+    ParamSpec(
+        id="glow.quality",
+        group=GROUP_GLOW,
+        label="辉光质量",
+        type="enum",
+        target="AI_Compositor › Autocel_Glow › Quality",
+        binding="glare.Quality",
+        options=("Low", "Medium", "High"),
+        note="影响辉光柔度与耗时；High 明显变慢。与渲染采样数无关。",
+    ),
+    ParamSpec(
+        id="glow.smoothness",
+        group=GROUP_GLOW,
+        label="辉光平滑度",
+        type="float",
+        target="AI_Compositor › Autocel_Glow › Smoothness",
+        binding="glare.Smoothness",
+        minimum=0.0,
+        maximum=1.0,
+        step=0.01,
+        note="阈值附近的过渡柔度。",
+    ),
+)
+
+# 全部参数（MVP-02 = 曝光组 + 辉光组）
+ALL_PARAMS: tuple[ParamSpec, ...] = EXPOSURE_PARAMS + GLOW_PARAMS
 
 BY_ID: dict[str, ParamSpec] = {p.id: p for p in ALL_PARAMS}
 

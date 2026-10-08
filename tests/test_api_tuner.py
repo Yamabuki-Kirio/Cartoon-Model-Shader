@@ -166,6 +166,47 @@ def test_superseded_job_reports_terminal_status(tuner_client) -> None:
     assert first_body.get("result") is None
 
 
+def test_glow_params_preview_flow(tuner_client) -> None:
+    """加入辉光组后，同一套基线/草稿/预览/回滚链路仍然成立。"""
+    client, fake = tuner_client
+    client.post("/api/session/baseline")
+    submit = client.post(
+        "/api/preview",
+        json={
+            "draft": {
+                "glow.threshold": 1.8,
+                "glow.strength": 0.9,
+                "glow.size": 0.3,
+                "color.exposure": 0.25,
+            }
+        },
+    ).json()
+    job = wait_job(client, submit["job_id"])
+    assert job["status"] == "done", job.get("error")
+    applied = job["result"]["applied"]
+    assert applied["glow.threshold"] == pytest.approx(1.8)
+    assert applied["glow.strength"] == pytest.approx(0.9)
+    assert applied["glow.size"] == pytest.approx(0.3)
+    assert job["result"]["restore_verified"] is True
+    # 回滚后辉光插座回到基线值
+    assert fake.glare_node.inputs.get("Threshold").default_value == pytest.approx(1.1)  # type: ignore[union-attr]
+
+
+def test_glow_out_of_range_and_bad_enum_rejected(tuner_client) -> None:
+    client, _ = tuner_client
+    client.post("/api/session/baseline")
+    for payload in (
+        {"draft": {"glow.threshold": -1}},
+        {"draft": {"glow.size": 2}},
+        {"draft": {"glow.strength": "1.0"}},
+        {"draft": {"glow.type": "SuperNova"}},
+        {"draft": {"glow.quality": "Ultra"}},
+    ):
+        response = client.post("/api/preview", json=payload)
+        assert response.status_code == 400, payload
+        assert response.json()["error"]["code"] == "PARAM_INVALID"
+
+
 def test_disconnected_blender_yields_error_envelope() -> None:
     """Blender 不在时，预览提交应给出可重试的错误而不是崩溃。"""
     from tests.fake_mcp_server import find_free_port
