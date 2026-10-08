@@ -16,7 +16,7 @@ MMD 刚入门，渲染水平很低，见谅。只用于自用。
 |---|---|
 | 平台 | 仅 Windows |
 | 界面 | 普通浏览器打开本地 Web UI，不封装桌面程序 |
-| Blender 通信 | 直接复用现有 Blender MCP `127.0.0.1:9876` 行分隔 JSON 接口，**不另装通信插件** |
+| Blender 通信 | 直接复用现有 Blender MCP `127.0.0.1:9876` TCP JSON 接口（请求以换行结束；**响应不带分隔符，需累积缓冲 + 增量解析**），**不另装通信插件** |
 | 常驻会话 | 复用同一个 Blender 会话，参数改动只触发重渲，不重启进程（冷启动约 5 秒是大头） |
 | 无污染预览 | 每次预览**从内存基线恢复后应用完整草稿**，不在上一次结果上叠加 |
 | 等待方式 | **不使用固定 `sleep`**；以任务 ID + 状态查询 / 推送等待 Blender 完成 |
@@ -33,7 +33,7 @@ MMD 刚入门，渲染水平很低，见谅。只用于自用。
 │  · 中央预览 / A-B     │                       │  · 预设 / 缩略图 / 运行记录│
 │  · Cel 色阶编辑器     │                       │  · 推送状态与最新预览图    │
 └─────────────────────┘                       └────────────┬─────────────┘
-                                                           │ 行分隔 JSON
+                                                           │ TCP JSON
                                                            │ 127.0.0.1:9876
                                               ┌────────────▼─────────────┐
                                               │   Blender（常驻会话）      │
@@ -66,13 +66,30 @@ MMD 刚入门，渲染水平很低，见谅。只用于自用。
 
 ```
 Cartoon-Model-Shader/
-├── docs/                  设计与需求文档
-│   └── 需求文档.md
-├── reference/             参考数据（参数面 schema 等）
-│   └── 参数面清单.json
+├── docs/                            设计与需求文档
+│   ├── 需求文档.md
+│   ├── 技术设计.md
+│   ├── 安全检查.md
+│   └── AI交付_第一步实施方案.md        MVP-01 任务书
+├── reference/                       参考数据（参数面 schema 等）
+│   ├── 参数面清单.json
+│   ├── 一键卡通渲染.py
+│   ├── 一键渲染_通用驱动.py
+│   └── 审计_本次执行.md
 ├── src/
-│   ├── server/            本地控制服务（HTTP + WebSocket）
-│   └── web/               浏览器前端
+│   ├── server/                      本地控制服务（FastAPI）
+│   │   ├── app.py                   路由 + 静态托管
+│   │   ├── config.py                非敏感配置（仅回环）
+│   │   ├── blender_mcp.py           TCP JSON 客户端
+│   │   ├── scene_probe.py           只读探针模板 + 解析
+│   │   ├── models.py                API 模型
+│   │   ├── errors.py                稳定错误码
+│   │   └── redact.py                诊断脱敏
+│   └── web/                         浏览器前端（原生 HTML/CSS/JS）
+├── tests/                           假 MCP + pytest 用例
+├── config.example.json
+├── requirements.txt
+├── pytest.ini
 └── README.md
 ```
 
@@ -83,10 +100,64 @@ Cartoon-Model-Shader/
   → 自动预览 → 恢复基线 → 保存预设
 ```
 
+## 本地运行（MVP-01 · 只读连接闭环）
+
+本阶段只做一件事：**在浏览器里确认能连上 Blender，并只读展示当前工程与场景摘要**。
+不修改场景、不调参、不渲染、不保存、不导入；不提供任何接受任意 Python 的接口。
+
+### 安装与启动
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn src.server.app:app --host 127.0.0.1 --port 8765
+```
+
+浏览器打开 <http://127.0.0.1:8765>。需要 Python 3.11+。
+
+### 配置
+
+复制 `config.example.json` 为 `config.local.json`（已被 `.gitignore` 排除）按需覆盖 host / port / 超时。
+服务与 MCP 客户端都**只允许连回环地址**，配置成远程地址会被直接拒绝。
+
+环境变量可覆盖：`TOON_TUNER_MCP_HOST`、`TOON_TUNER_MCP_PORT`、`TOON_TUNER_MCP_CONNECT_TIMEOUT`、
+`TOON_TUNER_MCP_RESPONSE_TIMEOUT`、`TOON_TUNER_SERVER_HOST`、`TOON_TUNER_SERVER_PORT`。
+
+### 测试
+
+```powershell
+pytest
+```
+
+测试使用内置假 MCP 服务，**不需要安装 Blender**。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/health` | 仅检查本地控制服务 |
+| GET | `/api/blender/status` | 快速探测端口与协议（始终 200，用 `status` 区分） |
+| GET | `/api/blender/scene` | 执行完整只读场景探针 |
+| POST | `/api/blender/reconnect` | 重置连接状态并立即重新检测 |
+
+`status` 取值：`connected` / `disconnected` / `timeout` / `protocol_error` / `blender_error`。
+
+### 常见问题
+
+| 现象 | 处理 |
+|---|---|
+| 页面显示「未连接」 | 确认 Blender 已打开，并在插件面板里启动了 MCP 服务（监听 9876） |
+| 显示「连接超时」 | Blender 可能正忙（例如正在渲染）；空闲后点「重新连接」 |
+| 显示「协议错误」 | 9876 端口可能被别的程序占用；确认是本工具的 Blender MCP |
+| 显示「Blender 执行错误」 | 只读探针在 Blender 内失败；确认当前场景状态后重试 |
+| 页面打不开 | 确认 uvicorn 已在 8765 运行 |
+
 ## 开发状态
 
 - [x] 需求文档定稿
 - [x] 仓库初始化
+- [x] **MVP-01：只读连接闭环** —— 连接 9876 → 读当前场景 → 展示连接状态与场景摘要 → 断线重连（不改动任何 Blender 数据）
 - [ ] 最小闭环：连接 → 读场景 → 建立基线 → 调整 L0 → 自动预览 → 恢复基线 → 保存预设
 - [ ] Cel 色阶编辑器（7 组）
 - [ ] 严格材质匹配与手工归类

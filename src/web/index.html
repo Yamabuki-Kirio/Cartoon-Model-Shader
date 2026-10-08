@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cartoon-Model-Shader · 连接检测（MVP-01）</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="page-header">
+    <h1>Cartoon-Model-Shader</h1>
+    <p class="subtitle">MVP-01 · 只读连接检测：确认浏览器 → 本地服务 → Blender MCP 三层可靠通信</p>
+  </header>
+
+  <main>
+    <section class="card" id="connection-card">
+      <div class="status-line">
+        <span class="dot dot-checking" id="status-dot" aria-hidden="true"></span>
+        <span class="status-text" id="status-text">正在检测…</span>
+      </div>
+      <dl class="kv-grid">
+        <dt>Blender MCP</dt>
+        <dd id="target" class="mono">127.0.0.1:9876</dd>
+        <dt>最近检测</dt>
+        <dd id="checked-at">—</dd>
+        <dt>响应耗时</dt>
+        <dd id="latency">—</dd>
+      </dl>
+      <p class="hint" id="status-hint"></p>
+      <div class="actions">
+        <button type="button" id="reconnect-btn" class="primary">重新连接</button>
+        <button type="button" id="refresh-scene-btn">刷新场景</button>
+      </div>
+    </section>
+
+    <section class="card card-error hidden" id="error-card">
+      <h2>需要处理</h2>
+      <p class="error-message" id="error-message"></p>
+      <p class="hint" id="error-hint"></p>
+      <details>
+        <summary>技术细节</summary>
+        <dl class="kv-grid">
+          <dt>错误码</dt>
+          <dd id="error-code" class="mono"></dd>
+          <dt>可重试</dt>
+          <dd id="error-retryable"></dd>
+        </dl>
+      </details>
+    </section>
+
+    <section class="card hidden" id="blender-card">
+      <h2>Blender 与当前工程</h2>
+      <dl class="kv-grid">
+        <dt>版本</dt>
+        <dd id="b-version">—</dd>
+        <dt>当前文件</dt>
+        <dd id="b-file">—</dd>
+        <dt>保存状态</dt>
+        <dd id="b-saved">—</dd>
+        <dt>活动场景</dt>
+        <dd id="scene-name">—</dd>
+        <dt>渲染引擎</dt>
+        <dd id="scene-engine">—</dd>
+        <dt>当前相机</dt>
+        <dd id="scene-camera">—</dd>
+        <dt>分辨率</dt>
+        <dd id="scene-resolution">—</dd>
+        <dt>当前帧</dt>
+        <dd id="scene-frame">—</dd>
+      </dl>
+      <details>
+        <summary>诊断信息（含完整路径，仅供排错）</summary>
+        <dl class="kv-grid">
+          <dt>完整文件路径</dt>
+          <dd id="b-fullpath" class="mono">—</dd>
+        </dl>
+        <pre class="raw" id="raw-json"></pre>
+      </details>
+    </section>
+
+    <section class="card hidden" id="objects-card">
+      <h2>场景对象摘要</h2>
+      <div class="stats" id="object-stats"></div>
+      <h3>角色候选</h3>
+      <p class="muted">仅按「网格 + 有材质槽」筛选，按面数降序，最多 10 个；本阶段不自动决定目标。</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>对象名</th>
+              <th class="num">面数</th>
+              <th class="num">材质槽</th>
+              <th>可见</th>
+              <th>参与渲染</th>
+            </tr>
+          </thead>
+          <tbody id="candidates-body"></tbody>
+        </table>
+      </div>
+      <p class="muted hidden" id="candidates-empty">当前场景没有带材质槽的网格对象。</p>
+    </section>
+  </main>
+
+  <footer class="page-footer">
+    <span>只读模式：不修改场景、不渲染、不保存、不导入。</span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

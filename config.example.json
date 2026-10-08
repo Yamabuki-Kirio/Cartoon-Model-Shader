@@ -1,0 +1,12 @@
+{
+  "blender_mcp": {
+    "host": "127.0.0.1",
+    "port": 9876,
+    "connect_timeout_seconds": 1.5,
+    "response_timeout_seconds": 5.0
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765
+  }
+}

@@ -21,6 +21,12 @@ __pycache__/
 .venv/
 venv/
 env/
+*.egg-info/
+
+# ===== 测试产物 =====
+.pytest_cache/
+.coverage
+htmlcov/
 
 # ===== 构建 / 运行产物 =====
 dist/
