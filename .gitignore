@@ -1,0 +1,47 @@
+# ===== 操作系统 =====
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ===== 与本工程无关的大体积素材（防止误提交）=====
+*.mov
+*.mp4
+*.avi
+*.blend
+*.blend1
+*.vmd
+*.vpd
+*.pmx
+*.zip
+
+# ===== 依赖 =====
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# ===== 构建 / 运行产物 =====
+dist/
+build/
+out/
+*.log
+
+# ===== 工具运行时产物（预览图 / 临时基线 / 自动备份）=====
+runtime/
+previews/
+.backups/
+*.blend.backup.*
+
+# ===== 编辑器 / IDE =====
+.vscode/
+.idea/
+*.swp
+
+# ===== 密钥与本地配置（绝不入库）=====
+.env
+.env.*
+*.token
+*.secret
+config.local.*

@@ -1,0 +1,329 @@
+{
+  "schema": "toon-param-surface/1",
+  "generated_at": "2026-10-09T01:45:00+08:00",
+  "purpose": "供可视化调参工具消费：把「一键卡通渲染」管线的全部可调参数、取值来源、实测影响与重算代价结构化。",
+  "subject": {
+    "model": "哈尼娅",
+    "input_blend": "<MODEL_DIR>/哈尼娅.blend",
+    "input_sha256": "5b56dd1cb1f23bdf4beff526e95e4d3d44e5153f03ed8b510a2bb735e113efef",
+    "source_rig": "<SOURCE_RIG_DIR>/Sakura_1.blend",
+    "source_rig_sha256": "bec6fbbc32ed5309dc6fdaf0d7057178586d50913fb19b715f72cf1f29fa6f20",
+    "mesh": { "name": "model_mesh", "polygons": 35544, "material_slots": 19, "height_m": 1.527, "facing": "-Y" },
+    "resolution": [1080, 1980],
+    "engine": "BLENDER_EEVEE_NEXT",
+    "blender": "5.2.1 LTS",
+    "note": "MMD 语义化材质命名的模型；本次 19 个材质槽在严格模式下 100% 命中，未补任何规则。"
+  },
+
+  "budget": {
+    "unit": "second",
+    "measured": {
+      "full_run_two_samples": [8.0, 7.0],
+      "blender_internal_clock": {
+        "ocio_config_loaded": 0.031,
+        "blend_opened": 0.66,
+        "png_saved_at": 7.78
+      },
+      "compositor_change_plus_rerender": 0.75,
+      "six_variant_glow_sweep_wall": 4.5
+    },
+    "derived": {
+      "pipeline_setup_approx": 6.0,
+      "render_only_approx": 1.0,
+      "blender_cold_start_approx": 5.0
+    },
+    "determinism": {
+      "max_channel_delta_same_params": 2,
+      "fraction_pixels_differing": 0.000015,
+      "note": "同一套参数两次渲染，仅 ≤2/255、0.0015% 像素的 EEVEE 非确定性差异。参数→画面是可复现映射，适合做 A/B 调参。"
+    },
+    "key_implication": "渲染本身约 1 秒，瓶颈是 Blender 进程冷启动（约 5 秒）。调参工具必须常驻一个 Blender 会话，参数改动只触发重渲，不重启进程。"
+  },
+
+  "cost_tiers": {
+    "L0": { "label": "即时 — 只重跑合成器 + 渲染", "seconds": 1.3,
+            "how": "改节点 default_value 后重渲", "ui": "滑块拖动即时预览" },
+    "L1": { "label": "快 — 改共享节点组 / 物体属性后重渲", "seconds": 2.5,
+            "how": "Cel 色阶、描边线宽、世界强度、采样", "ui": "滑块释放后 2~3 秒出图" },
+    "L2": { "label": "中 — 需重建材质节点树", "seconds": 5.0,
+            "how": "贴图色彩空间、材质归类规则、分辨率", "ui": "点『应用』后带进度条" },
+    "L3": { "label": "慢 — 等同全量重跑", "seconds": 7.5,
+            "how": "重新追加源工程资源、灯光装置、相机、管线模式", "ui": "独立『重建』按钮，不与滑块混放" }
+  },
+
+  "provenance_legend": {
+    "source_saved": "源工程里的存盘值 —— 注意：存盘值不等于生效值（部分节点被上游旁路）",
+    "calibrated": "本机实测校正值，本次会话或既往跨模型实测得到",
+    "removed_in_5x": "源工程有、但 Blender 5.x 已不存在该接口，设置无效",
+    "hardcoded": "脚本内置常量，非源工程搬运"
+  },
+
+  "parameters": [
+
+    { "id": "glow.type", "group": "辉光", "label": "辉光类型", "cost": "L0",
+      "target": "compositor.Glare.Type", "type": "enum",
+      "enum": ["Bloom", "Ghosts", "Streaks", "FogGlow", "SimpleStar"],
+      "value_source": "Bloom", "value_calibrated": "Bloom", "provenance": "source_saved",
+      "effect": "辉光算法；Bloom 为源工程所用，视作风格基线，不建议改。", "evidence": "1009/_harness/glow_sweep.log" },
+
+    { "id": "glow.quality", "group": "辉光", "label": "辉光质量", "cost": "L0",
+      "target": "compositor.Glare.Quality", "type": "enum", "enum": ["Low", "Medium", "High"],
+      "value_source": "Medium", "value_calibrated": "Medium", "provenance": "source_saved",
+      "effect": "影响辉光柔度与耗时；High 明显变慢。", "warn": "与『渲染采样数』无关，别搞混。" },
+
+    { "id": "glow.threshold", "group": "辉光", "label": "辉光阈值", "cost": "L0",
+      "target": "compositor.Glare.Threshold", "type": "float", "range": [0.0, 5.0],
+      "value_source": 1.0, "value_calibrated": 1.5, "provenance": "calibrated",
+      "effect": "低于此亮度的像素不发辉光。调低 → 大面积泛白；调高 → 只有高光边缘发亮。",
+      "observed_effect": "1.0 时主体 51.4% 像素相对无辉光变化 >0.05（过曝）；1.5 时降到 7.3%。",
+      "observed_on": "哈尼娅", "evidence": "1009/_harness/glow/glow_*.png" },
+
+    { "id": "glow.smoothness", "group": "辉光", "label": "辉光平滑度", "cost": "L0",
+      "target": "compositor.Glare.Smoothness", "type": "float", "range": [0.0, 1.0],
+      "value_source": 0.1, "value_calibrated": 0.1, "provenance": "source_saved",
+      "effect": "阈值附近的过渡柔度。本次未调。" },
+
+    { "id": "glow.strength", "group": "辉光", "label": "辉光强度", "cost": "L0",
+      "target": "compositor.Glare.Strength", "type": "float", "range": [0.0, 10.0],
+      "value_source": 2.0, "value_calibrated": 1.0, "provenance": "calibrated",
+      "effect": "辉光整体叠加量。这是过曝的主因之一。",
+      "observed_effect": "2.0 → 1.0 后主体平均亮度 0.3106 → 0.2701。",
+      "observed_on": "哈尼娅", "evidence": "1009/_harness/glow/glow_*.png" },
+
+    { "id": "glow.size", "group": "辉光", "label": "辉光尺寸", "cost": "L0",
+      "target": "compositor.Glare.Size", "type": "float",
+      "range": [0.0, 1.0], "range_confidence": "低 — 5.x 插座取值范围未在本次实测标定",
+      "value_source": 0.5, "value_calibrated": 0.3, "provenance": "calibrated",
+      "effect": "辉光扩散半径。调大 → 整幅蒙纱感。",
+      "observed_effect": "实测 0.25 / 0.3 / 0.5 三档，0.3 为可用值。",
+      "observed_on": "哈尼娅" },
+
+    { "id": "glow.maximum", "group": "辉光", "label": "辉光上限", "cost": "L0",
+      "target": "compositor.Glare.Maximum", "type": "float",
+      "value_source": 10.0, "value_calibrated": 10.0, "provenance": "source_saved",
+      "effect": "辉光最远扩散距离上限。本次未调。" },
+
+    { "id": "glow.saturation", "group": "辉光", "label": "辉光饱和度", "cost": "L0",
+      "target": "compositor.Glare.Saturation", "type": "float",
+      "value_source": 1.0, "value_calibrated": 1.0, "provenance": "source_saved",
+      "effect": "辉光是否偏白。本次未调。" },
+
+    { "id": "glow.mix", "group": "辉光", "label": "辉光混合量", "cost": "none",
+      "target": "compositor.Glare.Mix", "type": "float",
+      "value_source": null, "value_calibrated": null, "provenance": "removed_in_5x",
+      "hard_evidence": "Glare 插座列表 = [Image, Type, Quality, Threshold, Smoothness, Clamp, Maximum, Strength, Saturation, Tint, Size, Streaks, Streaks Angle, Iterations, Fade, Color Modulation, Diagonal, Sun Position, Jitter, Kernel Data Type, Kernel, Kernel] —— 无 Mix。设 mix=-0.5 与 mix=-0.7 两档，输出与 mix 未设时像素逐点相同（最大差 0）。",
+      "warn": "工具里不要暴露这个参数。源工程若声称用 Mix 调过辉光比例，那个说法在 5.x 无法实现。" },
+
+    { "id": "color.view_transform", "group": "色彩管理", "label": "视图变换", "cost": "L0",
+      "target": "scene.view_settings.view_transform", "type": "enum",
+      "enum": ["Standard", "Khronos PBR Neutral", "AgX", "Filmic", "Filmic Log", "False Color", "Raw"],
+      "value_source": "AgX", "value_calibrated": "AgX", "provenance": "source_saved",
+      "effect": "整体影调曲线。换成 Standard 会立刻变亮但丢高光滚降，卡通风格会崩。",
+      "warn": "这是『看起来亮/暗』的强开关，但它与贴图色彩空间是两个独立因素，别混为一谈。" },
+
+    { "id": "color.look", "group": "色彩管理", "label": "Look（对比度预设）", "cost": "L0",
+      "target": "scene.view_settings.look", "type": "enum",
+      "enum": ["None", "AgX - Very High Contrast", "AgX - High Contrast", "AgX - Medium High Contrast", "AgX - Base Contrast", "AgX - Medium Low Contrast", "AgX - Low Contrast", "AgX - Very Low Contrast"],
+      "value_source": "AgX - High Contrast", "value_calibrated": "AgX - High Contrast",
+      "provenance": "source_saved",
+      "effect": "对比度档位；降低会让二分色阶变柔，升高会让硬边更硬。",
+      "suggest": "调参工具里做成滑杆最直观 —— 7 档从 Low 到 Very High 连续试。" },
+
+    { "id": "color.exposure", "group": "色彩管理", "label": "曝光", "cost": "L0",
+      "target": "scene.view_settings.exposure", "type": "float", "range": [-10.0, 10.0],
+      "value_source": 0.0, "value_calibrated": 0.0, "provenance": "hardcoded",
+      "effect": "整体亮度 EV 补偿。线性乘法，最适合做『整体亮度』滑杆。" },
+
+    { "id": "color.gamma", "group": "色彩管理", "label": "Gamma", "cost": "L0",
+      "target": "scene.view_settings.gamma", "type": "float", "range": [0.1, 5.0],
+      "value_source": 1.0, "value_calibrated": 1.0, "provenance": "hardcoded",
+      "effect": "中间调非线性调整。本次未调。" },
+
+    { "id": "world.hdri", "group": "世界环境", "label": "HDRI", "cost": "L1",
+      "target": "world.node_tree.Environment Texture", "type": "asset",
+      "value_source": "sunset.exr", "value_calibrated": "sunset.exr", "provenance": "source_saved",
+      "effect": "环境光照与颜色倾向。卡通着色把它主要当作环境填充色。",
+      "warn": "透明底（film_transparent=true）下它不出现在背景，但仍在影响受光。" },
+
+    { "id": "world.strength", "group": "世界环境", "label": "环境光强度", "cost": "L1",
+      "target": "world.node_tree.Background.Strength", "type": "float", "range": [0.0, 2.0],
+      "value_source": 0.12, "value_calibrated": 0.12, "provenance": "source_saved",
+      "effect": "环境光贡献量。调高会抬暗部、削弱二分色阶的暗面。",
+      "suggest": "与 21 盏灯一起决定『亮面/暗面』的整体水准。" },
+
+    { "id": "output.film_transparent", "group": "输出", "label": "透明背景", "cost": "L1",
+      "target": "scene.render.film_transparent", "type": "bool",
+      "value_source": true, "value_calibrated": true, "provenance": "source_saved",
+      "effect": "true → 出图带 alpha，背景透明；false → 背景填世界环境。",
+      "warn": "浅色模型在透明底 + 白底看图器里会『消失』。工具里预览建议固定合成到中灰底。" },
+
+    { "id": "output.resolution", "group": "输出", "label": "分辨率", "cost": "L2",
+      "target": "scene.render.resolution_x / _y", "type": "int2",
+      "value_source": [1080, 1980], "value_calibrated": [1080, 1980], "provenance": "source_saved",
+      "effect": "直接改变渲染耗时（线性于像素数）。预览时用小分辨率，导出时切回。",
+      "suggest": "工具里做成『预览 540×990 / 标准 1080×1980』两档，不要连续滑。" },
+
+    { "id": "render.taa_render_samples", "group": "渲染", "label": "EEVEE 采样数", "cost": "L1",
+      "target": "scene.eevee.taa_render_samples", "type": "int", "range": [1, 256],
+      "value_source": 16, "value_calibrated": 16, "provenance": "source_saved",
+      "effect": "抗锯齿与软阴影质量；1 可让预览飞快。",
+      "suggest": "调参时压到 4~8，导出前恢复 16。这是性价比最高的一处提速。" },
+
+    { "id": "render.use_raytracing", "group": "渲染", "label": "光线追踪", "cost": "L1",
+      "target": "scene.eevee.use_raytracing", "type": "bool",
+      "value_source": true, "value_calibrated": true, "provenance": "source_saved",
+      "effect": "影响反射/阴影真实度与耗时。卡通自发光为主，关掉差别不大。" },
+
+    { "id": "render.use_shadows", "group": "渲染", "label": "阴影开关", "cost": "L1",
+      "target": "scene.eevee.use_shadows", "type": "bool",
+      "value_source": true, "value_calibrated": true, "provenance": "source_saved",
+      "effect": "关掉可让面部阴影干净，但会丢层次。" },
+
+    { "id": "tonemap.映射模式", "group": "合成器 Tonemapping", "label": "影调映射模式", "cost": "L0",
+      "target": "compositor.node_group[Tonemapping].映射模式", "type": "enum",
+      "enum": ["NAESTonemap", "Reinhard", "Filmic", "None(旁路)"],
+      "value_source": "NAESTonemap", "value_calibrated": "NAESTonemap", "provenance": "source_saved",
+      "effect": "提亮与高光滚降。**这是忠实/增强两模式的核心差异之一**：faithful 模式完全不挂它。",
+      "warn": "源工程里该节点被 Kafka_Arm_Bypass_Final 旁路，从未生效。挂上它会让画面明显变亮 —— 这正是此前误判『根因已闭合』的原因。" },
+
+    { "id": "tonemap.颜色溢出保护", "group": "合成器 Tonemapping", "label": "颜色溢出保护", "cost": "L0",
+      "target": "compositor.node_group[Tonemapping].颜色溢出保护", "type": "bool",
+      "value_source": false, "value_calibrated": false, "provenance": "source_saved",
+      "effect": "抑制高饱和溢出。本次未调。" },
+
+    { "id": "outline.enabled", "group": "描边", "label": "描边开关", "cost": "L1",
+      "target": "内置 AI_Outline_GN 节点组 + AI_Outline 材质", "type": "bool",
+      "value_source": true, "value_calibrated": true, "provenance": "source_saved",
+      "effect": "整片剪影黑边有无。",
+      "warn": "模型整片死黑时先别怀疑描边 —— 真因通常是材质被判半透明，透出了背后的黑壳。" },
+
+    { "id": "outline.impl", "group": "描边", "label": "描边实现", "cost": "L1",
+      "target": "脚本 OUTLINE_IMPL", "type": "enum", "enum": ["builtin", "source"],
+      "value_source": "builtin", "value_calibrated": "builtin", "provenance": "hardcoded",
+      "effect": "builtin = 脚本内置反壳法（可控）；source = 复用源工程『通用描边3.1』节点组。" },
+
+    { "id": "outline.width_mm", "group": "描边", "label": "描边线宽", "cost": "L1",
+      "target": "AI_Outline_GN.SetPosition.OffsetScale", "type": "float", "unit": "mm",
+      "range": [0.0, 3.0], "value_source": 0.91, "value_calibrated": 0.91, "provenance": "source_saved",
+      "effect": "剪影线粗细。0.5 以下发丝；1.5 以上画得很重。",
+      "suggest": "做成滑杆，这是最直观的风格旋钮之一；但注意它随模型尺度变化，换模型要重调。" },
+
+    { "id": "outline.emission", "group": "描边", "label": "描边颜色 / 自发光", "cost": "L1",
+      "target": "AI_Outline 材质 Emission", "type": "color+float",
+      "value_source": "(0,0,0) 纯黑, strength 1.0", "value_calibrated": "(0,0,0), 1.0",
+      "provenance": "source_saved",
+      "effect": "描边颜色。改成深棕/深蓝是常见的风格软化手法。本次未调。" },
+
+    { "id": "cel.groups", "group": "Cel 色阶", "label": "7 组二分明暗色阶", "cost": "L1",
+      "target": "node_group[Cel_*].ColorRamp + Emission Strength", "type": "table",
+      "value_source": "见下方 entries", "value_calibrated": "见下方 entries",
+      "provenance": "source_saved",
+      "effect": "画面的核心风格来源：每个部件一组『暗面/中间/亮面』三段色 + 自发光强度。CONSTANT 常量插值保证硬边。",
+      "note": "7 个组是共享节点组 —— 改一处即全模型生效，代价很低（L1）。这是最值得做成可视化编辑器的部分。",
+      "entries": [
+        { "node_group": "Cel_Skin",            "applies_to": "皮肤",     "ramp_positions": [0.38, 0.56, 0.74],
+          "ramp_colors": [[0.58,0.46,0.43],[0.80,0.69,0.65],[1.00,0.94,0.90]], "emission_strength": 0.50 },
+        { "node_group": "Cel_Hair",            "applies_to": "头发(通用)", "ramp_positions": [0.34, 0.55, 0.73],
+          "ramp_colors": [[0.38,0.28,0.36],[0.68,0.55,0.64],[1.00,0.90,0.94]], "emission_strength": 0.50 },
+        { "node_group": "Cel_Cloth",           "applies_to": "服装布料",  "ramp_positions": [0.34, 0.55, 0.73],
+          "ramp_colors": [[0.34,0.38,0.50],[0.62,0.67,0.77],[0.96,0.97,1.00]], "emission_strength": 0.42 },
+        { "node_group": "Cel_Dark",            "applies_to": "深色件/兜底", "ramp_positions": [0.34, 0.56, 0.77],
+          "ramp_colors": [[0.20,0.17,0.25],[0.38,0.34,0.46],[0.66,0.62,0.72]], "emission_strength": 0.33 },
+        { "node_group": "Cel_Eyes",            "applies_to": "眼/齿/舌/睫毛", "ramp_positions": [0.30, 0.76],
+          "ramp_colors": [[0.78,0.80,0.79],[0.96,0.98,0.97]], "emission_strength": 0.48 },
+        { "node_group": "RayToon_Face_Soft",   "applies_to": "脸部(柔)",  "ramp_positions": [0.34, 0.52, 0.70],
+          "ramp_colors": [[0.78,0.70,0.68],[0.90,0.84,0.81],[1.00,0.96,0.93]], "emission_strength": 0.44 },
+        { "node_group": "RayToon_Eyes_Unlit",  "applies_to": "眼睛(无光)", "ramp_positions": [0.18, 0.88],
+          "ramp_colors": [[0.90,0.92,0.91],[0.98,1.00,0.99]], "emission_strength": 0.44 },
+        { "node_group": "Sakura_Hair_Reference","applies_to": "头部头发(专用参考组)", "ramp_positions": null,
+          "ramp_colors": null, "emission_strength": null,
+          "note": "按源模型头发专门调的组；本模型 头_Material1/6/7/10 命中。发色怪异时关掉 USE_HAIR_REFERENCE_GROUP 退回 Cel_Hair。" }
+      ] },
+
+    { "id": "material.rules", "group": "材质归类", "label": "名称→色阶组 正则规则表", "cost": "L2",
+      "target": "脚本 MATERIAL_RULES", "type": "ordered_regex_table",
+      "value_source": "内置 12 条规则（见脚本 91-122 行）", "value_calibrated": "本次未增删（19/19 一次命中）",
+      "provenance": "hardcoded",
+      "effect": "决定每个材质槽走哪组色阶。顺序即优先级。",
+      "warn": "这是通用性的真正边界：材质名必须有语义（中/日/英文）。矮身高模型 18 槽里 11 个叫 MaterialN，无法归类。工具里必须暴露这张表并允许编辑 / 手动指定。" },
+
+    { "id": "material.fallback_group", "group": "材质归类", "label": "兜底组", "cost": "L2",
+      "target": "脚本 FALLBACK_GROUP", "type": "string",
+      "value_source": "Cel_Dark", "value_calibrated": "Cel_Dark", "provenance": "hardcoded",
+      "effect": "未命中规则的材质落到哪。",
+      "warn": "严格模式（默认开）下不会真的落到这里，而是直接报错中止。以前静默兜底会刷出『全部归类成功』的假象。" },
+
+    { "id": "material.strict_match", "group": "材质归类", "label": "严格材质匹配", "cost": "L2",
+      "target": "脚本 STRICT_MATERIAL_MATCH", "type": "bool",
+      "value_source": null, "value_calibrated": true, "provenance": "calibrated",
+      "effect": "true = 有材质未命中就报错中止；false = 兜底出图。",
+      "warn": "工具默认应保持 true，并把未命中清单展示给用户手工指派 —— 不要给『一键兜底出图』的默认路径。" },
+
+    { "id": "material.use_hair_reference", "group": "材质归类", "label": "启用头发参考组", "cost": "L2",
+      "target": "脚本 USE_HAIR_REFERENCE_GROUP + HEAD_HAIR_PATTERNS", "type": "bool",
+      "value_source": true, "value_calibrated": true, "provenance": "calibrated",
+      "effect": "头部头发是否改用源模型专用的 Sakura_Hair_Reference 组。",
+      "warn": "该组是按源模型发色调的，换模型可能发色怪异 → 工具里要能一键回退 Cel_Hair。" },
+
+    { "id": "texture.base_colorspace", "group": "贴图", "label": "基础色贴图色彩空间", "cost": "L2",
+      "target": "image.colorspace_settings.name（仅被选作基础色的那张）", "type": "enum",
+      "enum": ["sRGB", "Filmic sRGB", "Non-Color", "Linear Rec.709", "保持原样(None)"],
+      "value_source": "sRGB / Linear Rec.709（本模型导入时原状分布：sRGB×36 + Linear Rec.709×4）",
+      "value_calibrated": "Filmic sRGB",
+      "provenance": "calibrated",
+      "effect": "同一张贴图，Filmic sRGB 解出的线性值比 sRGB 亮得多 —— 是此前『整片偏暗』的主要贡献因素之一。",
+      "warn": "只对被选作基础色的 6 张生效（本模型登记 10 张，其余球面/toon/法线/掩码不参与）。源工程 22 张贴图的精确分布是 Filmic sRGB×16 + sRGB×6，不是『全部 Filmic sRGB』。",
+      "suggest": "工具里做成『对当前模型逐张列出 + 勾选』，不要做成全局一键覆盖。" },
+
+    { "id": "texture.pick_policy", "group": "贴图", "label": "基础贴图选取策略", "cost": "L2",
+      "target": "脚本 find_base_image()", "type": "policy",
+      "value_source": "取分辨率最大且仍连接的贴图，并继承其 UV 图层名",
+      "provenance": "hardcoded",
+      "effect": "决定重建材质时保留哪张贴图。",
+      "warn": "**这是当前最大的一处保真度缺口**：一个 MMD 材质常有多张（基准/球面/toon），本脚本只保留一张，球面与 toon 贴图被丢弃，影响未量化。工具里应把它变成可选的『多层贴图』模式。" },
+
+    { "id": "pipeline.mode", "group": "管线", "label": "合成路径模式", "cost": "L3",
+      "target": "脚本 PIPELINE_MODE", "type": "enum", "enum": ["faithful", "enhanced"],
+      "value_source": null, "value_calibrated": "faithful", "provenance": "calibrated",
+      "effect": "faithful = 渲染层直出（等于源工程实际生效路径，因为它的 Tonemap/Bloom 被旁路）；enhanced = 渲染层 → Glare → Tonemapping → 输出。",
+      "warn": "两者是不同的产品，不要混称。faithful 平均亮度 0.4570 / enhanced 0.5112（基准 0.5016）—— **faithful 反而离基准更远**，说明『色彩空间修正』不足以单独闭合差距。",
+      "suggest": "工具里做成两个并排 tab，而不是一个开关。" },
+
+    { "id": "lights.active", "group": "灯光装置", "label": "灯光装置（29 盏 / 21 盏参与渲染）", "cost": "L3",
+      "target": "脚本 LIGHTS_ACTIVE / LIGHTS_SPARE", "type": "table",
+      "value_source": "29 盏（新建 28 / 复用 1），21 盏 hide_render=false",
+      "value_calibrated": "29 盏", "provenance": "source_saved",
+      "highlights": {
+        "AutoSun": { "type": "SUN", "energy": 1.0, "note": "Autocel 自动日光，能量固定 1.0" },
+        "three_point": [
+          { "name": "主光", "type": "AREA", "energy": 150.0, "color_hex": "#FFD1BC", "hide_render": true },
+          { "name": "辅光", "type": "AREA", "energy": 30.0,  "color_hex": "#DAEAFF", "hide_render": true },
+          { "name": "背光", "type": "AREA", "energy": 250.0, "color_hex": "#BCDAFF", "hide_render": false }
+        ],
+        "energy_range": [1.0, 521.4],
+        "note": "mmd_kafei_tools 三点照明预设，颜色/能量与插件内置 DEFAULT 预设逐位一致。"
+      },
+      "warn": "喂 .blend 输入时，场景自带同名灯（如 Light）会绕过规格直接被复用 —— 本次已修：新建/复用两条路径统一覆盖参数。" },
+
+    { "id": "camera.lens", "group": "相机", "label": "相机焦距与构图", "cost": "L3",
+      "target": "scene.camera.data.lens", "type": "float", "unit": "mm",
+      "value_source": 78.0, "value_calibrated": 78.0, "provenance": "source_saved",
+      "effect": "透视压缩程度。78mm 是源工程的特写机位。",
+      "note": "相机名 Toon_Face_Closeup_Camera；AUTO_FRAME=false 时沿用源工程构图。",
+      "suggest": "工具里给『源工程构图 / 按包围盒自动取景 / 手动轨道』三种，自动取景对换模型必需。" },
+
+    { "id": "camera.auto_frame", "group": "相机", "label": "自动取景", "cost": "L3",
+      "target": "脚本 AUTO_FRAME", "type": "bool",
+      "value_source": false, "value_calibrated": false, "provenance": "hardcoded",
+      "effect": "true = 按模型包围盒自动框构图；false = 死守源工程机位。",
+      "warn": "换模型时若保持 false，矮身高模型会出现『剪影铺满画布、四边触框』的假成功。" }
+  ],
+
+  "known_gaps": [
+    "LPIPS 未做（离线环境无 torch），只有 SSIM。",
+    "每材质只保留一张基础色贴图，球面/toon 贴图被丢弃，影响未量化。",
+    "色彩空间 / Glare / Tonemapping 三者的单变量贡献未拆开测（当前是叠加效应）。",
+    "Glare 的 Size / Saturation 等插座在 5.x 的合法取值范围未系统标定。",
+    "run_manifest.json 记录的是『已配置』参数而非『已生效』参数 —— faithful 模式的 manifest 里仍写着 Glow 1.0/2.0/0.5，而该模式下它根本不参与合成。工具侧须自行区分。"
+  ]
+}
