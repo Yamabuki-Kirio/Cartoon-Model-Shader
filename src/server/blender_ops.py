@@ -229,47 +229,8 @@ print({JSON_MARKER!r} + json.dumps(out, ensure_ascii=False, default=str))
 
 
 # -- 渲染预览 -----------------------------------------------------------
-
-
-def build_render_code(png_path: str, width: int, height: int, percentage: int) -> str:
-    """降分辨率渲染单张 PNG，随后**必定**恢复原分辨率。"""
-    return f"""
-import bpy, json, os
-
-scene = bpy.context.scene
-r = scene.render
-target = {png_path!r}
-os.makedirs(os.path.dirname(target), exist_ok=True)
-
-original = (r.resolution_x, r.resolution_y, r.resolution_percentage)
-frame = scene.frame_current
-rendered = False
-error = None
-try:
-    r.resolution_x = {int(width)}
-    r.resolution_y = {int(height)}
-    r.resolution_percentage = {int(percentage)}
-    r.image_settings.file_format = "PNG"
-    r.image_settings.color_mode = "RGBA"
-    bpy.ops.render.render(write_still=False)
-    image = bpy.data.images.get("Render Result")
-    if image is None:
-        raise RuntimeError("渲染结束后未找到 Render Result")
-    image.save_render(filepath=target, scene=scene)
-    rendered = os.path.isfile(target)
-finally:
-    r.resolution_x, r.resolution_y, r.resolution_percentage = original
-
-out = {{
-    "rendered": rendered,
-    "path": target,
-    "size_bytes": (os.path.getsize(target) if os.path.isfile(target) else 0),
-    "render_resolution": [{int(width)}, {int(height)}, {int(percentage)}],
-    "restored_resolution": [r.resolution_x, r.resolution_y, r.resolution_percentage],
-    "frame": frame,
-}}
-print({JSON_MARKER!r} + json.dumps(out, ensure_ascii=False, default=str))
-""".strip()
+# 渲染代码已统一由 ``framing.build_render_code`` 生成（它同时负责取景模式、
+# 临时预览相机的建立与恢复、以及中止判断），此处不再保留第二份实现。
 
 
 # -- 解析 ---------------------------------------------------------------

@@ -11,9 +11,9 @@ import json
 
 import pytest
 
-from src.server import blender_ops, errors
+from src.server import blender_ops, errors, framing
 from src.server.binder import BlenderBinder
-from src.server.blender_ops import JSON_MARKER, build_read_code, build_render_code, build_set_code
+from src.server.blender_ops import JSON_MARKER, build_read_code, build_set_code
 from src.server.config import BlenderMCPConfig
 from src.server.session import PreviewService
 from tests.fake_bpy import FakeBpy, FakeImage, extract_marker, run_generated_code
@@ -72,11 +72,11 @@ def test_set_code_cannot_inject_code_through_values() -> None:
 
 
 def test_render_code_writes_png_and_restores_resolution(tmp_path) -> None:
+    """渲染代码：落盘 PNG、按取景方式渲染、最后恢复原分辨率与原相机。"""
     fake = FakeBpy()
     target = tmp_path / "preview.png"
-    payload = extract_marker(
-        run_generated_code(build_render_code(target.as_posix(), 540, 990, 100), fake), JSON_MARKER
-    )
+    code = framing.build_render_code(target.as_posix(), 540, 990, 100)
+    payload = extract_marker(run_generated_code(code, fake), JSON_MARKER)
     assert payload["rendered"] is True
     assert payload["size_bytes"] > 0
     assert target.is_file()
@@ -84,6 +84,11 @@ def test_render_code_writes_png_and_restores_resolution(tmp_path) -> None:
     assert payload["restored_resolution"] == [1080, 1980, 100]
     assert fake.render_count == 1
     assert fake.last_render_resolution == (540, 990, 100)
+    # 默认（当前相机）模式：不得新建临时相机，且相机与帧原样不动
+    assert payload["camera_used"] == "Camera"
+    assert payload["camera_restored"] is True
+    assert payload["temporary_camera_leftovers"] == 0
+    assert fake.snapshot_framing()["camera"] == "Camera"
 
 
 def test_render_code_restores_resolution_even_when_saving_fails(tmp_path, monkeypatch) -> None:
@@ -95,11 +100,13 @@ def test_render_code_restores_resolution_even_when_saving_fails(tmp_path, monkey
     monkeypatch.setattr(FakeImage, "save_render", boom, raising=True)
     assert fake.context.scene.render.resolution_x == 1080
     with pytest.raises(RuntimeError):
-        run_generated_code(build_render_code((tmp_path / "x.png").as_posix(), 540, 990, 100), fake)
+        run_generated_code(framing.build_render_code((tmp_path / "x.png").as_posix(), 540, 990, 100), fake)
     # finally 分支必须已把分辨率还原
     assert fake.context.scene.render.resolution_x == 1080
     assert fake.context.scene.render.resolution_y == 1980
     assert fake.context.scene.render.resolution_percentage == 100
+    assert fake.context.scene.camera is not None
+    assert fake.context.scene.camera.name == "Camera"
 
 
 # -- 会话（基线 / 草稿 / 预览 / 回滚）---------------------------------------

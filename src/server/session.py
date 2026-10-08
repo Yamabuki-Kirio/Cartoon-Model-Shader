@@ -6,6 +6,8 @@
 * 旧任务自动作废：新任务提交时，排队中与运行中的旧任务立即标记为 ``superseded``，
   其结果被丢弃。
 * 不使用固定 ``sleep``：任务进度靠状态查询，Blender 侧一律等待响应。
+* **取景失效即停**：基线记录了帧 / 相机 / 焦距 / shift / 角色包围盒；一旦当前帧或
+  相机被外部改动，提交立刻以 ``FRAMING_STALE`` 拒绝，绝不把新构图当成参数效果。
 
 任务通过一个**合并式单工作线程**执行：短时间内的多次提交只会跑最后一个，
 既满足「旧任务作废」，又避免 Blender 被连续渲染请求压垮。
@@ -14,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as _dt
 import math
 import uuid
@@ -21,8 +24,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import errors, params
-from .binder import BlenderBinder
+from . import errors, framing as framing_module, params
+from .binder import PREVIEW_FALLBACK_RESOLUTION, BlenderBinder, preview_resolution_for
 
 #: 保留的历史任务上限（防止长时间运行内存无界增长）
 MAX_JOBS = 50
@@ -38,6 +41,33 @@ _FLOAT_TOLERANCE = 1e-6
 
 def _now_iso() -> str:
     return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _deep_copy(value: Any) -> Any:
+    """深拷贝一份只读快照，避免外部拿到内部可变结构。"""
+    return copy.deepcopy(value)
+
+
+def _render_framing_summary(render: dict[str, Any], job_framing: dict[str, Any] | None) -> dict[str, Any]:
+    """把 Blender 侧返回的取景结果整理成前端契约（含「是否已恢复原相机」）。"""
+    raw = render.get("framing") or {}
+    mode = raw.get("mode") or (job_framing or {}).get("mode")
+    return {
+        "mode": mode,
+        "mode_label": raw.get("mode_label") or framing_module.FRAMING_MODES.get(mode, mode),
+        "margin": raw.get("margin"),
+        "temporary_camera": bool(raw.get("temporary")),
+        "temporary_camera_name": raw.get("temporary_camera_name"),
+        "original_camera": raw.get("original_camera"),
+        "camera_used": raw.get("camera_used"),
+        "camera_restored": raw.get("camera_restored"),
+        "temporary_camera_leftovers": render.get("temporary_camera_leftovers"),
+        "distance": raw.get("distance"),
+        "frame": render.get("frame"),
+        "frame_after": render.get("frame_after"),
+        "fit": framing_module.normalize_fit(raw.get("fit")),
+        "character": framing_module.normalize_character(raw.get("character")),
+    }
 
 
 def preview_url_for(job_id: str) -> str:
@@ -59,6 +89,12 @@ class Baseline:
     values: dict[str, Any]
     options: dict[str, list[str]]
     render: dict[str, Any]
+    #: 建立基线时的取景快照（帧 / 相机 / transform / lens / shift / 角色包围盒）
+    framing: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def preview_resolution(self) -> tuple[int, int, int]:
+        return preview_resolution_for(self.render)
 
 
 @dataclass
@@ -70,6 +106,7 @@ class Job:
     updated_at: str
     requested: dict[str, Any]
     effective: dict[str, Any]
+    framing: dict[str, Any] = field(default_factory=dict)
     superseded: bool = False
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
@@ -84,6 +121,9 @@ class Job:
             "updated_at": self.updated_at,
             "superseded": self.superseded,
             "steps": list(self.steps),
+            "framing_request": (
+                framing_module.describe_options(self.framing) if self.framing else None
+            ),
         }
         if self.result is not None:
             payload["result"] = self.result
@@ -117,7 +157,9 @@ def _options_from_read(payload: dict[str, Any]) -> dict[str, list[str]]:
     return options
 
 
-def baseline_from_payload(payload: dict[str, Any]) -> Baseline:
+def baseline_from_payload(
+    payload: dict[str, Any], framing_snapshot: dict[str, Any] | None = None
+) -> Baseline:
     return Baseline(
         baseline_id=uuid.uuid4().hex[:12],
         captured_at=_now_iso(),
@@ -126,6 +168,7 @@ def baseline_from_payload(payload: dict[str, Any]) -> Baseline:
         values=values_from_read(payload),
         options=_options_from_read(payload),
         render=payload.get("render") or {},
+        framing=framing_snapshot or {},
     )
 
 
@@ -175,20 +218,69 @@ class PreviewService:
             "values": dict(b.values),
             "options": {k: list(v) for k, v in b.options.items()},
             "render": dict(b.render),
+            "framing": _deep_copy(b.framing),
+            "preview_resolution": list(b.preview_resolution),
         }
 
     async def capture_baseline(self) -> dict[str, Any]:
+        """采集内存基线：曝光/辉光现值 + 非破坏性的取景快照。
+
+        取景快照包含 ``frame_current`` / ``scene.camera`` / 相机 transform /
+        ``lens`` / ``shift_x`` / ``shift_y`` / 角色世界变换与包围盒。之后任何一次
+        预览提交都会与它比对，帧或相机被外部改动即判为失效。
+        """
         payload = await self._call(self._binder.read_exposure)
-        baseline = baseline_from_payload(payload)
+        context = await self._call(self._binder.read_framing)
+        baseline = baseline_from_payload(payload, framing_module.baseline_snapshot(context))
         async with self._state_lock:
             self._baseline = baseline
         return self.baseline_public() or {}
+
+    async def read_framing_context(self) -> dict[str, Any]:
+        """读取当前取景上下文，并附带与基线的比对结论。"""
+        context = await self._call(self._binder.read_framing)
+        baseline = self._baseline
+        verdict = framing_module.compare_context(
+            baseline.framing if baseline is not None else None, context
+        )
+        context["baseline"] = {
+            "established": baseline is not None,
+            "baseline_id": baseline.baseline_id if baseline is not None else None,
+            "captured_at": baseline.captured_at if baseline is not None else None,
+            "frame_current": (baseline.framing or {}).get("frame_current") if baseline else None,
+            "camera": (baseline.framing or {}).get("camera") if baseline else None,
+            "stale": verdict["stale"],
+            "reasons": verdict["reasons"],
+            "warnings": verdict["warnings"],
+        }
+        return context
 
     async def _ensure_baseline(self) -> Baseline:
         async with self._state_lock:
             if self._baseline is not None:
                 return self._baseline
-        return baseline_from_payload(await self._call(self._binder.read_exposure))
+        payload = await self._call(self._binder.read_exposure)
+        context = await self._call(self._binder.read_framing)
+        return baseline_from_payload(payload, framing_module.baseline_snapshot(context))
+
+    async def _assert_framing_fresh(self) -> None:
+        """提交前的取景闸门：帧 / 相机被外部改动时拒绝预览。
+
+        出错信息里带上「原来是什么 / 现在是什么」，便于直接定位用户那边做了什么。
+        """
+        async with self._state_lock:
+            baseline = self._baseline
+        if baseline is None or not baseline.framing:
+            return
+        context = await self._call(self._binder.read_framing)
+        verdict = framing_module.compare_context(baseline.framing, context)
+        if verdict["stale"]:
+            payload = framing_module.stale_error_payload(verdict)
+            raise errors.ToonTunerError(
+                errors.FRAMING_STALE,
+                payload["message"],
+                details={"reasons": verdict["reasons"], "warnings": verdict["warnings"]},
+            )
 
     async def restore_baseline(self) -> dict[str, Any]:
         baseline = await self._ensure_baseline()
@@ -205,14 +297,24 @@ class PreviewService:
         }
 
     # -- 任务 ------------------------------------------------------------
-    async def submit(self, draft: dict[str, Any]) -> Job:
+    async def submit(
+        self, draft: dict[str, Any], framing_options: dict[str, Any] | None = None
+    ) -> Job:
+        options = framing_module.validate_options(framing_options)
         async with self._state_lock:
             if self._baseline is None:
                 raise errors.ToonTunerError(
                     errors.NO_BASELINE, "尚未建立内存基线，无法预览。"
                 )
-            coerced = _validate_draft(draft, self._baseline)
-            effective = dict(self._baseline.values)
+        # 帧/相机被外部改动 => 直接拒绝，绝不把新构图当成参数效果（且不产生任务）
+        await self._assert_framing_fresh()
+
+        async with self._state_lock:
+            baseline = self._baseline
+            if baseline is None:  # pragma: no cover - 与上面同锁，仅防御
+                raise errors.ToonTunerError(errors.NO_BASELINE, "尚未建立内存基线，无法预览。")
+            coerced = _validate_draft(draft, baseline)
+            effective = dict(baseline.values)
             effective.update(coerced)
 
             self._seq += 1
@@ -225,6 +327,7 @@ class PreviewService:
                 updated_at=now,
                 requested=coerced,
                 effective=effective,
+                framing=dict(options),
             )
             self._jobs[job.job_id] = job
             for other in (self._pending, self._current):
@@ -296,7 +399,17 @@ class PreviewService:
                 return self._finish(job, JOB_SUPERSEDED, note="应用草稿后被取代")
 
             job.steps.append("渲染预览")
-            render = await self._call(self._binder.render_preview, job.job_id)
+            expected = {
+                "frame_current": (baseline.framing or {}).get("frame_current"),
+                "camera": (baseline.framing or {}).get("camera"),
+            }
+            render = await self._call(
+                self._binder.render_preview,
+                job.job_id,
+                job.framing or None,
+                baseline.preview_resolution,
+                expected,
+            )
             if self._is_superseded(job):
                 return self._finish(job, JOB_SUPERSEDED, note="渲染完成后被取代")
 
@@ -313,6 +426,7 @@ class PreviewService:
                 "baseline_id": baseline.baseline_id,
                 "restore_verified": verified,
                 "restore_mismatches": mismatches,
+                "framing": _render_framing_summary(render, job.framing),
             }
             self._finish(job, JOB_DONE, result=result)
         except errors.ToonTunerError as exc:

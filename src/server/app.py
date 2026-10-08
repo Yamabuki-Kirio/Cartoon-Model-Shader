@@ -1,4 +1,4 @@
-"""FastAPI 应用：只读连接闭环（MVP-01）。
+"""FastAPI 应用：本地卡通渲染调参台。
 
 路由：
 * ``GET  /``                       单页界面
@@ -6,10 +6,18 @@
 * ``GET  /api/blender/status``     快速探测端口与协议
 * ``GET  /api/blender/scene``      执行完整只读场景探针
 * ``POST /api/blender/reconnect``  重置连接状态并立即重新检测
+* ``GET  /api/framing/context``    当前帧 / 相机 / 相机动画 / 角色是否完整入画
+* ``GET  /api/params/schema``      L0 参数表
+* ``POST /api/session/baseline``   采集内存基线（含取景快照）+ 首张预览
+* ``POST /api/session/restore``    回滚到基线
+* ``POST /api/preview``            提交草稿 + 取景方式，产出预览任务
+* ``GET  /api/jobs/{id}``          任务状态
+* ``GET  /api/preview/{id}``       预览图（HTTP 端点，不暴露本机路径）
 
 安全边界：
 * 只监听 127.0.0.1（见 config 回环校验）。
-* 不提供任何接受任意 Python 的接口；Blender 侧代码只能来自内置探针模板。
+* 不提供任何接受任意 Python 的接口；Blender 侧代码只能来自内置模板。
+* 自动取景只用**临时预览相机**，绝不改动用户相机；渲染后必定恢复 ``scene.camera``。
 """
 
 from __future__ import annotations
@@ -26,14 +34,16 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import SERVICE_NAME, __version__, errors, params as params_module, scene_probe
+from . import SERVICE_NAME, __version__, errors, framing as framing_module, params as params_module, scene_probe
 from .binder import BlenderBinder, preview_dir, preview_png_name
 from .blender_mcp import BlenderMCPClient
 from .config import AppConfig, ConfigError, load_config
 from .models import (
+    BaselineRequest,
     BaselineResponse,
     BlenderStatusResponse,
     ErrorResponse,
+    FramingContextResponse,
     HealthResponse,
     JobResponse,
     ParamSchemaResponse,
@@ -218,15 +228,18 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         }
 
     @app.post("/api/session/baseline", response_model=BaselineResponse, tags=["session"])
-    async def create_baseline() -> dict[str, Any]:
-        """采集内存基线，并**立即**用基线参数创建一次预览任务。
+    async def create_baseline(body: BaselineRequest | None = None) -> dict[str, Any]:
+        """采集内存基线（含取景快照），并**立即**用基线参数创建一次预览任务。
 
         基线本身不产生画面，之前前端因此停在「可开始调参」却看不到图。
         这里把「首张基线预览」纳入同一响应：返回的 ``job_id`` /
-        ``preview_url`` 供前端轮询与取图。
+        ``preview_url`` 供前端轮询与取图。请求体可选，用于指定首张预览的取景方式。
         """
+        options = framing_module.validate_options(
+            body.framing.model_dump() if body is not None and body.framing is not None else None
+        )
         baseline = await preview.capture_baseline()
-        job = await preview.submit({})
+        job = await preview.submit({}, options)
         return {
             "ok": True,
             **baseline,
@@ -242,14 +255,51 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             raise errors.ToonTunerError(errors.NO_BASELINE, "尚未建立内存基线。")
         return {"ok": True, **baseline}
 
+    @app.get(
+        "/api/framing/context",
+        response_model=FramingContextResponse,
+        responses={502: {"model": ErrorResponse}, 503: {"model": ErrorResponse}, 504: {"model": ErrorResponse}},
+        tags=["framing"],
+    )
+    async def framing_context() -> dict[str, Any]:
+        """当前帧 / 当前相机 / 相机是否有动画 / 角色包围盒是否完整落在画面内。"""
+        context = await preview.read_framing_context()
+        return {
+            "ok": True,
+            **context,
+            "framing_modes": {
+                "default": framing_module.DEFAULT_MODE,
+                "default_margin": framing_module.DEFAULT_MARGIN,
+                "margin_min": framing_module.MARGIN_MIN,
+                "margin_max": framing_module.MARGIN_MAX,
+                "modes": [
+                    {
+                        "id": mode,
+                        "label": label,
+                        "uses_temporary_camera": mode in framing_module.AUTO_MODES,
+                    }
+                    for mode, label in framing_module.FRAMING_MODES.items()
+                ],
+            },
+        }
+
     @app.post("/api/session/restore", response_model=RestoreResponse, tags=["session"])
     async def restore_baseline() -> dict[str, Any]:
         return await preview.restore_baseline()
 
     @app.post("/api/preview", response_model=PreviewSubmitResponse, tags=["preview"])
     async def submit_preview(body: PreviewSubmitRequest) -> dict[str, Any]:
-        job = await preview.submit(body.draft)
-        return {"ok": True, "job_id": job.job_id, "seq": job.seq, "status": job.status}
+        options = framing_module.validate_options(
+            body.framing.model_dump() if body.framing is not None else None
+        )
+        job = await preview.submit(body.draft, options)
+        return {
+            "ok": True,
+            "job_id": job.job_id,
+            "seq": job.seq,
+            "status": job.status,
+            "framing": framing_module.describe_options(dict(job.framing)),
+        }
 
     @app.get("/api/jobs/{job_id}", response_model=JobResponse, tags=["preview"])
     async def read_job(job_id: str) -> dict[str, Any]:

@@ -208,3 +208,75 @@ summary { cursor: pointer; color: var(--muted); }
 .preview-status.status-err { color: var(--err); }
 
 .preview-pane .raw { max-height: 220px; }
+
+/* ===== 取景（构图）===== */
+.framing-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.framing-head h2 { margin: 0; }
+.framing-source {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.framing-source.source-current { color: var(--accent); border-color: var(--accent); }
+.framing-source.source-temp { color: var(--warn); border-color: var(--warn); }
+
+.framing-grid { grid-template-columns: minmax(112px, max-content) 1fr; }
+.framing-inside-ok { color: var(--ok); font-weight: 600; }
+.framing-inside-bad { color: var(--err); font-weight: 600; }
+.framing-inside-warn { color: var(--warn); font-weight: 600; }
+
+.framing-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--err);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--err) 8%, transparent);
+}
+.framing-banner-text { display: flex; flex-direction: column; gap: 2px; }
+.framing-banner-text strong { color: var(--err); }
+.framing-banner-text span { color: var(--muted); font-size: 12px; }
+
+.framing-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 16px;
+  margin-top: 16px;
+}
+.framing-control { display: flex; flex-direction: column; gap: 5px; }
+.framing-control label { color: var(--muted); font-size: 12px; }
+.framing-control select {
+  padding: 6px 8px;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  min-width: 190px;
+}
+.framing-margin-row { display: flex; align-items: center; gap: 10px; }
+.framing-margin-row input[type="range"] { width: 180px; accent-color: var(--accent); }
+
+.preview-framing-label {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.preview-framing-label.label-current { color: var(--accent); }
+.preview-framing-label.label-temp { color: var(--warn); }

@@ -13,6 +13,56 @@
   </header>
 
   <main>
+    <section class="card framing-bar hidden" id="framing-bar">
+      <div class="framing-head">
+        <h2>取景（构图）</h2>
+        <span class="framing-source" id="framing-source">—</span>
+      </div>
+      <dl class="kv-grid framing-grid">
+        <dt>当前帧</dt>
+        <dd id="framing-frame">—</dd>
+        <dt>当前相机</dt>
+        <dd id="framing-camera">—</dd>
+        <dt>相机动画</dt>
+        <dd id="framing-camera-anim">—</dd>
+        <dt>角色是否完整入画</dt>
+        <dd id="framing-inside">—</dd>
+      </dl>
+      <p class="hint" id="framing-fit-message"></p>
+
+      <div class="framing-banner hidden" id="framing-stale" role="alert">
+        <div class="framing-banner-text">
+          <strong>当前帧/相机已变化，请刷新基线。</strong>
+          <span id="framing-stale-detail"></span>
+        </div>
+        <button type="button" id="framing-refresh-baseline-btn" class="primary">立刻刷新基线</button>
+      </div>
+
+      <div class="framing-controls">
+        <div class="framing-control">
+          <label for="framing-mode">预览取景方式</label>
+          <select id="framing-mode">
+            <option value="current_camera">当前相机（默认）</option>
+            <option value="auto_full_body">自动全身</option>
+            <option value="auto_upper_body">自动半身</option>
+            <option value="auto_headshot">自动头像</option>
+          </select>
+        </div>
+        <div class="framing-control">
+          <label for="framing-margin">安全边距</label>
+          <div class="framing-margin-row">
+            <input type="range" id="framing-margin" min="0" max="40" step="1" value="15" />
+            <span class="control-value mono" id="framing-margin-value">15%</span>
+          </div>
+        </div>
+        <button type="button" id="reframe-btn" class="primary">重新取景</button>
+      </div>
+      <p class="hint">
+        自动取景会新建一台<strong>独立的临时预览相机</strong>：不改动你的相机、不改动相机动画、
+        不保存进工程，预览结束时（即使渲染失败）也会恢复原来的 <span class="mono">scene.camera</span>。
+      </p>
+    </section>
+
     <section class="card" id="connection-card">
       <div class="status-line">
         <span class="dot dot-checking" id="status-dot" aria-hidden="true"></span>
@@ -106,6 +156,10 @@
         拖动滑块或切换下拉后自动触发预览。每次预览都严格遵循「先恢复内存基线 → 再一次性应用整份草稿」，
         渲染结束后自动回滚到基线并逐项校验，因此不会在上一次结果上累积修改。
       </p>
+      <p class="muted">
+        若在 Blender 里切了帧或换了相机，基线会立刻失效：自动预览停止，页面顶部出现「请刷新基线」，
+        这样就不会把新的构图误当成参数效果。
+      </p>
       <div class="tuner-toolbar">
         <button type="button" id="baseline-btn" class="primary">建立 / 刷新基线</button>
         <button type="button" id="restore-btn">恢复基线</button>
@@ -117,6 +171,7 @@
           <p class="muted">正在读取参数表…</p>
         </div>
         <div class="preview-pane">
+          <p class="preview-framing-label" id="preview-framing-label">当前相机预览</p>
           <div class="preview-frame">
             <img id="preview-img" alt="预览图" class="hidden" />
             <p class="preview-placeholder" id="preview-placeholder">正在准备预览…</p>
@@ -134,7 +189,8 @@
   <footer class="page-footer">
     <span>
       本阶段只输出临时预览 PNG：不保存工程、不覆盖文件、不导入模型、不提供任意 Python 执行接口。
-      预览会临时修改曝光参数，渲染后自动回滚到基线。
+      预览会临时修改曝光/辉光参数，渲染后自动回滚到基线。自动取景只新建临时预览相机，
+      不改动你的相机与动画，渲染后（含失败）必定恢复原相机。
     </span>
   </footer>
 

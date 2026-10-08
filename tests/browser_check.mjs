@@ -1,7 +1,7 @@
 /**
  * 真实浏览器验收：用本机已安装的 Chrome/Edge（CDP 驱动）+ 真实 Blender。
  *
- * 只依赖 Node 内置能力（global fetch / global WebSocket），不需要 puppeteer、
+ * 只依赖 Node 内置能力（global fetch / global WebSocket / node:net），不需要 puppeteer、
  * 也不需要下载 Chromium。
  *
  * 覆盖验收点：
@@ -10,6 +10,10 @@
  *   3. 完成后状态为「基线已建立，可开始调参」
  *   4. 拖动曝光滑块能触发新预览，且新图替换旧图
  *   5. 预览图加载失败时显示明确错误，且**不再显示成功状态**
+ *   6. 顶部取景栏：当前帧 / 当前相机 / 相机是否有动画 / 角色是否完整入画
+ *   7. 当前相机预览 vs 临时自动取景的标识
+ *   8. 「重新取景」后角色完整入画，且**用户原相机一个字段都没变**
+ *   9. 用户切帧后：自动预览停止、出现「请刷新基线」，刷新后恢复
  *
  * 用法：
  *   node tests/browser_check.mjs [baseUrl] [screenshotDir]
@@ -17,11 +21,15 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const BASE_URL = process.argv[2] || "http://127.0.0.1:8765";
 const SHOT_DIR = process.argv[3] || join(tmpdir(), "toon-tuner-browser-check");
+// Blender MCP 的固定端口（与 config 默认一致）；仅用于「读相机状态 / 切帧」这两件事
+const MCP_HOST = process.env.TOON_TUNER_MCP_HOST || "127.0.0.1";
+const MCP_PORT = Number(process.env.TOON_TUNER_MCP_PORT || 9876);
 
 // 从环境变量推导浏览器安装位置，避免在仓库里写死本机绝对路径
 const INSTALL_ROOTS = [
@@ -50,6 +58,84 @@ function findBrowser() {
     if (path && existsSync(path)) return path;
   }
   throw new Error("未找到 Chrome 或 Edge");
+}
+
+/**
+ * 直接连 Blender MCP 执行一小段代码。
+ * 仅用于两件事：读取相机/帧状态、把当前帧切到别处（验收「基线失效」）。
+ * 切帧是对用户工程**临时**的改动，脚本结束前会恢复原帧。
+ */
+function mcpExecute(code, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ host: MCP_HOST, port: MCP_PORT });
+    let buffer = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        sock.destroy();
+        reject(new Error("Blender MCP 超时"));
+      }
+    }, timeoutMs);
+    sock.on("connect", () => {
+      sock.write(JSON.stringify({ type: "execute_code", params: { code } }) + "\n");
+    });
+    sock.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      try {
+        const parsed = JSON.parse(buffer);
+        settled = true;
+        clearTimeout(timer);
+        sock.end();
+        resolve(parsed);
+      } catch {
+        /* 响应无换行分隔符，继续累积 */
+      }
+    });
+    sock.on("error", (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+  });
+}
+
+const CAMERA_STATE_CODE = `
+import json
+import bpy
+
+scene = bpy.context.scene
+cam = scene.camera
+print("__CAM_STATE__" + json.dumps({
+    "frame": scene.frame_current,
+    "camera": cam.name if cam is not None else None,
+    "location": [round(float(v), 6) for v in cam.location] if cam is not None else None,
+    "world": [[round(float(v), 6) for v in row] for row in cam.matrix_world] if cam is not None else None,
+    "rotation": [round(float(v), 6) for v in cam.rotation_euler] if cam is not None else None,
+    "lens": round(float(cam.data.lens), 6) if cam is not None else None,
+    "shift": [round(float(cam.data.shift_x), 6), round(float(cam.data.shift_y), 6)] if cam is not None else None,
+    "temporary_cameras": [o.name for o in bpy.data.objects if o.name.startswith("__TOON_TUNER_PREVIEW_CAM__")],
+    "camera_count": len([o for o in scene.objects if o.type == "CAMERA"]),
+}, ensure_ascii=False))
+`;
+
+async function readCameraState() {
+  const response = await mcpExecute(CAMERA_STATE_CODE);
+  const stdout = (response && response.result && response.result.result) || "";
+  const line = stdout.split("\n").find((l) => l.startsWith("__CAM_STATE__"));
+  if (!line) throw new Error("拿不到相机状态：" + stdout.slice(0, 200));
+  return JSON.parse(line.slice("__CAM_STATE__".length));
+}
+
+async function setFrame(frame) {
+  const response = await mcpExecute(
+    `import bpy\nbpy.context.scene.frame_set(${Number(frame)})\nprint("__FRAME__" + str(bpy.context.scene.frame_current))\n`
+  );
+  const stdout = (response && response.result && response.result.result) || "";
+  if (!stdout.includes("__FRAME__")) throw new Error("切帧失败：" + stdout.slice(0, 200));
+  return stdout;
 }
 
 async function waitForDebugger(port, timeoutMs = 20000) {
@@ -127,6 +213,7 @@ async function main() {
 
   let cdp;
   let session;
+  let originalFrame = null;
   try {
     const version = await waitForDebugger(DEBUG_PORT);
     const ws = new WebSocket(version.webSocketDebuggerUrl);
@@ -274,7 +361,204 @@ async function main() {
     const recovered = await evaluate(waitImage);
     await shot("04-recovered");
     record("解除阻断后可重新拿到基线预览", !!recovered.shown, recovered.status);
+
+    // ================= 取景（构图）=====================================
+    const readBar = `(() => {
+      const bar = document.getElementById("framing-bar");
+      const txt = (id) => (document.getElementById(id) || {}).textContent || "";
+      return {
+        visible: !!bar && !bar.classList.contains("hidden"),
+        frame: txt("framing-frame"),
+        camera: txt("framing-camera"),
+        anim: txt("framing-camera-anim"),
+        inside: txt("framing-inside"),
+        source: txt("framing-source"),
+        fitMessage: txt("framing-fit-message"),
+        label: txt("preview-framing-label"),
+        mode: (document.getElementById("framing-mode") || {}).value,
+        margin: (document.getElementById("framing-margin") || {}).value,
+        staleShown: (() => { const b = document.getElementById("framing-stale"); return !!b && !b.classList.contains("hidden"); })(),
+        staleText: txt("framing-stale"),
+        reframeDisabled: (document.getElementById("reframe-btn") || {}).disabled === true,
+        previewJobId: (String(document.getElementById("preview-img").src).match(/[?&]v=([^&]+)/) || [])[1] || null,
+        statusText: txt("preview-status"),
+      };
+    })()`;
+
+    // ---- 6. 顶部取景栏四项信息 ----
+    const bar = await evaluate(readBar);
+    await shot("05-framing-bar");
+    record("顶部取景栏可见", !!bar.visible, bar.visible ? "" : "未显示");
+    record("显示当前帧", /\d+/.test(bar.frame), bar.frame);
+    record("显示当前相机", bar.camera.length > 1 && bar.camera !== "—", bar.camera);
+    record("显示相机是否有动画", /有动画|无/.test(bar.anim), bar.anim);
+    record("显示角色是否完整入画", /是|否/.test(bar.inside), bar.inside);
+    record(
+      "默认取景方式为「当前相机」并明确标识",
+      bar.mode === "current_camera" && bar.label.includes("当前相机预览"),
+      `${bar.mode} / ${bar.label}`
+    );
+    record("相机带动画时给出告警文案", bar.fitMessage.includes("动画"), bar.fitMessage.slice(0, 120));
+
+    // ---- 8. 重新取景：角色入画，且用户原相机一个字段都不变 ----
+    const camBefore = await readCameraState();
+    originalFrame = camBefore.frame;
+    record(
+      "重新取景前：无残留临时相机",
+      camBefore.temporary_cameras.length === 0,
+      `${camBefore.camera} / 相机数=${camBefore.camera_count}`
+    );
+    const jobBefore = bar.previewJobId;
+
+    await evaluate(`(() => {
+      const mode = document.getElementById("framing-mode");
+      mode.value = "auto_full_body";
+      mode.dispatchEvent(new Event("change", { bubbles: true }));
+      return mode.value;
+    })()`);
+    await sleep(500);
+    await evaluate(`(() => { document.getElementById("reframe-btn").click(); return true; })()`);
+
+    const waitAutoFramed = `new Promise((resolve) => {
+      const t0 = Date.now();
+      const tick = () => {
+        const img = document.getElementById("preview-img");
+        const label = document.getElementById("preview-framing-label");
+        const id = (String(img.src).match(/[?&]v=([^&]+)/) || [])[1] || null;
+        const shown = img && !img.classList.contains("hidden") && img.naturalWidth > 0;
+        if (shown && id && id !== ${JSON.stringify(jobBefore)} && label.textContent.includes("临时自动取景")) {
+          return resolve({ ok: true, id: id, label: label.textContent, status: document.getElementById("preview-status").textContent });
+        }
+        if (Date.now() - t0 > 120000) {
+          return resolve({ ok: false, id: id, label: label.textContent, status: document.getElementById("preview-status").textContent });
+        }
+        setTimeout(tick, 150);
+      };
+      tick();
+    })`;
+    const auto = await evaluate(waitAutoFramed);
+    await shot("06-auto-full-body");
+    record("自动全身取景产出新画面", !!auto.ok, `label=${auto.label} / ${auto.status}`);
+
+    const barAfter = await evaluate(readBar);
+    record(
+      "明确标识为「临时自动取景」且注明不改动用户相机",
+      barAfter.label.includes("临时自动取景") && barAfter.label.includes("不改动用户相机"),
+      barAfter.label
+    );
+    record("自动取景后角色完整入画", barAfter.inside.includes("是"), `${barAfter.inside} ｜ ${barAfter.fitMessage.slice(0, 120)}`);
+    record(
+      "入画判据明确标注参照的是临时取景相机",
+      barAfter.inside.includes("按临时取景相机"),
+      barAfter.inside
+    );
+    // 顶部「当前相机」描述的是场景状态：临时相机渲染完即销毁，这里必须仍显示工程相机，
+    // 不能显示 __TOON_TUNER_PREVIEW_CAM__，否则用户会误以为场景相机被换掉了。
+    record(
+      "自动取景后顶部「当前相机」仍是工程相机",
+      barAfter.camera === camBefore.camera && !barAfter.camera.includes("__TOON_TUNER_PREVIEW_CAM__"),
+      `${camBefore.camera} → ${barAfter.camera}`
+    );
+    record(
+      "说明文案点名了本次使用的临时相机与已恢复的原相机",
+      barAfter.fitMessage.includes("临时预览相机") && barAfter.fitMessage.includes(camBefore.camera),
+      barAfter.fitMessage.slice(0, 200)
+    );
+
+    const camAfter = await readCameraState();
+    // 该相机带关键帧（且带父级），本地 location 与基线记录的 matrix_world 不在同一空间，
+    // 因此不可变性断言必须以世界矩阵为准（需求 5「不修改原相机」）。
+    const sameCamera =
+      camAfter.camera === camBefore.camera &&
+      camAfter.frame === camBefore.frame &&
+      JSON.stringify(camAfter.world) === JSON.stringify(camBefore.world) &&
+      camAfter.lens === camBefore.lens &&
+      JSON.stringify(camAfter.shift) === JSON.stringify(camBefore.shift);
+    record("自动取景后用户原相机未被改动（世界变换/焦距/shift）", sameCamera,
+      `before=${JSON.stringify(camBefore.world)} lens=${camBefore.lens} shift=${JSON.stringify(camBefore.shift)}`);
+    record("自动取景后当前帧未被改动", camAfter.frame === camBefore.frame, `${camBefore.frame} → ${camAfter.frame}`);
+    record("临时预览相机已清理，没有残留", camAfter.temporary_cameras.length === 0,
+      `残留=${camAfter.temporary_cameras.length}`);
+    record("相机数量未变（没有多出对象）", camAfter.camera_count === camBefore.camera_count,
+      `${camBefore.camera_count} → ${camAfter.camera_count}`);
+
+    // 状态轮询每 5s 会重新拉一次 /api/framing/context；自动取景模式下它**不得**用
+    // 「当前相机」的诊断覆盖掉实际渲染结果（否则会出现判据与画面互相打架）。
+    await sleep(7000);
+    const barSettled = await evaluate(readBar);
+    record(
+      "轮询一轮后，判据仍是自动取景的结果（未被当前相机诊断覆盖）",
+      barSettled.inside.includes("按临时取景相机") && barSettled.inside.includes("是"),
+      `${barSettled.inside} ｜ ${barSettled.camera}`
+    );
+    record(
+      "轮询一轮后，顶部「当前相机」仍是工程相机",
+      barSettled.camera === camBefore.camera,
+      `${camBefore.camera} → ${barSettled.camera}`
+    );
+
+    // ---- 9. 用户切帧 → 自动预览停止 + 提示刷新基线 ----
+    await setFrame(Number(camBefore.frame) + 435);
+    const stale = await evaluate(`new Promise((resolve) => {
+      const t0 = Date.now();
+      const tick = () => {
+        const box = document.getElementById("framing-stale");
+        const shown = box && !box.classList.contains("hidden");
+        const id = (String(document.getElementById("preview-img").src).match(/[?&]v=([^&]+)/) || [])[1] || null;
+        if (shown) {
+          return resolve({
+            shown: true, id: id, banner: box.textContent,
+            reframeDisabled: document.getElementById("reframe-btn").disabled === true,
+            status: document.getElementById("preview-status").textContent,
+          });
+        }
+        if (Date.now() - t0 > 40000) {
+          return resolve({ shown: false, id: id, banner: box ? box.textContent : "", reframeDisabled: false, status: document.getElementById("preview-status").textContent });
+        }
+        setTimeout(tick, 200);
+      };
+      tick();
+    })`);
+    await shot("07-framing-stale");
+    record("切帧后出现失效横幅", !!stale.shown, stale.banner.slice(0, 140));
+    record("横幅提示「请刷新基线」", stale.banner.includes("请刷新基线"), stale.banner.slice(0, 80));
+    record("失效时停止自动预览", stale.status.includes("自动预览已停止"), stale.status);
+    record("失效时「重新取景」被禁用", !!stale.reframeDisabled, String(stale.reframeDisabled));
+    record("失效期间画面没有被新构图顶替", stale.id === auto.id, `${auto.id} → ${stale.id}`);
+
+    // ---- 恢复：把帧还原 → 刷新基线 → 重新拿到预览 ----
+    await setFrame(camBefore.frame);
+    await evaluate(`(() => { document.getElementById("framing-refresh-baseline-btn").click(); return true; })()`);
+    const clean = await evaluate(`new Promise((resolve) => {
+      const t0 = Date.now();
+      const tick = () => {
+        const box = document.getElementById("framing-stale");
+        const img = document.getElementById("preview-img");
+        const shown = box && box.classList.contains("hidden") &&
+          img && !img.classList.contains("hidden") && img.naturalWidth > 0;
+        if (shown) return resolve({ ok: true, status: document.getElementById("preview-status").textContent });
+        if (Date.now() - t0 > 120000) return resolve({ ok: false, status: document.getElementById("preview-status").textContent });
+        setTimeout(tick, 150);
+      };
+      tick();
+    })`);
+    await shot("08-refreshed");
+    record("还原帧并刷新基线后可继续预览", !!clean.ok, clean.status);
+    const camFinal = await readCameraState();
+    record("整轮验收结束后原相机仍然完好", camFinal.camera === camBefore.camera &&
+      JSON.stringify(camFinal.world) === JSON.stringify(camBefore.world) &&
+      camFinal.lens === camBefore.lens &&
+      JSON.stringify(camFinal.shift) === JSON.stringify(camBefore.shift), camFinal.camera);
   } finally {
+    // 把用户工程里被临时切走的当前帧放回去（切帧只用于验证「基线失效」）
+    if (originalFrame !== null) {
+      try {
+        await setFrame(originalFrame);
+        console.log(`已恢复原帧：${originalFrame}`);
+      } catch (err) {
+        console.log(`⚠ 恢复原帧失败，请在 Blender 里手动回到第 ${originalFrame} 帧：${err.message}`);
+      }
+    }
     try {
       if (cdp && session) await cdp.send("Browser.close");
     } catch {

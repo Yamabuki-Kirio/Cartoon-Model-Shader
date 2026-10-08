@@ -60,7 +60,34 @@
     img: el("preview-img"),
     placeholder: el("preview-placeholder"),
     status: el("preview-status"),
+    framingLabel: el("preview-framing-label"),
     jobRaw: el("job-raw")
+  };
+
+  /* 取景（构图）界面 */
+  var framingView = {
+    bar: el("framing-bar"),
+    source: el("framing-source"),
+    frame: el("framing-frame"),
+    camera: el("framing-camera"),
+    cameraAnim: el("framing-camera-anim"),
+    inside: el("framing-inside"),
+    fitMessage: el("framing-fit-message"),
+    staleBox: el("framing-stale"),
+    staleDetail: el("framing-stale-detail"),
+    refreshBaseline: el("framing-refresh-baseline-btn"),
+    mode: el("framing-mode"),
+    margin: el("framing-margin"),
+    marginValue: el("framing-margin-value"),
+    reframe: el("reframe-btn")
+  };
+
+  /* 取景方式的中文名（与服务端白名单一致） */
+  var FRAMING_LABELS = {
+    current_camera: "当前相机预览",
+    auto_full_body: "临时自动取景 · 全身",
+    auto_upper_body: "临时自动取景 · 半身",
+    auto_headshot: "临时自动取景 · 头像"
   };
 
   var lastStatus = null;
@@ -83,6 +110,12 @@
   var baselinePromise = null;
   /* 轮询上限，避免后端异常时前端无限轮询。 */
   var MAX_POLL_ATTEMPTS = 400;
+
+  // -- 取景状态 ---------------------------------------------------------
+  /* 基线建立后被外部切帧/换相机时置位：用于**停止自动预览**。 */
+  var framingStale = false;
+  var framingStaleDetail = "";
+  var framingContext = null;
 
   function setText(node, value, fallback) {
     if (!node) {
@@ -149,6 +182,7 @@
     nodes.blenderCard.classList.add("hidden");
     nodes.objectsCard.classList.add("hidden");
     tuner.card.classList.add("hidden");
+    framingView.bar.classList.add("hidden");
     sceneLoaded = false;
   }
 
@@ -258,6 +292,7 @@
       if (justConnected || !sceneLoaded) {
         loadScene();
       }
+      loadFramingContext();
       initTuner();
       return true;
     }
@@ -334,7 +369,220 @@
   async function onRefreshScene() {
     setBusy(true);
     await loadScene();
+    await loadFramingContext();
     setBusy(false);
+  }
+
+  // -- 取景（构图）--------------------------------------------------------
+  function framingLabel(mode) {
+    return FRAMING_LABELS[mode] || "当前相机预览";
+  }
+
+  function currentFramingOptions() {
+    var margin = Number(framingView.margin.value);
+    if (!isFinite(margin)) {
+      margin = 15;
+    }
+    return {
+      mode: framingView.mode.value || "current_camera",
+      margin: Math.min(0.4, Math.max(0, margin / 100))
+    };
+  }
+
+  function updateMarginReadout() {
+    framingView.marginValue.textContent = Number(framingView.margin.value) + "%";
+  }
+
+  function setFramingSource(mode) {
+    var usesTemp = mode !== "current_camera";
+    framingView.source.textContent = usesTemp
+      ? "临时自动取景（" + framingLabel(mode).replace("临时自动取景 · ", "") + "）"
+      : "当前相机预览";
+    framingView.source.classList.remove("source-current", "source-temp");
+    framingView.source.classList.add(usesTemp ? "source-temp" : "source-current");
+
+    tuner.framingLabel.textContent = usesTemp
+      ? "临时自动取景 · 不改动用户相机"
+      : "当前相机预览";
+    tuner.framingLabel.classList.remove("label-current", "label-temp");
+    tuner.framingLabel.classList.add(usesTemp ? "label-temp" : "label-current");
+
+    /* 判据必须跟着取景方式走：切到自动取景先置为「取景中」（等实际渲染结果），
+       切回当前相机则立刻用缓存的上文判据，不让上一次的结论滞留。 */
+    if (framingView.inside) {
+      if (usesTemp) {
+        setInsidePlaceholder(mode);
+      } else if (framingContext) {
+        applyInsideVerdict(framingContext.fit, mode);
+      }
+    }
+  }
+
+  function insideText(fit) {
+    if (!fit || fit.inside === null || fit.inside === undefined) {
+      if (fit && fit.reason === "no_camera") {
+        return { text: "无法判断（场景没有活动相机）", cls: "framing-inside-warn" };
+      }
+      if (fit && fit.reason === "no_character") {
+        return { text: "无法判断（没找到角色网格）", cls: "framing-inside-warn" };
+      }
+      return { text: "无法判断", cls: "framing-inside-warn" };
+    }
+    if (fit.inside) {
+      return { text: "是（完整落在画面内）", cls: "framing-inside-ok" };
+    }
+    return { text: "否（已出画）", cls: "framing-inside-bad" };
+  }
+
+  /* 「是否完整入画」的判定**永远描述当前选中的取景方式**，并显式标注参照的是哪台相机。
+     否则会出现「自动取景实拍完整入画、判据却说已出画」这种自相矛盾的界面。 */
+  function framingBasisLabel(mode) {
+    return mode && mode !== "current_camera" ? "按临时取景相机" : "按当前相机";
+  }
+
+  function applyInsideVerdict(fit, mode) {
+    var verdict = insideText(fit);
+    framingView.inside.textContent = verdict.text + "（" + framingBasisLabel(mode) + "）";
+    framingView.inside.classList.remove("framing-inside-ok", "framing-inside-bad", "framing-inside-warn");
+    framingView.inside.classList.add(verdict.cls);
+  }
+
+  function setInsidePlaceholder(mode) {
+    framingView.inside.textContent = "取景中…（" + framingBasisLabel(mode) + "）";
+    framingView.inside.classList.remove("framing-inside-ok", "framing-inside-bad", "framing-inside-warn");
+    framingView.inside.classList.add("framing-inside-warn");
+  }
+
+  /* 相机带关键帧时必须显式告警（需求 6）。 */
+  function cameraAnimationWarning() {
+    var baseline = (framingContext && framingContext.baseline) || {};
+    var found = (baseline.warnings || []).filter(function (item) {
+      return item && item.code === "camera_animated";
+    });
+    return found.length ? found[0].message : "";
+  }
+
+  function renderFramingContext(context) {
+    framingContext = context;
+    framingView.bar.classList.remove("hidden");
+
+    var mode = framingView.mode.value || "current_camera";
+    var frameText = String(context.frame_current);
+    if (context.frame_start !== null && context.frame_end !== null &&
+        context.frame_start !== undefined && context.frame_end !== undefined) {
+      frameText += "（工程范围 " + context.frame_start + "–" + context.frame_end + "）";
+    }
+    setText(framingView.frame, frameText, "—");
+    setText(framingView.camera, context.camera, "无相机");
+
+    var animation = (context.camera_info || {}).animation || {};
+    if (animation.has_animation) {
+      var sources = (animation.sources || []).join("、");
+      var curves = animation.fcurves ? "，共 " + animation.fcurves + " 条曲线" : "";
+      setText(framingView.cameraAnim, "有动画（" + sources + curves + "）", "有动画");
+    } else if (context.camera) {
+      setText(framingView.cameraAnim, "无（未检测到关键帧 / 驱动器）", "无");
+    } else {
+      setText(framingView.cameraAnim, "—");
+    }
+
+    /* 入画判据只属于「当前相机」这条取景路径：自动取景的判据来自实际渲染结果，
+       由 applyJobFraming 写入。这里若不加区分地覆盖，就会出现判据与画面互相打架。 */
+    var judgeCurrentCamera = mode === "current_camera";
+
+    var messages = [];
+    if (judgeCurrentCamera) {
+      applyInsideVerdict(context.fit, mode);
+      if (context.fit && context.fit.message) {
+        messages.push(context.fit.message);
+      }
+      if (context.fit && context.fit.margin_hint) {
+        messages.push(context.fit.margin_hint);
+      }
+    }
+    var character = context.character || {};
+    if (character.group) {
+      var objectNames = (character.objects || []).map(function (item) {
+        return item.name;
+      });
+      messages.push("取景对象：骨架「" + character.group + "」下的 " + objectNames.join("、") +
+        "（已排除刚体代理 / 描边壳 / 隐藏对象）");
+    }
+    var baseline = context.baseline || {};
+    if (baseline.established && baseline.frame_current !== null && baseline.frame_current !== undefined) {
+      messages.push("基线锁定于第 " + baseline.frame_current + " 帧 · 相机 " + (baseline.camera || "（无）"));
+    }
+    var animWarning = cameraAnimationWarning();
+    if (animWarning) {
+      messages.push(animWarning);
+    }
+    framingView.fitMessage.textContent = messages.join(" ｜ ");
+
+    /* 基线失效：停止自动预览并提示刷新基线 */
+    setFramingStale(!!baseline.stale, (baseline.reasons || []).map(function (item) {
+      return item.message;
+    }).join("；"));
+  }
+
+  function setFramingStale(stale, detail) {
+    framingStale = !!stale;
+    framingStaleDetail = detail || "";
+    if (stale) {
+      framingView.staleBox.classList.remove("hidden");
+      framingView.staleDetail.textContent = framingStaleDetail;
+      framingView.reframe.disabled = true;
+      tuner.status.classList.remove("status-ok", "status-busy");
+      tuner.status.classList.add("status-err");
+      tuner.status.textContent = "自动预览已停止：当前帧/相机已变化，请刷新基线" +
+        (framingStaleDetail ? "（" + framingStaleDetail + "）" : "");
+    } else {
+      framingView.staleBox.classList.add("hidden");
+      framingView.staleDetail.textContent = "";
+      framingView.reframe.disabled = false;
+    }
+  }
+
+  async function loadFramingContext() {
+    var result = await request("/api/framing/context");
+    if (!result.body || result.body.ok !== true) {
+      return null;
+    }
+    renderFramingContext(result.body);
+    return result.body;
+  }
+
+  async function onFramingModeChange() {
+    setFramingSource(framingView.mode.value);
+    if (framingStale) {
+      setFramingStale(true, framingStaleDetail);
+      return;
+    }
+    if (!baselineValues) {
+      return;
+    }
+    schedulePreview();
+  }
+
+  function onFramingMarginInput() {
+    updateMarginReadout();
+    if (framingStale || !baselineValues) {
+      return;
+    }
+    schedulePreview();
+  }
+
+  async function onReframe() {
+    if (framingStale) {
+      setFramingStale(true, framingStaleDetail);
+      return;
+    }
+    if (!baselineValues) {
+      var ok = await ensureBaseline(false);
+      if (!ok) {
+        return;
+      }
+    }
+    await submitPreview();
   }
 
   // -- L0 曝光调参 -------------------------------------------------------
@@ -535,16 +783,35 @@
 
   async function captureBaseline() {
     setPreviewStatus("正在建立内存基线…", "busy");
-    var result = await request("/api/session/baseline", { method: "POST" });
+    var options = currentFramingOptions();
+    /* 刷新基线 = 以当前帧/相机为准重新锁定，因此先解除失效状态 */
+    setFramingStale(false, "");
+    var result = await request("/api/session/baseline", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ framing: options })
+    });
     if (!result.body || !result.body.ok) {
-      showTunerError(result.body && result.body.error);
+      var error = result.body && result.body.error;
+      if (error && error.code === "FRAMING_STALE") {
+        /* 采集期间帧/相机又变了：仍然按「需要刷新基线」提示 */
+        setFramingStale(true, staleDetailFromError(error));
+        setPreviewStatus("建立基线失败：当前帧/相机已变化，请再试一次", "err");
+        return false;
+      }
+      showTunerError(error);
       return false;
     }
     baselineValues = result.body.values || {};
     tuner.baselineInfo.textContent =
       "基线 " + result.body.baseline_id + " · " + formatTime(result.body.captured_at) +
-      " · Blender " + (result.body.blender || "?");
+      " · Blender " + (result.body.blender || "?") +
+      (result.body.framing && result.body.framing.frame_current !== null
+        ? " · 锁定第 " + result.body.framing.frame_current + " 帧"
+        : "");
     applyValuesToControls(baselineValues);
+    setFramingSource(options.mode);
+    loadFramingContext();
 
     if (!result.body.job_id) {
       /* 兜底：后端未返回首张预览任务时，至少保持界面可用。 */
@@ -592,6 +859,11 @@
   }
 
   function schedulePreview() {
+    if (framingStale) {
+      /* 需求 3：当前帧/相机已变 => 停止自动预览，绝不把新构图当成参数效果。 */
+      setFramingStale(true, framingStaleDetail);
+      return;
+    }
     if (debounceTimer) {
       window.clearTimeout(debounceTimer);
     }
@@ -603,6 +875,10 @@
   }
 
   async function submitPreview() {
+    if (framingStale) {
+      setFramingStale(true, framingStaleDetail);
+      return;
+    }
     if (!baselineValues) {
       var ok = await ensureBaseline(false);
       if (!ok) {
@@ -610,21 +886,42 @@
       }
     }
     var token = ++previewToken;
+    var options = currentFramingOptions();
     setPreviewStatus("已提交预览，等待 Blender…", "busy");
     var result = await request("/api/preview", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ draft: collectDraft() })
+      body: JSON.stringify({ draft: collectDraft(), framing: options })
     });
     if (token !== previewToken) {
       return; /* 期间已有更新的提交，本次结果直接丢弃 */
     }
     if (!result.body || !result.body.ok) {
-      showTunerError(result.body && result.body.error);
+      var error = result.body && result.body.error;
+      if (error && error.code === "FRAMING_STALE") {
+        /* 服务端闸门拦下：立即停止自动预览并显示横幅 */
+        setFramingStale(true, staleDetailFromError(error));
+        loadFramingContext();
+        return;
+      }
+      showTunerError(error);
       return;
     }
+    setFramingSource(options.mode);
     activeJobId = result.body.job_id;
     await runPreviewJob(activeJobId, { baseline: false }, token);
+  }
+
+  function staleDetailFromError(error) {
+    if (!error) {
+      return "";
+    }
+    if (error.details && error.details.reasons && error.details.reasons.length) {
+      return error.details.reasons.map(function (item) {
+        return item.message;
+      }).join("；");
+    }
+    return error.message || "";
   }
 
   /* 轮询到终态。被更新的提交取代时返回 null —— 此时绝不能改写画面。 */
@@ -667,6 +964,11 @@
     }
     if (job.status === "failed") {
       var detail = job.error || {};
+      if (detail.code === "FRAMING_STALE") {
+        setFramingStale(true, staleDetailFromError(detail));
+        loadFramingContext();
+        return job;
+      }
       if (options.baseline) {
         /* 需求：基线参数仍然保留，但 UI 必须明确显示预览失败。 */
         setPlaceholder("基线预览失败");
@@ -682,6 +984,7 @@
     if (job.status === "done" && job.result && job.result.preview_url) {
       /* 防缓存：URL 带上本次 job_id，避免浏览器复用同路径的旧图。 */
       var url = job.result.preview_url + "?v=" + encodeURIComponent(job.job_id);
+      var framingResult = job.result.framing || null;
       var loaded;
       if (options.baseline) {
         loaded = await showImage(url, "基线已建立，预览失败：预览图无法加载");
@@ -689,6 +992,7 @@
           baselinePreviewUrl = url;
           baselinePreviewJobId = job.job_id;
           setPreviewStatus("基线已建立，可开始调参", "ok");
+          applyJobFraming(framingResult);
         }
       } else {
         loaded = await showImage(url, "(PREVIEW_IMAGE_LOAD_FAILED) 预览图无法加载，请刷新后重试");
@@ -699,12 +1003,56 @@
             "预览完成 · " + resolution[0] + "×" + resolution[1] + " · " + verified,
             job.result.restore_verified ? "ok" : "err"
           );
+          applyJobFraming(framingResult);
         }
       }
       return job;
     }
     setPreviewStatus("预览未完成（状态：" + job.status + "）", "err");
     return job;
+  }
+
+  /* 用任务结果里的取景信息回填界面：明确「当前相机预览 / 临时自动取景」。 */
+  function applyJobFraming(framingResult) {
+    if (!framingResult) {
+      return;
+    }
+    setFramingSource(framingResult.mode);
+    if (framingResult.temporary_camera && framingResult.camera_restored === false) {
+      tuner.framingLabel.textContent = "临时自动取景 · 原相机未恢复（请检查 Blender）";
+      tuner.framingLabel.classList.remove("label-current", "label-temp");
+      tuner.framingLabel.classList.add("label-temp");
+    }
+    if (framingResult.frame !== undefined && framingResult.frame !== null) {
+      setText(framingView.frame, framingResult.frame, "—");
+    }
+    setText(
+      framingView.camera,
+      // 「当前相机」一栏描述的是**场景状态**：临时预览相机渲染完即被销毁并已恢复原相机，
+      // 因此这里显示工程相机（original_camera），而不是 camera_used，避免让人误以为场景相机被换掉。
+      framingResult.original_camera || framingResult.camera_used,
+      "无相机"
+    );
+
+    var fit = framingResult.fit;
+    if (fit) {
+      applyInsideVerdict(fit, framingResult.mode);
+      var notes = [];
+      if (fit.message) {
+        notes.push(fit.message);
+      }
+      if (framingResult.temporary_camera) {
+        notes.push("本次取景使用临时预览相机 " +
+          (framingResult.temporary_camera_name || "（未具名）") +
+          "，渲染后已恢复原相机 " +
+          (framingResult.original_camera || "（无）") + "（不改动用户相机）");
+      }
+      var warning = cameraAnimationWarning();
+      if (warning) {
+        notes.push(warning);
+      }
+      framingView.fitMessage.textContent = notes.join(" ｜ ");
+    }
   }
 
   function onResetUi() {
@@ -741,6 +1089,17 @@
   });
   tuner.restoreBtn.addEventListener("click", onRestoreBaseline);
   tuner.resetBtn.addEventListener("click", onResetUi);
+
+  /* 取景控件 */
+  framingView.mode.addEventListener("change", onFramingModeChange);
+  framingView.margin.addEventListener("input", onFramingMarginInput);
+  framingView.reframe.addEventListener("click", onReframe);
+  framingView.refreshBaseline.addEventListener("click", function () {
+    ensureBaseline(true);
+  });
+  updateMarginReadout();
+  setFramingSource(framingView.mode.value);
+  setFramingStale(false, "");
 
   refreshStatus();
   startPolling();

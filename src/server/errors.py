@@ -21,6 +21,9 @@ PARAM_INVALID = "PARAM_INVALID"
 NO_BASELINE = "NO_BASELINE"
 JOB_NOT_FOUND = "JOB_NOT_FOUND"
 PREVIEW_FAILED = "PREVIEW_FAILED"
+# 取景（framing）
+FRAMING_STALE = "FRAMING_STALE"
+FRAMING_UNAVAILABLE = "FRAMING_UNAVAILABLE"
 
 # 错误码 -> (HTTP 状态码, 是否可重试, 面向用户的下一步建议)
 _ERROR_META: dict[str, tuple[int, bool, str]] = {
@@ -78,6 +81,16 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         502,
         True,
         "预览渲染失败。请确认 Blender 场景中存在相机与合成器节点组，然后重试。",
+    ),
+    FRAMING_STALE: (
+        409,
+        True,
+        "建立基线之后，当前帧或相机被外部改动，预览构图会失真。请点「建立 / 刷新基线」重新锁定，再继续调参。",
+    ),
+    FRAMING_UNAVAILABLE: (
+        409,
+        True,
+        "无法自动取景：请确认场景里有可见的角色网格（已排除刚体代理与描边壳）以及一台活动相机。",
     ),
 }
 

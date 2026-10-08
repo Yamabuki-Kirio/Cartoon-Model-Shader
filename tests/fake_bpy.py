@@ -1,9 +1,16 @@
 """极简 `bpy` 桩：让服务端生成的代码在无 Blender 环境下真实执行。
 
 这不是「假响应」，而是**真的把生成的 Python 代码跑一遍**，只是把 ``bpy`` 换成桩。
-因此它能捕捉到生成代码里的逻辑错误（例如字符串被 ``list()`` 拆成字符）。
+因此它能捕捉到生成代码里的逻辑错误（例如字符串被 ``list()`` 拆成字符、
+或者取景矩形忘记按 view_frame 的距离归一化）。
 
-覆盖范围仅限 MVP-02 生成的代码所触达的 API。
+覆盖范围：MVP-02 的曝光/辉光代码，以及本次的取景代码
+（``camera.data.view_frame`` / 角色包围盒 / ``bpy.data.objects|cameras`` 的增删）。
+
+⚠ ``FakeCameraData.view_frame`` 刻意复刻真实 Blender 的口径：
+  返回点**不在单位距离上**（fit 方向的半高恒为 0.5），因此忘记归一化的实现
+  会在这里直接暴露。实测真实值：lens=68.4966 / sensor_fit=VERTICAL 时
+  ``view_frame()`` 返回 z≈-2.854、半高 0.5。
 """
 
 from __future__ import annotations
@@ -11,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import math
 import sys
 import types
 from pathlib import Path
@@ -21,6 +29,73 @@ PNG_BYTES = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
     "0000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082"
 )
+
+#: 默认「角色」网格的局部包围盒（量级参照真实 MMD 模型：约 1.56 m 高）
+CHARACTER_LOCAL_MIN = (-0.34, -0.25, -0.03)
+CHARACTER_LOCAL_MAX = (0.29, 0.18, 1.52)
+
+
+# =============================================================================
+#  基础：矩阵 / 欧拉角
+# =============================================================================
+
+
+def euler_xyz_matrix(rotation: tuple[float, float, float]) -> list[list[float]]:
+    """XYZ 欧拉角 -> 3x3（R = Rz @ Ry @ Rx），行主序。"""
+    rx, ry, rz = (float(v) for v in rotation)
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    rx_m = [[1, 0, 0], [0, cx, -sx], [0, sx, cx]]
+    ry_m = [[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]
+    rz_m = [[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]
+    tmp = [[sum(rz_m[i][k] * ry_m[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+    return [[sum(tmp[i][k] * rx_m[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+class FakeMatrix:
+    """4x4 行主序矩阵；支持 ``m[i][j]`` 与 ``.translation``。"""
+
+    def __init__(self, rows: list[list[float]] | None = None) -> None:
+        self._rows = rows or [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+
+    def __getitem__(self, index: int) -> list[float]:
+        return list(self._rows[index])
+
+    def __iter__(self) -> Iterator[list[float]]:
+        return iter([list(r) for r in self._rows])
+
+    def __len__(self) -> int:
+        return 4
+
+    @property
+    def translation(self) -> tuple[float, float, float]:
+        return (self._rows[0][3], self._rows[1][3], self._rows[2][3])
+
+
+def compose_matrix(
+    location: tuple[float, float, float],
+    rotation: tuple[float, float, float],
+    scale: tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> FakeMatrix:
+    rot = euler_xyz_matrix(rotation)
+    rows = [[0.0] * 4 for _ in range(4)]
+    for i in range(3):
+        for j in range(3):
+            rows[i][j] = rot[i][j] * float(scale[j])
+    rows[0][3], rows[1][3], rows[2][3] = (float(v) for v in location)
+    rows[3][3] = 1.0
+    return FakeMatrix(rows)
+
+
+# =============================================================================
+#  节点（合成器）
+# =============================================================================
 
 
 class FakeSocket:
@@ -93,6 +168,11 @@ DEFAULT_GLARE_INPUTS: dict[str, Any] = {
 }
 
 
+# =============================================================================
+#  场景 / 渲染设置
+# =============================================================================
+
+
 class FakeViewSettings:
     def __init__(self) -> None:
         self.view_transform = "AgX"
@@ -113,6 +193,8 @@ class FakeRender:
         self.resolution_x = 1080
         self.resolution_y = 1980
         self.resolution_percentage = 100
+        self.pixel_aspect_x = 1.0
+        self.pixel_aspect_y = 1.0
         self.film_transparent = True
         self.filepath = ""
         self.image_settings = FakeImageSettings()
@@ -123,13 +205,340 @@ class FakeDisplaySettings:
         self.display_device = "sRGB"
 
 
+# =============================================================================
+#  动画数据（用于「相机是否带动画」）
+# =============================================================================
+
+
+class FakeFCurve:
+    def __init__(self, data_path: str = "location") -> None:
+        self.data_path = data_path
+        self.keyframe_points: list[Any] = []
+
+
+class FakeAction:
+    def __init__(self, name: str, fcurves: int = 3) -> None:
+        self.name = name
+        self.fcurves = [FakeFCurve() for _ in range(fcurves)]
+
+
+class FakeAnimData:
+    def __init__(self, action: FakeAction | None = None, nla_tracks: int = 0, drivers: int = 0) -> None:
+        self.action = action
+        self.nla_tracks = [object() for _ in range(nla_tracks)]
+        self.drivers = [object() for _ in range(drivers)]
+
+
+# =============================================================================
+#  数据块
+# =============================================================================
+
+
+class FakeMeshData:
+    def __init__(self, name: str, polygons: int = 100, vertices: int = 8) -> None:
+        self.name = name
+        self.polygons = [object() for _ in range(polygons)]
+        self.vertices = [object() for _ in range(vertices)]
+        #: 局部包围盒 (min, max)；None 表示用默认角色盒
+        self._bbox: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
+
+
+class FakeMaterialSlot:
+    def __init__(self, name: str = "Material") -> None:
+        self.name = name
+        self.material = None
+
+
+class FakeModifier:
+    def __init__(self, type: str, object: Any = None) -> None:
+        self.type = type
+        self.object = object
+        self.name = type.title()
+
+
+class FakeCameraData:
+    """相机数据：``view_frame`` 的口径与真实 Blender 一致。"""
+
+    def __init__(
+        self,
+        name: str = "Camera",
+        *,
+        lens: float = 50.0,
+        sensor_width: float = 36.0,
+        sensor_height: float = 24.0,
+        sensor_fit: str = "AUTO",
+        shift_x: float = 0.0,
+        shift_y: float = 0.0,
+        cam_type: str = "PERSP",
+        ortho_scale: float = 6.0,
+        clip_start: float = 0.1,
+        clip_end: float = 100.0,
+    ) -> None:
+        self.name = name
+        self.type = cam_type
+        self.lens = lens
+        self.sensor_width = sensor_width
+        self.sensor_height = sensor_height
+        self.sensor_fit = sensor_fit
+        self.shift_x = shift_x
+        self.shift_y = shift_y
+        self.ortho_scale = ortho_scale
+        self.clip_start = clip_start
+        self.clip_end = clip_end
+        self.animation_data: FakeAnimData | None = None
+
+    # -- 取景矩形 ---------------------------------------------------------
+    def resolved_fit(self, scene: "FakeScene | None") -> str:
+        if self.sensor_fit != "AUTO":
+            return self.sensor_fit
+        rx, ry = _resolution(scene)
+        pax, pay = _pixel_aspect(scene)
+        return "HORIZONTAL" if rx * pax >= ry * pay else "VERTICAL"
+
+    def half_extents(self, scene: "FakeScene | None") -> tuple[float, float]:
+        """单位距离处的半宽/半高（= tan(hfov/2), tan(vfov/2)）。"""
+        fit = self.resolved_fit(scene)
+        rx, ry = _resolution(scene)
+        pax, pay = _pixel_aspect(scene)
+        if self.type == "ORTHO":
+            if fit == "HORIZONTAL":
+                half_w = self.ortho_scale / 2.0
+                half_h = half_w * (ry * pay) / (rx * pax)
+            else:
+                half_h = self.ortho_scale / 2.0
+                half_w = half_h * (rx * pax) / (ry * pay)
+            return half_w, half_h
+        if fit == "HORIZONTAL":
+            half_w = (self.sensor_width / 2.0) / self.lens
+            half_h = half_w * (ry * pay) / (rx * pax)
+        else:
+            half_h = (self.sensor_height / 2.0) / self.lens
+            half_w = half_h * (rx * pax) / (ry * pay)
+        return half_w, half_h
+
+    def frame_center(self, scene: "FakeScene | None") -> tuple[float, float]:
+        """画面中心相对光轴的偏移（单位距离处）；shift 以 fit 方向的传感器尺寸归一化。"""
+        fit = self.resolved_fit(scene)
+        half_w, half_h = self.half_extents(scene)
+        unit = (half_w * 2.0) if fit == "HORIZONTAL" else (half_h * 2.0)
+        return self.shift_x * unit, self.shift_y * unit
+
+    def view_frame(self, scene: "FakeScene | None" = None, depsgraph: Any = None) -> list[tuple[float, float, float]]:
+        """复刻真实 Blender：返回 fit 方向半高恒为 0.5 的矩形，且 z 不在单位距离上。"""
+        fit = self.resolved_fit(scene)
+        half_w, half_h = self.half_extents(scene)
+        if self.type == "ORTHO":
+            depth = 1.0
+        else:
+            depth = 0.5 / (half_h if fit == "VERTICAL" else half_w)
+        cx, cy = self.frame_center(scene)
+        hw = half_w * depth
+        hh = half_h * depth
+        return [
+            (cx - hw, cy - hh, -depth),
+            (cx + hw, cy - hh, -depth),
+            (cx + hw, cy + hh, -depth),
+            (cx - hw, cy + hh, -depth),
+        ]
+
+
+def _resolution(scene: "FakeScene | None") -> tuple[float, float]:
+    if scene is None:
+        return (1920.0, 1080.0)
+    return (float(scene.render.resolution_x), float(scene.render.resolution_y))
+
+
+def _pixel_aspect(scene: "FakeScene | None") -> tuple[float, float]:
+    if scene is None:
+        return (1.0, 1.0)
+    return (
+        float(getattr(scene.render, "pixel_aspect_x", 1.0)),
+        float(getattr(scene.render, "pixel_aspect_y", 1.0)),
+    )
+
+
+class FakeObject:
+    """场景对象。``type`` 由 data 推断，行为贴近 bpy。"""
+
+    def __init__(self, name: str, data: Any = None, obj_type: str | None = None) -> None:
+        self.name = name
+        self.data = data
+        if obj_type is None:
+            obj_type = "CAMERA" if isinstance(data, FakeCameraData) else (
+                "MESH" if isinstance(data, FakeMeshData) else "EMPTY"
+            )
+        self.type = obj_type
+        self.location: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.rotation_euler: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.rotation_mode = "XYZ"
+        self.scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+        self.parent: "FakeObject | None" = None
+        self.modifiers: list[FakeModifier] = []
+        self.material_slots: list[FakeMaterialSlot] = []
+        self.hide_render = False
+        self.hide_viewport = False
+        self.rigid_body: Any = None
+        self.animation_data: FakeAnimData | None = None
+        self._scene: "FakeScene | None" = None
+
+    # -- 通用 -------------------------------------------------------------
+    @property
+    def matrix_world(self) -> FakeMatrix:
+        local = compose_matrix(self.location, self.rotation_euler, self.scale)
+        if self.parent is None:
+            return local
+        parent = self.parent.matrix_world
+        rows = [[0.0] * 4 for _ in range(4)]
+        for i in range(3):
+            for j in range(3):
+                rows[i][j] = sum(parent[i][k] * local[k][j] for k in range(3))
+            rows[i][3] = sum(parent[i][k] * local[k][3] for k in range(3)) + parent[i][3]
+        rows[3][3] = 1.0
+        return FakeMatrix(rows)
+
+    def visible_get(self) -> bool:
+        return not self.hide_viewport
+
+    def evaluated_get(self, depsgraph: Any = None) -> "FakeObject":
+        return self
+
+    @property
+    def bound_box(self) -> list[tuple[float, float, float]]:
+        if isinstance(self.data, FakeMeshData) and self.data._bbox is not None:
+            mn, mx = self.data._bbox
+        else:
+            mn, mx = CHARACTER_LOCAL_MIN, CHARACTER_LOCAL_MAX
+        return [
+            (x, y, z) for x in (mn[0], mx[0]) for y in (mn[1], mx[1]) for z in (mn[2], mx[2])
+        ]
+
+
+def _character_bbox(offset: float = 0.0) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """默认角色网格的局部包围盒（可整体外扩，用于模拟描边壳）。"""
+    mn = tuple(v - offset for v in CHARACTER_LOCAL_MIN)
+    mx = tuple(v + offset for v in CHARACTER_LOCAL_MAX)
+    return mn, mx  # type: ignore[return-value]
+
+
+# =============================================================================
+#  bpy.data 集合
+# =============================================================================
+
+
+class FakeObjects:
+    """``bpy.data.objects``：new / remove / get / 迭代，并与场景联动。"""
+
+    def __init__(self, bpy: "FakeBpy") -> None:
+        self._bpy = bpy
+        self._items: list[FakeObject] = []
+
+    def new(self, name: str, data: Any = None) -> FakeObject:
+        obj = FakeObject(name, data)
+        obj._scene = self._bpy.context.scene
+        self._items.append(obj)
+        return obj
+
+    def add(self, obj: FakeObject) -> FakeObject:  # 测试便利方法：同时链接进场景
+        obj._scene = self._bpy.context.scene
+        self._items.append(obj)
+        if obj not in obj._scene.objects:  # noqa: SLF001
+            obj._scene.objects.append(obj)  # noqa: SLF001
+        return obj
+
+    def remove(self, obj: FakeObject, do_unlink: bool = False) -> None:
+        if obj in self._items:
+            self._items.remove(obj)
+        scene = obj._scene
+        if scene is not None and obj in scene.objects:
+            scene.objects.remove(obj)
+
+    def get(self, name: str) -> FakeObject | None:
+        for item in self._items:
+            if item.name == name:
+                return item
+        return None
+
+    def __iter__(self) -> Iterator[FakeObject]:
+        return iter(list(self._items))
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+class FakeCameras:
+    """``bpy.data.cameras``。"""
+
+    def __init__(self, bpy: "FakeBpy") -> None:
+        self._bpy = bpy
+        self._items: list[FakeCameraData] = []
+
+    def new(self, name: str = "Camera", **kwargs: Any) -> FakeCameraData:
+        data = FakeCameraData(name=name, **kwargs)
+        self._items.append(data)
+        return data
+
+    def remove(self, data: FakeCameraData, do_unlink: bool = False) -> None:
+        if data in self._items:
+            self._items.remove(data)
+
+    def get(self, name: str) -> FakeCameraData | None:
+        for item in self._items:
+            if item.name == name:
+                return item
+        return None
+
+    def __iter__(self) -> Iterator[FakeCameraData]:
+        return iter(list(self._items))
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+class _CollectionObjects:
+    def __init__(self, scene: "FakeScene", bpy: "FakeBpy") -> None:
+        self._scene = scene
+        self._bpy = bpy
+
+    def link(self, obj: FakeObject) -> None:
+        if obj not in self._scene.objects:
+            self._scene.objects.append(obj)
+        obj._scene = self._scene
+        if obj not in self._bpy.data.objects._items:  # noqa: SLF001 - 桩内部
+            self._bpy.data.objects._items.append(obj)  # noqa: SLF001
+
+
+class FakeCollection:
+    def __init__(self, scene: "FakeScene", bpy: "FakeBpy") -> None:
+        self.objects = _CollectionObjects(scene, bpy)
+
+
+# =============================================================================
+#  场景
+# =============================================================================
+
+
 class FakeScene:
-    def __init__(self) -> None:
+    def __init__(self, bpy: "FakeBpy | None" = None) -> None:
         self.view_settings = FakeViewSettings()
         self.render = FakeRender()
         self.display_settings = FakeDisplaySettings()
         self.frame_current = 1
+        self.frame_start = 1
+        self.frame_end = 250
         self.name = "Scene"
+        self.objects: list[FakeObject] = []
+        self.camera: FakeObject | None = None
+        self._bpy = bpy
+        self.collection = FakeCollection(self, bpy) if bpy is not None else None
+
+
+class FakeDepsgraph:
+    """仅作标记；``evaluated_get`` 不需要它。"""
+
+
+# =============================================================================
+#  bpy.data / ops / app
+# =============================================================================
 
 
 class FakeImage:
@@ -158,23 +567,20 @@ class FakeOpsRender:
         self._bpy = bpy
 
     def render(self, write_still: bool = True, **kwargs: Any) -> None:
+        scene = self._bpy.context.scene
         self._bpy.render_count += 1
+        self._bpy.last_render_camera = scene.camera.name if scene.camera is not None else None
         self._bpy.last_render_resolution = (
-            self._bpy.context.scene.render.resolution_x,
-            self._bpy.context.scene.render.resolution_y,
-            self._bpy.context.scene.render.resolution_percentage,
+            scene.render.resolution_x,
+            scene.render.resolution_y,
+            scene.render.resolution_percentage,
         )
+        self._bpy.render_scene_camera_history.append(self._bpy.last_render_camera)
 
 
 class _Ops:
     def __init__(self, bpy: "FakeBpy") -> None:
         self.render = FakeOpsRender(bpy)
-
-
-class _Data:
-    def __init__(self, bpy: "FakeBpy") -> None:
-        self.node_groups = _NodeGroupMap(bpy.node_groups)
-        self.images = _ImageMap()
 
 
 class _NodeGroupMap:
@@ -185,9 +591,33 @@ class _NodeGroupMap:
         return self._groups.get(name)
 
 
+class _Data:
+    def __init__(self, bpy: "FakeBpy") -> None:
+        self.node_groups = _NodeGroupMap(bpy.node_groups)
+        self.images = _ImageMap()
+        self.filepath = ""
+        self.is_dirty = False
+        self.objects = FakeObjects(bpy)
+        self.cameras = FakeCameras(bpy)
+
+
 class _App:
     version_string = "5.2.1 LTS"
     background = False
+
+
+class FakeViewLayer:
+    def update(self) -> None:
+        return None
+
+
+class _Context:
+    def __init__(self, bpy: "FakeBpy") -> None:
+        self.scene = bpy._scene  # noqa: SLF001
+        self.view_layer = FakeViewLayer()
+
+    def evaluated_depsgraph_get(self) -> FakeDepsgraph:
+        return FakeDepsgraph()
 
 
 class FakeBpy:
@@ -205,12 +635,92 @@ class FakeBpy:
                 ],
             )
         }
-        self.context = types.SimpleNamespace(scene=FakeScene())
+        self._scene = FakeScene(self)
+        self.context = _Context(self)
         self.app = _App()
         self.data = _Data(self)
         self.ops = _Ops(self)
         self.render_count = 0
         self.last_render_resolution: tuple[int, int, int] | None = None
+        self.last_render_camera: str | None = None
+        self.render_scene_camera_history: list[str | None] = []
+        self.build_default_scene()
+
+    # -- 默认场景（量级参照真实工程）--------------------------------------
+    def build_default_scene(self) -> None:
+        objects = self.data.objects
+
+        arm = objects.add(FakeObject("model_arm", obj_type="ARMATURE"))
+
+        mesh_data = FakeMeshData("model_body", polygons=35544)
+        mesh_data._bbox = _character_bbox()  # noqa: SLF001
+        body = FakeObject("model_mesh", mesh_data)
+        body.material_slots = [FakeMaterialSlot(f"mat_{i:02d}") for i in range(20)]
+        body.modifiers = [FakeModifier("ARMATURE", arm)]
+        body.parent = arm
+        objects.add(body)
+
+        # 刚体代理（真实工程里 138 个，全部 hide_render）
+        for index, bone in enumerate(("下半身A", "左足", "左ひざ")):
+            proxy_data = FakeMeshData(f"proxy_{index}", polygons=40)
+            proxy = FakeObject(f"{index:03d}_{bone}", proxy_data)
+            proxy.material_slots = [FakeMaterialSlot("物理")]
+            proxy.hide_render = True
+            proxy.hide_viewport = True
+            proxy.rigid_body = object()
+            objects.add(proxy)
+
+        # 描边壳（按命名排除，即使它可见且带材质槽）
+        shell_data = FakeMeshData("outline_shell", polygons=35544)
+        shell_data._bbox = _character_bbox(offset=0.001)  # noqa: SLF001
+        shell = FakeObject("model_mesh_outline", shell_data)
+        shell.material_slots = [FakeMaterialSlot("Outline")]
+        objects.add(shell)
+
+        # 默认相机：正面平视，斜后方 6 m，角色完整入画
+        camera = FakeObject("Camera", FakeCameraData("Camera", lens=50.0))
+        camera.location = (0.0, -6.0, 0.8)
+        camera.rotation_euler = (math.pi / 2.0, 0.0, 0.0)
+        objects.add(camera)
+        self._scene.camera = camera
+
+    def use_project_camera(self, *, frame: int = 217) -> FakeObject:
+        """把场景切成「真实工程那台相机」：长焦 + 大 shift + 带动画。
+
+        实测值来自现场 Blender：lens=68.4966 / sensor_fit=VERTICAL /
+        shift_x=0.40 / shift_y=-0.16，角色因此落在画面外。
+        """
+        scene = self._scene
+        data = FakeCameraData(
+            "Duo_Vertical_MMD_Camera",
+            lens=68.49658966064453,
+            sensor_width=36.0,
+            sensor_height=24.0,
+            sensor_fit="VERTICAL",
+            shift_x=0.4,
+            shift_y=-0.16,
+            clip_start=0.1,
+            clip_end=40.0,
+        )
+        data.animation_data = FakeAnimData(FakeAction("Duo_Vertical_MMD_Camera动作.001", fcurves=3))
+        camera = FakeObject("Duo_Vertical_MMD_Camera", data)
+        camera.location = (-0.2975170314311981, -1.2671719789505005, 1.3735994100570679)
+        camera.rotation_euler = (1.5707963705062866, 0.0, 0.0)
+        camera.animation_data = FakeAnimData(FakeAction("Duo_Vertical_MMD_Camera动作.001", fcurves=3))
+        self.data.objects.add(camera)
+        scene.camera = camera
+        scene.frame_current = frame
+        scene.frame_start = 0
+        scene.frame_end = 741
+        scene.render.resolution_x = 1080
+        scene.render.resolution_y = 1980
+        scene.render.resolution_percentage = 50
+        return camera
+
+    # -- 便利 -------------------------------------------------------------
+    @property
+    def scene(self) -> FakeScene:
+        return self._scene
 
     @property
     def glare_node(self) -> FakeNode:
@@ -238,6 +748,41 @@ class FakeBpy:
                 "Size": glare.inputs.get("Size").default_value,  # type: ignore[union-attr]
             },
         }
+
+    # -- 取景快照（测试断言用）--------------------------------------------
+    def snapshot_framing(self) -> dict[str, Any]:
+        scene = self.context.scene
+        camera = scene.camera
+        return {
+            "frame": scene.frame_current,
+            "camera": camera.name if camera is not None else None,
+            "resolution": [
+                scene.render.resolution_x,
+                scene.render.resolution_y,
+                scene.render.resolution_percentage,
+            ],
+            "camera_location": None if camera is None else tuple(camera.location),
+            "camera_rotation": None if camera is None else tuple(camera.rotation_euler),
+            "camera_lens": None if camera is None else camera.data.lens,
+            "camera_shift": None if camera is None else (camera.data.shift_x, camera.data.shift_y),
+        }
+
+    def temp_camera_objects(self) -> list[FakeObject]:
+        return [o for o in self.data.objects if o.name.startswith("__TOON_TUNER_PREVIEW_CAM__")]
+
+    def temp_camera_datablocks(self) -> list[FakeCameraData]:
+        return [d for d in self.data.cameras if d.name.startswith("__TEMP_CAM__")]
+
+
+def _character_bbox(offset: float = 0.0) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    mn = tuple(v - offset for v in CHARACTER_LOCAL_MIN)
+    mx = tuple(v + offset for v in CHARACTER_LOCAL_MAX)
+    return mn, mx  # type: ignore[return-value]
+
+
+# =============================================================================
+#  安装 / 执行
+# =============================================================================
 
 
 @contextlib.contextmanager
