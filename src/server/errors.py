@@ -16,6 +16,11 @@ BLENDER_SCRIPT_ERROR = "BLENDER_SCRIPT_ERROR"
 BLENDER_UNEXPECTED_RESPONSE = "BLENDER_UNEXPECTED_RESPONSE"
 CONFIG_INVALID = "CONFIG_INVALID"
 INTERNAL_ERROR = "INTERNAL_ERROR"
+# MVP-02
+PARAM_INVALID = "PARAM_INVALID"
+NO_BASELINE = "NO_BASELINE"
+JOB_NOT_FOUND = "JOB_NOT_FOUND"
+PREVIEW_FAILED = "PREVIEW_FAILED"
 
 # 错误码 -> (HTTP 状态码, 是否可重试, 面向用户的下一步建议)
 _ERROR_META: dict[str, tuple[int, bool, str]] = {
@@ -53,6 +58,26 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         500,
         True,
         "本地控制服务内部错误，请查看服务日志后重试。",
+    ),
+    PARAM_INVALID: (
+        400,
+        False,
+        "提交的参数不在白名单内或取值越界。请刷新页面后重试。",
+    ),
+    NO_BASELINE: (
+        409,
+        True,
+        "尚未建立内存基线。请先在 Blender 连接正常时建立基线，再调整参数。",
+    ),
+    JOB_NOT_FOUND: (
+        404,
+        False,
+        "任务 ID 不存在或已过期（旧任务会在新预览提交后作废）。",
+    ),
+    PREVIEW_FAILED: (
+        502,
+        True,
+        "预览渲染失败。请确认 Blender 场景中存在相机与合成器节点组，然后重试。",
     ),
 }
 

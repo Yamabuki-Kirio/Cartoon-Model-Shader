@@ -18,6 +18,7 @@ import asyncio
 import datetime as _dt
 import logging
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -25,16 +26,24 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import SERVICE_NAME, __version__, errors, scene_probe
+from . import SERVICE_NAME, __version__, errors, params as params_module, scene_probe
+from .binder import BlenderBinder, preview_dir, preview_png_name
 from .blender_mcp import BlenderMCPClient
 from .config import AppConfig, ConfigError, load_config
 from .models import (
+    BaselineResponse,
     BlenderStatusResponse,
     ErrorResponse,
     HealthResponse,
+    JobResponse,
+    ParamSchemaResponse,
+    PreviewSubmitRequest,
+    PreviewSubmitResponse,
+    RestoreResponse,
     SceneResponse,
 )
 from .redact import redact
+from .session import PreviewService
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
@@ -127,14 +136,27 @@ class BlenderGateway:
 
 def create_app(config: AppConfig | None = None) -> FastAPI:
     cfg = config or load_config()
+    gateway = BlenderGateway(cfg)
+    binder = BlenderBinder(cfg.blender_mcp)
+    preview = PreviewService(binder)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        await preview.start()
+        try:
+            yield
+        finally:
+            await preview.stop()
+
     app = FastAPI(
         title="Cartoon-Model-Shader 本地控制服务",
         version=__version__,
-        description="MVP-01：只读连接 Blender MCP 9876 并展示场景摘要。",
+        description="只读场景摘要 + L0 曝光调参与无污染预览（连接 Blender MCP 9876）。",
+        lifespan=lifespan,
     )
     app.state.config = cfg
-    gateway = BlenderGateway(cfg)
     app.state.gateway = gateway
+    app.state.preview = preview
 
     # -- 全局异常处理：把内部异常统一成稳定错误码 -------------------------
     @app.exception_handler(errors.ToonTunerError)
@@ -182,6 +204,61 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     )
     async def blender_reconnect() -> dict[str, Any]:
         return await gateway.reconnect()
+
+    # -- MVP-02：曝光调参 -------------------------------------------------
+    @app.get("/api/params/schema", response_model=ParamSchemaResponse, tags=["params"])
+    async def params_schema() -> dict[str, Any]:
+        baseline = preview.baseline_public()
+        options = dict(baseline["options"]) if baseline else {}
+        schema = params_module.public_schema(options)
+        return {
+            "ok": True,
+            "schema_version": schema["schema"],
+            "groups": schema["groups"],
+        }
+
+    @app.post("/api/session/baseline", response_model=BaselineResponse, tags=["session"])
+    async def create_baseline() -> dict[str, Any]:
+        return {"ok": True, **(await preview.capture_baseline())}
+
+    @app.get("/api/session/baseline", tags=["session"])
+    async def read_baseline() -> Any:
+        baseline = preview.baseline_public()
+        if baseline is None:
+            raise errors.ToonTunerError(errors.NO_BASELINE, "尚未建立内存基线。")
+        return {"ok": True, **baseline}
+
+    @app.post("/api/session/restore", response_model=RestoreResponse, tags=["session"])
+    async def restore_baseline() -> dict[str, Any]:
+        return await preview.restore_baseline()
+
+    @app.post("/api/preview", response_model=PreviewSubmitResponse, tags=["preview"])
+    async def submit_preview(body: PreviewSubmitRequest) -> dict[str, Any]:
+        job = await preview.submit(body.draft)
+        return {"ok": True, "job_id": job.job_id, "seq": job.seq, "status": job.status}
+
+    @app.get("/api/jobs/{job_id}", response_model=JobResponse, tags=["preview"])
+    async def read_job(job_id: str) -> dict[str, Any]:
+        job = preview.get_job(job_id)
+        if job is None:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        return job.to_public()
+
+    @app.get("/api/preview/{job_id}", tags=["preview"], response_class=FileResponse)
+    async def preview_image(job_id: str) -> Any:
+        job = preview.get_job(job_id)
+        if job is None:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        if job.status != "done":
+            raise errors.ToonTunerError(
+                errors.JOB_NOT_FOUND, f"任务尚未产出预览图（当前状态：{job.status}）。"
+            )
+        path = preview_dir() / preview_png_name(job.job_id)
+        if not path.is_file():
+            raise errors.ToonTunerError(
+                errors.PREVIEW_FAILED, "预览图文件已不存在，请重新提交预览。"
+            )
+        return FileResponse(path, media_type="image/png", filename=path.name)
 
     # -- 静态页面 ---------------------------------------------------------
     index_file = WEB_DIR / "index.html"

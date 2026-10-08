@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
-from typing import Any
+from typing import Any, Callable
 
 from src.server.scene_probe import PROBE_MARKER
 
@@ -61,17 +61,23 @@ def build_probe_stdout(payload: dict[str, Any] | None = None) -> str:
 
 
 class FakeMCPServer:
-    """模式：ok / timeout / bad_json / error / chunked。"""
+    """模式：ok / timeout / bad_json / error / chunked。
+
+    传入 ``executor`` 后，``execute_code`` 会调用它来产生 stdout —— 这让测试可以
+    真的把服务端生成的代码跑一遍（见 ``tests/fake_bpy.py``）。
+    """
 
     def __init__(
         self,
         mode: str = "ok",
         probe_payload: dict[str, Any] | None = None,
         chunk_size: int = 24,
+        executor: Callable[[str], str] | None = None,
     ) -> None:
         self.mode = mode
         self.probe_payload = probe_payload
         self.chunk_size = chunk_size
+        self.executor = executor
         self.host = "127.0.0.1"
         self.port = 0
         self._sock: socket.socket | None = None
@@ -179,7 +185,11 @@ class FakeMCPServer:
         if cmd_type == "ping":
             body = json.dumps({"status": "success", "result": {"pong": True}}).encode("utf-8")
         elif cmd_type == "execute_code":
-            body = build_success_envelope(build_probe_stdout(self.probe_payload))
+            if self.executor is not None:
+                code = str((command.get("params") or {}).get("code", ""))
+                body = build_success_envelope(self.executor(code))
+            else:
+                body = build_success_envelope(build_probe_stdout(self.probe_payload))
         else:
             body = json.dumps(
                 {"status": "error", "message": f"Unknown command type: {cmd_type}"}

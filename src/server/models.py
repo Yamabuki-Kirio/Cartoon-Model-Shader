@@ -78,3 +78,77 @@ class SceneResponse(BaseModel):
     scene: SceneInfo
     objects: ObjectStats
     role_candidates: list[RoleCandidate] = Field(default_factory=list)
+
+
+# -- MVP-02：曝光调参 -------------------------------------------------------
+
+
+class ParamSpecModel(BaseModel):
+    id: str
+    group: str
+    label: str
+    type: Literal["float", "enum"]
+    target: str
+    unit: str = ""
+    note: str = ""
+    minimum: float | None = None
+    maximum: float | None = None
+    step: float | None = None
+    options: list[str] | None = None
+    options_dynamic: bool | None = None
+
+
+class ParamGroup(BaseModel):
+    name: str
+    params: list[ParamSpecModel]
+
+
+class ParamSchemaResponse(BaseModel):
+    ok: Literal[True] = True
+    schema_version: str
+    groups: list[ParamGroup]
+
+
+class BaselineResponse(BaseModel):
+    ok: Literal[True] = True
+    baseline_id: str
+    captured_at: str
+    blender: str
+    glare_present: bool
+    values: dict[str, Any]
+    options: dict[str, list[str]] = Field(default_factory=dict)
+    render: dict[str, Any] = Field(default_factory=dict)
+
+
+class RestoreResponse(BaseModel):
+    ok: Literal[True] = True
+    baseline_id: str
+    verified: bool
+    mismatches: list[dict[str, Any]] = Field(default_factory=list)
+    readback: dict[str, Any]
+
+
+class PreviewSubmitRequest(BaseModel):
+    """只接受「参数 id -> 取值」；不接受任何代码。"""
+
+    draft: dict[str, Any] = Field(default_factory=dict, description="完整草稿：参数 id 到取值的映射")
+
+
+class PreviewSubmitResponse(BaseModel):
+    ok: Literal[True] = True
+    job_id: str
+    seq: int
+    status: str
+
+
+class JobResponse(BaseModel):
+    ok: bool = True
+    job_id: str
+    seq: int
+    status: str
+    created_at: str
+    updated_at: str
+    superseded: bool = False
+    steps: list[str] = Field(default_factory=list)
+    result: dict[str, Any] | None = None
+    error: ErrorDetail | None = None

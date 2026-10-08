@@ -1,11 +1,14 @@
-/* Cartoon-Model-Shader · MVP-01 前端
- * 只读展示：连接状态 + 当前工程/场景摘要。
+/* Cartoon-Model-Shader · 前端
+ * 连接状态 + 当前工程/场景摘要 + L0 曝光调参与预览。
  * 所有动态文本一律用 textContent 写入，绝不拼接 HTML，避免对象名注入。
  */
 (function () {
   "use strict";
 
   var POLL_INTERVAL_MS = 5000;
+  var JOB_POLL_INTERVAL_MS = 200;
+  /* L0 参数停止调整后触发预览的去抖窗口（需求：250–400ms） */
+  var DEBOUNCE_MS = 300;
   var DEFAULT_TARGET = "127.0.0.1:9876";
 
   function el(id) {
@@ -47,9 +50,31 @@
 
   var candidatesTable = document.querySelector(".table-wrap");
 
+  var tuner = {
+    card: el("tuner-card"),
+    baselineBtn: el("baseline-btn"),
+    restoreBtn: el("restore-btn"),
+    resetBtn: el("reset-ui-btn"),
+    baselineInfo: el("baseline-info"),
+    controls: el("param-controls"),
+    img: el("preview-img"),
+    placeholder: el("preview-placeholder"),
+    status: el("preview-status"),
+    jobRaw: el("job-raw")
+  };
+
   var lastStatus = null;
   var sceneLoaded = false;
   var pollTimer = null;
+
+  // -- 调参状态 ---------------------------------------------------------
+  var schemaLoaded = false;
+  var controlsById = {};
+  var baselineValues = null;
+  var debounceTimer = null;
+  var activeJobId = null;
+  var jobPollTimer = null;
+  var previewInFlight = false;
 
   function setText(node, value, fallback) {
     if (!node) {
@@ -115,6 +140,7 @@
   function hideSceneCards() {
     nodes.blenderCard.classList.add("hidden");
     nodes.objectsCard.classList.add("hidden");
+    tuner.card.classList.add("hidden");
     sceneLoaded = false;
   }
 
@@ -224,6 +250,7 @@
       if (justConnected || !sceneLoaded) {
         loadScene();
       }
+      initTuner();
       return true;
     }
 
@@ -302,6 +329,298 @@
     setBusy(false);
   }
 
+  // -- L0 曝光调参 -------------------------------------------------------
+  function setPreviewStatus(text, kind) {
+    tuner.status.textContent = text;
+    tuner.status.classList.remove("status-ok", "status-busy", "status-err");
+    if (kind) {
+      tuner.status.classList.add("status-" + kind);
+    }
+  }
+
+  function showTunerError(error) {
+    var detail = error || {};
+    setPreviewStatus("(" + (detail.code || "ERROR") + ") " + (detail.message || "预览失败"), "err");
+    tuner.jobRaw.textContent = JSON.stringify(detail, null, 2);
+  }
+
+  function clearJobPolling() {
+    if (jobPollTimer) {
+      window.clearInterval(jobPollTimer);
+      jobPollTimer = null;
+    }
+  }
+
+  function buildControl(spec) {
+    var wrap = document.createElement("div");
+    wrap.className = "control";
+
+    var head = document.createElement("div");
+    head.className = "control-head";
+    var label = document.createElement("label");
+    label.setAttribute("for", "ctl-" + spec.id);
+    label.textContent = spec.label;
+    var readout = document.createElement("span");
+    readout.className = "control-value mono";
+    head.appendChild(label);
+    head.appendChild(readout);
+    wrap.appendChild(head);
+
+    var input;
+    if (spec.type === "float") {
+      input = document.createElement("input");
+      input.type = "range";
+      input.min = String(spec.minimum);
+      input.max = String(spec.maximum);
+      input.step = String(spec.step || 0.01);
+    } else {
+      input = document.createElement("select");
+      (spec.options || []).forEach(function (option) {
+        var opt = document.createElement("option");
+        opt.value = option;
+        opt.textContent = option;
+        input.appendChild(opt);
+      });
+    }
+    input.id = "ctl-" + spec.id;
+    input.dataset.paramId = spec.id;
+    wrap.appendChild(input);
+
+    var meta = document.createElement("p");
+    meta.className = "control-meta";
+    if (spec.type === "float") {
+      meta.textContent = "范围 [" + spec.minimum + ", " + spec.maximum + "] · " + spec.target;
+    } else {
+      meta.textContent = spec.options_dynamic ? spec.target + " · 候选取自 Blender 实时配置" : spec.target;
+    }
+    wrap.appendChild(meta);
+
+    if (spec.note) {
+      var note = document.createElement("p");
+      note.className = "control-note";
+      note.textContent = spec.note;
+      wrap.appendChild(note);
+    }
+
+    return { element: wrap, input: input, readout: readout, spec: spec };
+  }
+
+  function updateReadout(entry) {
+    var value = entry.input.value;
+    if (entry.spec.type === "float") {
+      entry.readout.textContent = Number(value).toFixed(2);
+    } else {
+      entry.readout.textContent = "";
+    }
+  }
+
+  function buildControls(groups) {
+    tuner.controls.textContent = "";
+    controlsById = {};
+    (groups || []).forEach(function (group) {
+      var heading = document.createElement("h3");
+      heading.textContent = group.name;
+      tuner.controls.appendChild(heading);
+      (group.params || []).forEach(function (spec) {
+        var entry = buildControl(spec);
+        controlsById[spec.id] = entry;
+        updateReadout(entry);
+        entry.input.addEventListener(entry.spec.type === "float" ? "input" : "change", function () {
+          updateReadout(entry);
+          schedulePreview();
+        });
+        tuner.controls.appendChild(entry.element);
+      });
+    });
+    var hint = document.createElement("p");
+    hint.className = "control-note";
+    hint.textContent = "提示：预览使用的分辨率低于正式导出；参数改动只影响预览，不会写入工程。";
+    tuner.controls.appendChild(hint);
+  }
+
+  async function loadSchema() {
+    var result = await request("/api/params/schema");
+    if (!result.body || !result.body.ok) {
+      tuner.controls.textContent = "";
+      var failed = document.createElement("p");
+      failed.className = "muted";
+      failed.textContent = "参数表读取失败。请确认本地服务与 Blender 均正常后重试。";
+      tuner.controls.appendChild(failed);
+      return false;
+    }
+    buildControls(result.body.groups);
+    schemaLoaded = true;
+    return true;
+  }
+
+  function collectDraft() {
+    var draft = {};
+    Object.keys(controlsById).forEach(function (paramId) {
+      var entry = controlsById[paramId];
+      draft[paramId] = entry.spec.type === "float" ? Number(entry.input.value) : entry.input.value;
+    });
+    return draft;
+  }
+
+  function applyValuesToControls(values) {
+    if (!values) {
+      return;
+    }
+    Object.keys(controlsById).forEach(function (paramId) {
+      var entry = controlsById[paramId];
+      if (!(paramId in values)) {
+        return;
+      }
+      var value = values[paramId];
+      if (entry.spec.type === "float") {
+        entry.input.value = String(value);
+      } else if (entry.spec.options && entry.spec.options.indexOf(value) === -1) {
+        var opt = document.createElement("option");
+        opt.value = value;
+        opt.textContent = value;
+        entry.input.appendChild(opt);
+        entry.input.value = value;
+      } else {
+        entry.input.value = value;
+      }
+      updateReadout(entry);
+    });
+  }
+
+  async function ensureBaseline(force) {
+    if (baselineValues && !force) {
+      return true;
+    }
+    setPreviewStatus("正在建立内存基线…", "busy");
+    var result = await request("/api/session/baseline", { method: "POST" });
+    if (!result.body || !result.body.ok) {
+      showTunerError(result.body && result.body.error);
+      return false;
+    }
+    baselineValues = result.body.values || {};
+    tuner.baselineInfo.textContent =
+      "基线 " + result.body.baseline_id + " · " + formatTime(result.body.captured_at) +
+      " · Blender " + (result.body.blender || "?");
+    applyValuesToControls(baselineValues);
+    setPreviewStatus("基线已建立，可开始调参", "ok");
+    return true;
+  }
+
+  async function onRestoreBaseline() {
+    clearJobPolling();
+    setPreviewStatus("正在恢复基线…", "busy");
+    var result = await request("/api/session/restore", { method: "POST" });
+    if (!result.body) {
+      setPreviewStatus("无法访问本地服务", "err");
+      return;
+    }
+    if (result.body.ok !== true) {
+      showTunerError(result.body.error);
+      return;
+    }
+    applyValuesToControls(result.body.readback);
+    tuner.jobRaw.textContent = JSON.stringify(result.body, null, 2);
+    if (result.body.verified) {
+      setPreviewStatus("已恢复到基线，逐项校验通过", "ok");
+    } else {
+      setPreviewStatus("已恢复，但存在不一致项（见任务详情）", "err");
+    }
+  }
+
+  function schedulePreview() {
+    if (debounceTimer) {
+      window.clearTimeout(debounceTimer);
+    }
+    setPreviewStatus("待预览…", "busy");
+    debounceTimer = window.setTimeout(function () {
+      debounceTimer = null;
+      submitPreview();
+    }, DEBOUNCE_MS);
+  }
+
+  async function submitPreview() {
+    if (!baselineValues) {
+      var ok = await ensureBaseline(false);
+      if (!ok) {
+        return;
+      }
+    }
+    clearJobPolling();
+    previewInFlight = true;
+    setPreviewStatus("已提交预览，等待 Blender…", "busy");
+    var result = await request("/api/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ draft: collectDraft() })
+    });
+    if (!result.body || !result.body.ok) {
+      previewInFlight = false;
+      showTunerError(result.body && result.body.error);
+      return;
+    }
+    activeJobId = result.body.job_id;
+    pollJob(result.body.job_id);
+  }
+
+  function pollJob(jobId) {
+    clearJobPolling();
+    jobPollTimer = window.setInterval(async function () {
+      var result = await request("/api/jobs/" + jobId);
+      if (!result.body) {
+        return;
+      }
+      var job = result.body;
+      tuner.jobRaw.textContent = JSON.stringify(job, null, 2);
+      if (job.status === "queued" || job.status === "running") {
+        setPreviewStatus("Blender 处理中…（" + (job.steps.join(" → ") || job.status) + "）", "busy");
+        return;
+      }
+      clearJobPolling();
+      previewInFlight = false;
+      if (job.status === "superseded") {
+        return;
+      }
+      if (job.status === "failed") {
+        showTunerError(job.error);
+        return;
+      }
+      if (job.status === "done" && job.result) {
+        var url = job.result.preview_url + "?t=" + Date.now();
+        tuner.img.onload = function () {
+          tuner.img.classList.remove("hidden");
+          tuner.placeholder.classList.add("hidden");
+        };
+        tuner.img.src = url;
+        var resolution = job.result.render_resolution || [];
+        var verified = job.result.restore_verified ? "已回滚基线（校验通过）" : "回滚校验未通过";
+        setPreviewStatus(
+          "预览完成 · " + resolution[0] + "×" + resolution[1] + " · " + verified,
+          job.result.restore_verified ? "ok" : "err"
+        );
+      }
+    }, JOB_POLL_INTERVAL_MS);
+  }
+
+  function onResetUi() {
+    if (!baselineValues) {
+      setPreviewStatus("尚未建立基线，无法复位", "err");
+      return;
+    }
+    applyValuesToControls(baselineValues);
+    schedulePreview();
+  }
+
+  async function initTuner() {
+    tuner.card.classList.remove("hidden");
+    if (!schemaLoaded) {
+      var loaded = await loadSchema();
+      if (!loaded) {
+        return;
+      }
+    }
+    await ensureBaseline(false);
+  }
+
   function startPolling() {
     if (pollTimer) {
       window.clearInterval(pollTimer);
@@ -311,6 +630,11 @@
 
   nodes.reconnect.addEventListener("click", onReconnect);
   nodes.refreshScene.addEventListener("click", onRefreshScene);
+  tuner.baselineBtn.addEventListener("click", function () {
+    ensureBaseline(true);
+  });
+  tuner.restoreBtn.addEventListener("click", onRestoreBaseline);
+  tuner.resetBtn.addEventListener("click", onResetUi);
 
   refreshStatus();
   startPolling();

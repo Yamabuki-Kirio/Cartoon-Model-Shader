@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Cartoon-Model-Shader · 连接检测（MVP-01）</title>
+  <title>Cartoon-Model-Shader · 卡通渲染调参</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <header class="page-header">
     <h1>Cartoon-Model-Shader</h1>
-    <p class="subtitle">MVP-01 · 只读连接检测：确认浏览器 → 本地服务 → Blender MCP 三层可靠通信</p>
+    <p class="subtitle">本地调参台：先确认三层通信，再调 L0 曝光参数并即时看预览</p>
   </header>
 
   <main>
@@ -99,10 +99,43 @@
       </div>
       <p class="muted hidden" id="candidates-empty">当前场景没有带材质槽的网格对象。</p>
     </section>
+
+    <section class="card hidden" id="tuner-card">
+      <h2>L0 曝光调参</h2>
+      <p class="muted">
+        拖动滑块或切换下拉后自动触发预览。每次预览都严格遵循「先恢复内存基线 → 再一次性应用整份草稿」，
+        渲染结束后自动回滚到基线并逐项校验，因此不会在上一次结果上累积修改。
+      </p>
+      <div class="tuner-toolbar">
+        <button type="button" id="baseline-btn" class="primary">建立 / 刷新基线</button>
+        <button type="button" id="restore-btn">恢复基线</button>
+        <button type="button" id="reset-ui-btn">控件复位</button>
+        <span class="muted" id="baseline-info">尚未建立基线</span>
+      </div>
+      <div class="tuner-body">
+        <div class="controls" id="param-controls">
+          <p class="muted">正在读取参数表…</p>
+        </div>
+        <div class="preview-pane">
+          <div class="preview-frame">
+            <img id="preview-img" alt="预览图" class="hidden" />
+            <p class="preview-placeholder" id="preview-placeholder">调整参数后将在此显示预览</p>
+          </div>
+          <p class="preview-status" id="preview-status">—</p>
+          <details>
+            <summary>任务详情（排错用）</summary>
+            <pre class="raw" id="job-raw"></pre>
+          </details>
+        </div>
+      </div>
+    </section>
   </main>
 
   <footer class="page-footer">
-    <span>只读模式：不修改场景、不渲染、不保存、不导入。</span>
+    <span>
+      本阶段只输出临时预览 PNG：不保存工程、不覆盖文件、不导入模型、不提供任意 Python 执行接口。
+      预览会临时修改曝光参数，渲染后自动回滚到基线。
+    </span>
   </footer>
 
   <script src="/static/app.js"></script>
