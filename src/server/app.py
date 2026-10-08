@@ -43,7 +43,7 @@ from .models import (
     SceneResponse,
 )
 from .redact import redact
-from .session import PreviewService
+from .session import PreviewService, preview_url_for
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
@@ -219,7 +219,21 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.post("/api/session/baseline", response_model=BaselineResponse, tags=["session"])
     async def create_baseline() -> dict[str, Any]:
-        return {"ok": True, **(await preview.capture_baseline())}
+        """采集内存基线，并**立即**用基线参数创建一次预览任务。
+
+        基线本身不产生画面，之前前端因此停在「可开始调参」却看不到图。
+        这里把「首张基线预览」纳入同一响应：返回的 ``job_id`` /
+        ``preview_url`` 供前端轮询与取图。
+        """
+        baseline = await preview.capture_baseline()
+        job = await preview.submit({})
+        return {
+            "ok": True,
+            **baseline,
+            "job_id": job.job_id,
+            "job_status": job.status,
+            "preview_url": preview_url_for(job.job_id),
+        }
 
     @app.get("/api/session/baseline", tags=["session"])
     async def read_baseline() -> Any:

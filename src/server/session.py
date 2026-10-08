@@ -40,6 +40,16 @@ def _now_iso() -> str:
     return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def preview_url_for(job_id: str) -> str:
+    """预览图的唯一 HTTP 端点。
+
+    落盘位置在系统临时目录（``%TEMP%/toon-tuner-previews``），那是**本机文件
+    系统路径**，浏览器既不能也不应直接把它当作 ``img.src``。前端一律走这个
+    端点取图，服务端按 ``job_id`` 决定实际文件，不接受任何路径参数。
+    """
+    return f"/api/preview/{job_id}"
+
+
 @dataclass
 class Baseline:
     baseline_id: str
@@ -295,7 +305,7 @@ class PreviewService:
             verified, mismatches = _verify(baseline.values, readback)
 
             result = {
-                "preview_url": f"/api/preview/{job.job_id}",
+                "preview_url": preview_url_for(job.job_id),
                 "render_resolution": render.get("render_resolution"),
                 "size_bytes": render.get("size_bytes"),
                 "applied": values_from_read(applied),

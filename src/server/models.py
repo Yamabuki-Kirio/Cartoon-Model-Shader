@@ -110,6 +110,13 @@ class ParamSchemaResponse(BaseModel):
 
 
 class BaselineResponse(BaseModel):
+    """基线采集结果 + 紧跟其后的「基线预览」任务。
+
+    需求：``POST /api/session/baseline`` 成功后**立即**用基线参数创建一次预览，
+    因此响应里同时带上该任务的 ``job_id``。前端据它轮询，图片 load 成功后才
+    显示「基线已建立，可开始调参」。
+    """
+
     ok: Literal[True] = True
     baseline_id: str
     captured_at: str
@@ -118,6 +125,9 @@ class BaselineResponse(BaseModel):
     values: dict[str, Any]
     options: dict[str, list[str]] = Field(default_factory=dict)
     render: dict[str, Any] = Field(default_factory=dict)
+    job_id: str | None = None
+    job_status: str | None = None
+    preview_url: str | None = None
 
 
 class RestoreResponse(BaseModel):

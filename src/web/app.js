@@ -73,8 +73,16 @@
   var baselineValues = null;
   var debounceTimer = null;
   var activeJobId = null;
-  var jobPollTimer = null;
-  var previewInFlight = false;
+  /* 单调递增的「预览代次」：只有最新一次提交允许改写画面，
+     从而保证旧任务的结果永远不会覆盖新图片。 */
+  var previewToken = 0;
+  /* 基线首张预览的 URL（带 job_id 防缓存），供「恢复基线」与后续 A/B 对比复用。 */
+  var baselinePreviewUrl = null;
+  var baselinePreviewJobId = null;
+  /* 同一时刻只允许一次基线采集（连接状态轮询会重复触发）。 */
+  var baselinePromise = null;
+  /* 轮询上限，避免后端异常时前端无限轮询。 */
+  var MAX_POLL_ATTEMPTS = 400;
 
   function setText(node, value, fallback) {
     if (!node) {
@@ -344,11 +352,34 @@
     tuner.jobRaw.textContent = JSON.stringify(detail, null, 2);
   }
 
-  function clearJobPolling() {
-    if (jobPollTimer) {
-      window.clearInterval(jobPollTimer);
-      jobPollTimer = null;
-    }
+  function setPlaceholder(text) {
+    tuner.placeholder.textContent = text;
+    tuner.placeholder.classList.remove("hidden");
+  }
+
+  function delay(ms) {
+    return new Promise(function (resolve) {
+      window.setTimeout(resolve, ms);
+    });
+  }
+
+  /* 只有 onload 之后才显示图片；onerror 一律落到错误态，绝不显示成功。 */
+  function showImage(url, onErrorStatus) {
+    return new Promise(function (resolve) {
+      var img = tuner.img;
+      img.onload = function () {
+        img.classList.remove("hidden");
+        tuner.placeholder.classList.add("hidden");
+        resolve(true);
+      };
+      img.onerror = function () {
+        img.classList.add("hidden");
+        setPlaceholder("预览图无法加载");
+        setPreviewStatus(onErrorStatus, "err");
+        resolve(false);
+      };
+      img.src = url;
+    });
   }
 
   function buildControl(spec) {
@@ -491,6 +522,18 @@
     if (baselineValues && !force) {
       return true;
     }
+    if (baselinePromise) {
+      return baselinePromise;
+    }
+    baselinePromise = captureBaseline();
+    try {
+      return await baselinePromise;
+    } finally {
+      baselinePromise = null;
+    }
+  }
+
+  async function captureBaseline() {
     setPreviewStatus("正在建立内存基线…", "busy");
     var result = await request("/api/session/baseline", { method: "POST" });
     if (!result.body || !result.body.ok) {
@@ -502,12 +545,25 @@
       "基线 " + result.body.baseline_id + " · " + formatTime(result.body.captured_at) +
       " · Blender " + (result.body.blender || "?");
     applyValuesToControls(baselineValues);
-    setPreviewStatus("基线已建立，可开始调参", "ok");
+
+    if (!result.body.job_id) {
+      /* 兜底：后端未返回首张预览任务时，至少保持界面可用。 */
+      setPreviewStatus("基线已建立，可开始调参", "ok");
+      return true;
+    }
+
+    /* 需求：基线成功后立即用基线参数渲染一次预览；
+       只有图片 load 成功才显示「可开始调参」。 */
+    var token = ++previewToken;
+    tuner.img.classList.add("hidden");
+    setPlaceholder("正在渲染基线预览…");
+    setPreviewStatus("正在渲染基线预览…", "busy");
+    await runPreviewJob(result.body.job_id, { baseline: true }, token);
     return true;
   }
 
   async function onRestoreBaseline() {
-    clearJobPolling();
+    ++previewToken; /* 让在途的预览轮询失效，避免旧结果覆盖基线画面 */
     setPreviewStatus("正在恢复基线…", "busy");
     var result = await request("/api/session/restore", { method: "POST" });
     if (!result.body) {
@@ -520,11 +576,19 @@
     }
     applyValuesToControls(result.body.readback);
     tuner.jobRaw.textContent = JSON.stringify(result.body, null, 2);
-    if (result.body.verified) {
-      setPreviewStatus("已恢复到基线，逐项校验通过", "ok");
-    } else {
+    if (!result.body.verified) {
       setPreviewStatus("已恢复，但存在不一致项（见任务详情）", "err");
+      return;
     }
+    if (baselinePreviewUrl) {
+      /* 场景已回到基线，直接复用保存的基线预览图，无需重复渲染。 */
+      var loaded = await showImage(baselinePreviewUrl, "基线预览图无法加载，请点「建立 / 刷新基线」重试");
+      if (loaded) {
+        setPreviewStatus("已恢复到基线，逐项校验通过（显示基线预览）", "ok");
+      }
+      return;
+    }
+    setPreviewStatus("已恢复到基线，逐项校验通过", "ok");
   }
 
   function schedulePreview() {
@@ -545,60 +609,102 @@
         return;
       }
     }
-    clearJobPolling();
-    previewInFlight = true;
+    var token = ++previewToken;
     setPreviewStatus("已提交预览，等待 Blender…", "busy");
     var result = await request("/api/preview", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ draft: collectDraft() })
     });
+    if (token !== previewToken) {
+      return; /* 期间已有更新的提交，本次结果直接丢弃 */
+    }
     if (!result.body || !result.body.ok) {
-      previewInFlight = false;
       showTunerError(result.body && result.body.error);
       return;
     }
     activeJobId = result.body.job_id;
-    pollJob(result.body.job_id);
+    await runPreviewJob(activeJobId, { baseline: false }, token);
   }
 
-  function pollJob(jobId) {
-    clearJobPolling();
-    jobPollTimer = window.setInterval(async function () {
+  /* 轮询到终态。被更新的提交取代时返回 null —— 此时绝不能改写画面。 */
+  async function pollJob(jobId, token) {
+    var attempts = 0;
+    while (true) {
+      if (token !== previewToken) {
+        return null;
+      }
       var result = await request("/api/jobs/" + jobId);
-      if (!result.body) {
-        return;
+      if (result.body) {
+        var job = result.body;
+        tuner.jobRaw.textContent = JSON.stringify(job, null, 2);
+        if (job.status !== "queued" && job.status !== "running") {
+          return job;
+        }
+        if (token === previewToken) {
+          setPreviewStatus("Blender 处理中…（" + (job.steps.join(" → ") || job.status) + "）", "busy");
+        }
       }
-      var job = result.body;
-      tuner.jobRaw.textContent = JSON.stringify(job, null, 2);
-      if (job.status === "queued" || job.status === "running") {
-        setPreviewStatus("Blender 处理中…（" + (job.steps.join(" → ") || job.status) + "）", "busy");
-        return;
-      }
-      clearJobPolling();
-      previewInFlight = false;
-      if (job.status === "superseded") {
-        return;
-      }
-      if (job.status === "failed") {
-        showTunerError(job.error);
-        return;
-      }
-      if (job.status === "done" && job.result) {
-        var url = job.result.preview_url + "?t=" + Date.now();
-        tuner.img.onload = function () {
-          tuner.img.classList.remove("hidden");
-          tuner.placeholder.classList.add("hidden");
+      attempts += 1;
+      if (attempts >= MAX_POLL_ATTEMPTS) {
+        return {
+          status: "failed",
+          error: { code: "JOB_TIMEOUT", message: "等待 Blender 完成任务超时。", retryable: true }
         };
-        tuner.img.src = url;
-        var resolution = job.result.render_resolution || [];
-        var verified = job.result.restore_verified ? "已回滚基线（校验通过）" : "回滚校验未通过";
-        setPreviewStatus(
-          "预览完成 · " + resolution[0] + "×" + resolution[1] + " · " + verified,
-          job.result.restore_verified ? "ok" : "err"
-        );
       }
-    }, JOB_POLL_INTERVAL_MS);
+      await delay(JOB_POLL_INTERVAL_MS);
+    }
+  }
+
+  async function runPreviewJob(jobId, opts, token) {
+    var options = opts || {};
+    var job = await pollJob(jobId, token);
+    if (job === null || token !== previewToken) {
+      return null; /* 已被更新的提交接管，不触碰画面与状态 */
+    }
+    if (job.status === "superseded") {
+      return job; /* 画面与状态归最新那次提交所有 */
+    }
+    if (job.status === "failed") {
+      var detail = job.error || {};
+      if (options.baseline) {
+        /* 需求：基线参数仍然保留，但 UI 必须明确显示预览失败。 */
+        setPlaceholder("基线预览失败");
+        setPreviewStatus(
+          "基线已建立，预览失败：(" + (detail.code || "ERROR") + ") " + (detail.message || "预览未完成"),
+          "err"
+        );
+      } else {
+        showTunerError(job.error);
+      }
+      return job;
+    }
+    if (job.status === "done" && job.result && job.result.preview_url) {
+      /* 防缓存：URL 带上本次 job_id，避免浏览器复用同路径的旧图。 */
+      var url = job.result.preview_url + "?v=" + encodeURIComponent(job.job_id);
+      var loaded;
+      if (options.baseline) {
+        loaded = await showImage(url, "基线已建立，预览失败：预览图无法加载");
+        if (loaded && token === previewToken) {
+          baselinePreviewUrl = url;
+          baselinePreviewJobId = job.job_id;
+          setPreviewStatus("基线已建立，可开始调参", "ok");
+        }
+      } else {
+        loaded = await showImage(url, "(PREVIEW_IMAGE_LOAD_FAILED) 预览图无法加载，请刷新后重试");
+        if (loaded && token === previewToken) {
+          var resolution = job.result.render_resolution || [];
+          var verified = job.result.restore_verified ? "已回滚基线（校验通过）" : "回滚校验未通过";
+          setPreviewStatus(
+            "预览完成 · " + resolution[0] + "×" + resolution[1] + " · " + verified,
+            job.result.restore_verified ? "ok" : "err"
+          );
+        }
+      }
+      return job;
+    }
+    setPreviewStatus("预览未完成（状态：" + job.status + "）", "err");
+    return job;
   }
 
   function onResetUi() {
