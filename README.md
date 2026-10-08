@@ -1,8 +1,10 @@
-# 本地卡通渲染调参工具（Toon Tuner）
+# Cartoon-Model-Shader
 
-一款**仅在本机运行**的 Blender 卡通渲染调参工具。用户在 Blender 中打开待渲染的 `.blend`，通过浏览器界面调整卡通渲染参数，点「查看效果」即刻得到预览图；满意后保存预设、应用到当前工程并导出正式渲染。
+> **自用项目，不开源。**
 
-核心目标：把调参反馈压缩到 **1–3 秒**，同时保证每次预览**可复现、可回滚、不累积污染**。
+做 MMD 模型三渲二的时候下载了很多插件 —— Autocel 智能卡通化着色器、Cycles Render Engine、glTF 2.0 format、MCP for Blender、MiaoboxNode、MikuMikuRig、MMD Tools、MMD Tools Append、MMD 自动换头、mmd_kafei_tools、Pose Library、卡渲秘咒。顺序繁多，每次从零开始做出来的效果都不一样，所以做了个脚本自动把模型渲染成我理想中的情况，现在再做可视化界面方便调参数。
+
+MMD 刚入门，渲染水平很低，见谅。只用于自用。
 
 > 需求全文见 [`docs/需求文档.md`](docs/需求文档.md)。
 
@@ -63,7 +65,7 @@
 ## 目录结构
 
 ```
-toon-tuner/
+Cartoon-Model-Shader/
 ├── docs/                  设计与需求文档
 │   └── 需求文档.md
 ├── reference/             参考数据（参数面 schema 等）
