@@ -63,6 +63,8 @@ PRESET_INCOMPATIBLE = "PRESET_INCOMPATIBLE"
 FRONTEND_NOT_BUILT = "FRONTEND_NOT_BUILT"
 #: v4 通用执行器在 Blender 侧写入失败（该次写入已被执行器自己回滚）。
 SURFACE_APPLY_FAILED = "SURFACE_APPLY_FAILED"
+#: `/next` 的静态资源不存在（含路径越界；两种情况刻意不区分）。
+ASSET_NOT_FOUND = "ASSET_NOT_FOUND"
 
 #: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，
 #: 便于调用方直接读到 ``parameter`` / ``value`` / ``depends_on`` / ``allowed``。
@@ -291,6 +293,11 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         True,
         "参数写入 Blender 失败（本次写入已被自动回滚，工程里的取值未改变）。"
         "请确认对应对象仍然存在后重试。",
+    ),
+    ASSET_NOT_FOUND: (
+        404,
+        False,
+        "前端静态资源不存在。若页面白屏，请重新执行 npm run build 后再刷新。",
     ),
 }
 

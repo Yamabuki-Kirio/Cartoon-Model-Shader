@@ -34,6 +34,12 @@ build/
 out/
 *.log
 
+# ===== v4 前端（web/）=====
+# 构建产物**不入库**：发布与人工验收前按需 `npm run build`（约定见 docs/技术方案_v4.md §12）。
+web/dist/
+# 依赖不入库；但 package-lock.json **必须入库**，否则构建不可复现。
+web/node_modules/
+
 # ===== 工具运行时产物（预览图 / 临时基线 / 自动备份）=====
 runtime/
 previews/
