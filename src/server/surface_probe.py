@@ -317,6 +317,20 @@ def describe_groups(payload: dict[str, Any]) -> dict[str, Any]:
                     int(node["color_ramp"].get("element_count") or 0) for node in ramps
                 ],
                 "structure_signature": list(raw.get("structure_signature") or []),
+                # 节点级拓扑：Cel 适配器需要它来判断「有没有色带、色带在哪、
+                # 有没有 Emission 强度插座」。已经过 redact_describe 脱敏。
+                "nodes": [
+                    {
+                        "name": node.get("name"),
+                        "type": node.get("type"),
+                        "bl_idname": node.get("bl_idname"),
+                        "mute": bool(node.get("mute")),
+                        "inputs": list(node.get("inputs") or []),
+                        "color_ramp": node.get("color_ramp"),
+                    }
+                    for node in (raw.get("nodes") or [])
+                    if isinstance(node, dict)
+                ],
             }
         )
     found = [group for group in groups if group["exists"]]
