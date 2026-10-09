@@ -33,6 +33,24 @@ function celGroup(name: string, count: number, extra: Record<string, unknown> = 
   });
 }
 
+/** jsdom 里没有布局：给轨道一个固定的几何，位置才能从 clientX 算出来。 */
+function stubTrackGeometry(track: Element, width = 200): void {
+  (track as HTMLElement).getBoundingClientRect = () =>
+    ({ left: 0, top: 0, right: width, bottom: 10, width, height: 10, x: 0, y: 0 }) as DOMRect;
+}
+
+/** 用 MouseEvent 造指针事件：jsdom 的 PointerEvent 支持不完整，而处理函数只读坐标。 */
+function pointer(type: "pointerdown" | "pointermove" | "pointerup", clientX: number): MouseEvent {
+  return new MouseEvent(type, { bubbles: true, cancelable: true, clientX });
+}
+
+function rampDraft(workspace: ReturnType<typeof makeTestWorkspace>["workspace"]) {
+  return workspace.store.getState().draft["cel.Cel_Skin.ramp"] as {
+    elements: Array<{ position: number; color: number[] }>;
+    interpolation: string;
+  };
+}
+
 describe("Cel 编辑器", () => {
   it("2 / 3 / 4 个色标都渲染出对应数量的控件", async () => {
     for (const count of [2, 3, 4]) {
@@ -90,6 +108,87 @@ describe("Cel 编辑器", () => {
       elements: Array<{ position: number }>;
     };
     expect(draft.elements[1].position).toBeCloseTo(0.6);
+  });
+
+  it("真实拖动生命周期：pointerdown → pointermove → pointerup 改草稿并封存历史", async () => {
+    const { workspace } = await setup([celGroup("Cel_Skin", 3)]);
+    const { getByTestId } = render(<CelEditor workspace={workspace} groupId="cel.Cel_Skin" />);
+    const track = getByTestId("ramp-track-cel.Cel_Skin");
+    stubTrackGeometry(track, 200);
+    const handle = getByTestId("ramp-handle-cel.Cel_Skin-1");
+
+    // 拖动前先动一次别的东西，验证「拖动只追加一条记录」
+    fireEvent.input(getByTestId("ramp-position-cel.Cel_Skin-1"), { target: { value: "0.5" } });
+    fireEvent.blur(getByTestId("ramp-position-cel.Cel_Skin-1"));
+    expect(workspace.store.getState().undoDepth).toBe(1);
+
+    fireEvent(handle, pointer("pointerdown", 100));
+    // 每次事件之间让 Preact 完成重渲染 —— 浏览器里就是这样，拖动跨多帧。
+    // 若「当前拖第几号」靠 state 判定，这里每一步都会读到 null 而整段失效。
+    await settle(2);
+    // 两次 move 用同一个 mergeKey ⇒ 只算一条撤销记录
+    fireEvent(track, pointer("pointermove", 40)); // → 0.2
+    await settle(2);
+    fireEvent(track, pointer("pointermove", 60)); // → 0.3
+    await settle(2);
+    expect(rampDraft(workspace).elements[1].position).toBeCloseTo(0.3);
+    expect(workspace.store.getState().undoDepth).toBe(2);
+
+    // 邻居约束仍然生效：拖过右侧色标（1.0）会被夹住
+    fireEvent(track, pointer("pointermove", 400)); // → 被夹到 1 - MIN_POSITION_GAP
+    await settle(2);
+    expect(rampDraft(workspace).elements[1].position).toBeLessThan(1);
+    expect(rampDraft(workspace).elements[1].position).toBeGreaterThan(0.99);
+
+    fireEvent(track, pointer("pointerup", 400));
+    await settle(2);
+    // 松开后仍继续 move ⇒ 不应再改草稿（证明拖动真的结束了）
+    const afterUp = rampDraft(workspace).elements[1].position;
+    fireEvent(track, pointer("pointermove", 20));
+    await settle(2);
+    expect(rampDraft(workspace).elements[1].position).toBe(afterUp);
+
+    // 松开已经封存历史：下一次拖动是新的一条记录
+    fireEvent(handle, pointer("pointerdown", 100));
+    await settle(2);
+    fireEvent(track, pointer("pointermove", 80)); // → 0.4
+    await settle(2);
+    expect(workspace.store.getState().undoDepth).toBe(3);
+
+    // 撤销回到上一次拖动结束时的那条记录，而不是回到拖动中途
+    workspace.actions.undo();
+    expect(rampDraft(workspace).elements[1].position).toBeCloseTo(afterUp);
+  });
+
+  it("轨道宽度为 0（布局未就绪）时拖动不写入草稿", async () => {
+    const { workspace } = await setup([celGroup("Cel_Skin", 3)]);
+    const { getByTestId } = render(<CelEditor workspace={workspace} groupId="cel.Cel_Skin" />);
+    const track = getByTestId("ramp-track-cel.Cel_Skin");
+    // 不 stub：jsdom 的 getBoundingClientRect 全是 0
+    fireEvent(getByTestId("ramp-handle-cel.Cel_Skin-1"), pointer("pointerdown", 100));
+    fireEvent(track, pointer("pointermove", 100));
+    expect(workspace.store.getState().dirtyIds.size).toBe(0);
+    expect(workspace.store.getState().undoDepth).toBe(0);
+  });
+
+  it("只读组即使收到指针事件也不改草稿", async () => {
+    const { workspace } = await setup([
+      groupNode("Sakura_Hair_Reference", {
+        editable: false,
+        children: [rampNode({ group: "Sakura_Hair_Reference", editable: false })],
+      }),
+    ]);
+    const { getByTestId } = render(
+      <CelEditor workspace={workspace} groupId="cel.Sakura_Hair_Reference" />
+    );
+    const track = getByTestId("ramp-track-cel.Sakura_Hair_Reference");
+    stubTrackGeometry(track);
+    fireEvent(
+      getByTestId("ramp-handle-cel.Sakura_Hair_Reference-1"),
+      pointer("pointerdown", 100)
+    );
+    fireEvent(track, pointer("pointermove", 20));
+    expect(workspace.store.getState().dirtyIds.size).toBe(0);
   });
 
   it("编辑不自动触发渲染（L1：只改草稿）", async () => {

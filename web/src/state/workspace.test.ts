@@ -170,6 +170,98 @@ describe("工作台状态机", () => {
     expect(state.lastSuccessfulPreview).toBe(good);
   });
 
+  it("预览任务以 STRUCTURE_CHANGED 终结时，走同一条结构阻断路径", async () => {
+    // 服务端同样会用任务终态报结构失效（提交后工程被改）。若这里只写一句 error，
+    // 草稿不作废、historyBlocked 仍为 false，用户还能继续提交已作废的草稿。
+    let mode: "ok" | "structure" = "ok";
+    const { workspace, endpoints } = makeWorkspace({
+      job: vi.fn(async () =>
+        mode === "ok"
+          ? (jobPayload() as unknown as JobState)
+          : (jobPayload({
+              status: "failed",
+              result: null,
+              error: {
+                code: "STRUCTURE_CHANGED",
+                message: "工程结构已变化：色标数量与基线不一致。",
+                retryable: true,
+                details: { structure_changed: ["Cel_Skin"] },
+              },
+            }) as unknown as JobState)
+      ),
+    });
+    await workspace.actions.bootstrap();
+    workspace.actions.setValue("cel.Cel_Skin.ramp", { elements: [], interpolation: "EASE" });
+    await workspace.actions.applyAndPreview();
+    await settle();
+    const preview = workspace.store.getState().lastSuccessfulPreview;
+    expect(preview).toBeTruthy();
+
+    mode = "structure";
+    workspace.actions.setValue("cel.Cel_Skin.ramp", { elements: [], interpolation: "LINEAR" });
+    await workspace.actions.applyAndPreview();
+    await settle();
+
+    const state = workspace.store.getState();
+    expect(state.error?.code).toBe("STRUCTURE_CHANGED");
+    expect(state.historyBlocked).toBe(true);
+    expect(state.draft).toEqual({});
+    expect(state.dirtyIds.size).toBe(0);
+    expect(state.canUndo).toBe(false);
+    expect(state.notice).toContain("作废");
+    // 任务上下文照旧带上；最后一张成功预览**不受影响**
+    expect(state.activeJob?.status).toBe("failed");
+    expect(state.lastSuccessfulPreview).toBe(preview);
+
+    // 阻断生效：再提交直接被拒，且不产生新任务
+    endpoints.submitPreview.mockClear();
+    await expect(workspace.actions.applyAndPreview()).resolves.toBe(false);
+    expect(endpoints.submitPreview).not.toHaveBeenCalled();
+  });
+
+  it("IDENTITY_MISSING 的任务终态同样触发阻断", async () => {
+    const { workspace } = makeWorkspace({
+      job: vi.fn(async () =>
+        jobPayload({
+          status: "failed",
+          result: null,
+          error: { code: "IDENTITY_MISSING", message: "对象已重命名。", retryable: true },
+        }) as unknown as JobState
+      ),
+    });
+    await workspace.actions.bootstrap();
+    workspace.actions.setValue("cel.Cel_Skin.ramp", { elements: [], interpolation: "EASE" });
+    await workspace.actions.applyAndPreview();
+    await settle();
+    expect(workspace.store.getState().historyBlocked).toBe(true);
+    expect(workspace.store.getState().error?.code).toBe("IDENTITY_MISSING");
+  });
+
+  it("关闭错误提示不解除结构锁（锁只能由成功刷新基线解除）", async () => {
+    const { workspace, endpoints } = makeWorkspace();
+    await workspace.actions.bootstrap();
+    workspace.actions.applyStructureFatal({
+      code: "STRUCTURE_CHANGED",
+      message: "结构已变化",
+      retryable: true,
+    });
+
+    workspace.actions.clearError();
+    let state = workspace.store.getState();
+    expect(state.error).toBeNull();
+    expect(state.historyBlocked).toBe(true);
+
+    // 关掉横幅之后依然提交不了
+    endpoints.submitPreview.mockClear();
+    await expect(workspace.actions.applyAndPreview()).resolves.toBe(false);
+    expect(endpoints.submitPreview).not.toHaveBeenCalled();
+
+    // 只有刷新基线成功才解锁
+    await workspace.actions.refreshBaseline();
+    state = workspace.store.getState();
+    expect(state.historyBlocked).toBe(false);
+  });
+
   it("外部值变化只提示，不作废草稿", async () => {
     const external = [{ id: "cel.Cel_Skin.ramp[1].color.0", baseline: 0.5, current: 0.9 }];
     const { workspace } = makeWorkspace({

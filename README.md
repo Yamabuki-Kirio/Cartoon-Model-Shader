@@ -121,9 +121,13 @@ Cartoon-Model-Shader/
 │   ├── index.html                   构建入口（含 <!--TOON_TUNER_TOKEN--> 占位）
 │   ├── tooling/                     构建侧工具与断言（**不叫 build/**：`.gitignore` 忽略 `build/`）
 │   │   ├── token-placeholder.ts     令牌占位插件 + 「令牌形态」判据
+│   │   ├── dev-token-bridge.ts      仅开发期：/__dev/token 把后端注入的令牌转交页面
+│   │   ├── dev-token-bridge.test.ts 令牌桥：提取/失败原因/不缓存
 │   │   └── dist-artifacts.test.ts   产物断言 + 仓库卫生（文件不得被 .gitignore 忽略）
 │   ├── scripts/verify-dist.mjs      构建产物校验（npm run build 的最后一步）
 │   ├── src/{api,schema,state,components,features,styles,testing}/
+│   │   ├── api/dev-token.ts         仅开发期：把 dev server 的令牌装进与生产同一个全局变量
+│   │   └── testing/setup-dom.ts     测试环境保真：补 jsdom 缺失的 onpointer* IDL 属性
 │   └── dist/                        构建产物（**不入库**）
 ├── tests/                           假 MCP + 假 bpy 桩 + pytest 用例
 │   ├── fake_bpy.py                  可执行 bpy 桩（复刻 view_frame / ops.wm 保存等真实行为）
@@ -182,6 +186,12 @@ npm run build
 开发时可以用 Vite dev server（`npm run dev`，默认 5173，`/api` 已代理到 8765），
 但**生产入口始终是 FastAPI**：`dist` 里的 `index.html` 只有 `<!--TOON_TUNER_TOKEN-->` 占位，
 令牌由服务端在响应时注入，因此磁盘上的产物里永远没有令牌。
+
+开发期有个绕不开的落差：页面由 dev server 提供，而令牌只存在于 FastAPI 的响应里，
+于是**所有写请求都会 401**。为此 dev server 暴露了一个 `apply: "serve"` 的令牌桥
+（`GET /__dev/token`）：它代取一次 FastAPI 页面、把注入的令牌转交前端，
+前端仍然只从 `window.__TOON_TUNER_TOKEN__` 这一处读 —— 生产与开发**共用同一条读取路径**，
+所以「开发能用、生产 401」这类差异不会藏起来。该插件不进构建产物（`dist` 里搜不到它）。
 
 多一条关于缓存的约定：`index.html` 明确 `no-store`（它含本次进程的会话令牌），
 而 `assets/` 下的文件带内容哈希、可以长期缓存。
@@ -351,6 +361,15 @@ npm run typecheck
 npm run build     # 末尾会跑 scripts/verify-dist.mjs 校验产物
 npm run test      # tooling/dist-artifacts.test.ts 会断言 dist 的真实内容，因此 build 要在 test 之前
 ```
+
+前端测试有两条与**运行环境**有关的约定，目的不是「让测试变绿」，而是让测试可信：
+
+- **jsdom 缺少 `onpointer*` IDL 属性**：Preact 按 `"onpointerdown" in element` 决定注册的事件名，
+  为假时会注册驼峰 `PointerDown`，于是浏览器语义的 `pointerdown` 永远打不中 ——
+  表现是「拖动在测试里毫无反应」，看起来像组件坏了。`src/testing/setup-dom.ts` 在 `setupFiles`
+  里补上缺失的 IDL 属性（**只补存在性**，不伪造 `setPointerCapture` 等行为，组件已按不支持捕获降级）。
+- **开发期令牌桥**（`tooling/dev-token-bridge.test.ts`）：断言它能取到令牌、失败时给出明确原因、
+  响应不缓存。没有它，`npm run dev` 下所有写请求都会 401。
 
 测试使用内置假 MCP 服务与**假 `bpy` 桩**，不需要安装 Blender：
 
