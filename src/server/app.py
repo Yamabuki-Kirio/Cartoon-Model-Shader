@@ -1,7 +1,9 @@
 """FastAPI 应用：本地卡通渲染调参台。
 
 路由：
-* ``GET  /``                       单页界面
+* ``GET  /``                       旧单页界面（原生 HTML/CSS/JS，行为不变）
+* ``GET  /next``                   v4 工作台（构建产物；未构建 ⇒ 503 FRONTEND_NOT_BUILT）
+* ``GET  /next/assets/{path}``     v4 构建资源（内容哈希命名，长缓存；越界 ⇒ 404）
 * ``GET  /api/health``             仅检查本地控制服务
 * ``GET  /api/blender/status``     快速探测端口与协议
 * ``GET  /api/blender/scene``      执行完整只读场景探针
@@ -10,7 +12,7 @@
 * ``GET  /api/params/schema``      L0 参数表
 * ``GET  /api/color/looks``        某视图下 Blender 真正接受的 look 档位（依赖枚举）
 * ``POST /api/color/looks/refresh`` 重新扫描 look 能力表
-* ``POST /api/session/baseline``   采集内存基线（含取景快照）+ 首张预览
+* ``POST /api/session/baseline``   采集内存基线（含取景快照与 v4 拓扑）+ 首张预览
 * ``POST /api/session/restore``    回滚到基线（走同一套依赖映射）
 * ``POST /api/preview``            提交草稿 + 取景方式，产出预览任务
 * ``GET  /api/jobs/{id}``          任务状态
@@ -36,6 +38,8 @@
   且确认令牌与基线/草稿/模式/目标路径逐项绑定，不可复用或篡改。
 * look 是依赖 ``view_transform`` 的枚举：后端在**下发脚本前**完成依赖校验，
   非法组合返回稳定错误 ``INVALID_DEPENDENT_ENUM``，不退化成 ``BLENDER_SCRIPT_ERROR``。
+* ``/next`` 的前端构建产物由本服务托管；**令牌只注入 HTML**，静态资源逐字节直出，
+  且 ``index.html`` 明确 ``no-store``（它含本次进程的会话令牌）；资源路径越界一律 404。
 """
 
 from __future__ import annotations
@@ -57,6 +61,7 @@ from . import (
     __version__,
     errors,
     framing as framing_module,
+    frontend,
     params as params_module,
     presets as presets_module,
     scene_probe,
@@ -95,6 +100,7 @@ from .presets import PresetStore
 from .redact import redact
 from .session import PreviewService, preview_url_for, validate_draft
 from .surface_service import SurfaceService
+from . import config as config_module
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
@@ -627,7 +633,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     async def index() -> Any:
-        """单页界面。
+        """旧单页界面（原生 HTML/CSS/JS）。
 
         令牌在**响应时**注入：磁盘上的 ``index.html`` 只有占位注释，
         因此令牌永远不会出现在静态文件、构建产物或日志里。
@@ -641,6 +647,38 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 errors.INTERNAL_ERROR, "前端页面缺失（src/web/index.html）"
             ).to_payload(),
         )
+
+    # -- v4 工作台（/next）------------------------------------------------
+    #: 构建产物目录：`web/dist`。只影响服务端自己；接口层不接受任何路径参数。
+    web_root = cfg.web_dir or (config_module.REPO_ROOT / "web")
+
+    @app.get("/next", include_in_schema=False, response_class=HTMLResponse)
+    async def next_index() -> Any:
+        """v4 工作台页面。
+
+        未构建时**明确报 503 FRONTEND_NOT_BUILT 与构建步骤**，
+        绝不回退到旧页面 —— 那会让人以为「新工作台就是这样」。
+        页面含会话令牌，因此 ``no-store``。
+        """
+        html = frontend.read_index(web_root)
+        response = HTMLResponse(security.inject_token(html, guard.token))
+        response.headers["Cache-Control"] = frontend.INDEX_CACHE_CONTROL
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+
+    @app.get("/next/assets/{asset_path:path}", include_in_schema=False)
+    async def next_asset(asset_path: str) -> Any:
+        """v4 构建资源。
+
+        * **逐字节直出**：不做任何令牌注入（令牌必须只出现在 HTML 里）；
+        * 文件名带内容哈希 ⇒ 长缓存；
+        * 路径越界与不存在一律 404。
+        """
+        path = frontend.resolve_asset(web_root, asset_path)
+        response = FileResponse(path, media_type=frontend.content_type_for(path))
+        response.headers["Cache-Control"] = frontend.ASSET_CACHE_CONTROL
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     return app
 

@@ -97,12 +97,13 @@ Cartoon-Model-Shader/
 │   │   ├── framing.py               预览取景：只读构图诊断 + 临时预览相机 + 基线失效比对
 │   │   ├── color_looks.py           依赖枚举：view_transform → 合法 look 的探测/迁移/校验
 │   │   ├── blender_ops.py           由白名单生成只读/写入/渲染代码
-│   │   ├── binder.py                高层绑定：读基线 / 写草稿 / 渲染预览
-│   │   ├── session.py               内存基线 + 任务队列（旧任务自动作废）
+│   │   ├── binder.py                高层绑定：读基线 / 写草稿 / 渲染预览 / 通用执行器入口
+│   │   ├── session.py               内存基线 + 任务队列（旧任务自动作废）+ v4 任务路径
 │   │   ├── security.py              本机会话令牌（所有写接口的统一闸门）
 │   │   ├── presets.py               预设存储（原子写入；文件名由服务端派生）
 │   │   ├── project_ops.py           工程读/写固定模板 + 同目录时间戳备份
 │   │   ├── commit.py                应用到工程：确认令牌 / 回读校验 / 备份 / 保存
+│   │   ├── frontend.py              /next 构建产物托管（令牌只注入 HTML、越界 404）
 │   │   ├── surface_probe.py         只读拓扑探针（脱敏；v4 的探测原料）
 │   │   ├── surface_service.py       v4 参数面状态：身份 + 结构指纹 + schema + 基线值
 │   │   ├── surface/                 v4 参数面（纯函数式）
@@ -115,7 +116,15 @@ Cartoon-Model-Shader/
 │   │   ├── models.py                API 模型
 │   │   ├── errors.py                稳定错误码
 │   │   └── redact.py                诊断脱敏
-│   └── web/                         浏览器前端（原生 HTML/CSS/JS）
+│   └── web/                         旧页面（原生 HTML/CSS/JS；提交 5 才会下线）
+├── web/                             v4 工作台（Vite + Preact + TypeScript）
+│   ├── index.html                   构建入口（含 <!--TOON_TUNER_TOKEN--> 占位）
+│   ├── tooling/                     构建侧工具与断言（**不叫 build/**：`.gitignore` 忽略 `build/`）
+│   │   ├── token-placeholder.ts     令牌占位插件 + 「令牌形态」判据
+│   │   └── dist-artifacts.test.ts   产物断言 + 仓库卫生（文件不得被 .gitignore 忽略）
+│   ├── scripts/verify-dist.mjs      构建产物校验（npm run build 的最后一步）
+│   ├── src/{api,schema,state,components,features,styles,testing}/
+│   └── dist/                        构建产物（**不入库**）
 ├── tests/                           假 MCP + 假 bpy 桩 + pytest 用例
 │   ├── fake_bpy.py                  可执行 bpy 桩（复刻 view_frame / ops.wm 保存等真实行为）
 │   ├── support.py                   公共测试支撑：统一携带会话令牌的 TestClient
@@ -129,7 +138,9 @@ Cartoon-Model-Shader/
 │   ├── test_surface_identity.py     三层指纹：身份/结构/值
 │   ├── test_surface_cel.py          Cel 适配器 + 通用执行器（整体写入/回滚）
 │   ├── test_v4_surface_api.py       v4 竖切端到端：基线/预览/失效/失败恢复/保存绑定
+│   ├── test_next_frontend.py        /next 托管：并存迁移/未构建诊断/令牌只进 HTML/路径穿越
 │   └── browser_check.mjs            真实浏览器验收（本机 Chrome/Edge + CDP）
+├── .github/workflows/test.yml       CI：pytest（3.11/3.12）与 web（Node 22）两个独立 job
 ├── config.example.json
 ├── requirements.txt
 ├── pytest.ini
@@ -154,7 +165,26 @@ pip install -r requirements.txt
 uvicorn src.server.app:app --host 127.0.0.1 --port 8765
 ```
 
-浏览器打开 <http://127.0.0.1:8765>。
+浏览器打开 <http://127.0.0.1:8765>（旧页面）或 <http://127.0.0.1:8765/next>（v4 工作台）。
+
+### v4 工作台（`/next`）需要先构建
+
+`/next` 由 FastAPI 托管 **Vite 构建产物**。构建产物**不入库**（`web/dist` 在 `.gitignore` 里），
+因此拉下代码后要先构建一次；未构建时 `/next` 会返回 `503 FRONTEND_NOT_BUILT`
+并附上构建步骤（**不会**悄悄回退到旧页面）：
+
+```powershell
+cd web
+npm ci
+npm run build
+```
+
+开发时可以用 Vite dev server（`npm run dev`，默认 5173，`/api` 已代理到 8765），
+但**生产入口始终是 FastAPI**：`dist` 里的 `index.html` 只有 `<!--TOON_TUNER_TOKEN-->` 占位，
+令牌由服务端在响应时注入，因此磁盘上的产物里永远没有令牌。
+
+多一条关于缓存的约定：`index.html` 明确 `no-store`（它含本次进程的会话令牌），
+而 `assets/` 下的文件带内容哈希、可以长期缓存。
 
 ### 已实现范围
 
@@ -312,6 +342,16 @@ uvicorn src.server.app:app --host 127.0.0.1 --port 8765
 pytest
 ```
 
+前端另有独立的一套（**pytest 不依赖 Node**）：
+
+```powershell
+cd web
+npm ci
+npm run typecheck
+npm run build     # 末尾会跑 scripts/verify-dist.mjs 校验产物
+npm run test      # tooling/dist-artifacts.test.ts 会断言 dist 的真实内容，因此 build 要在 test 之前
+```
+
 测试使用内置假 MCP 服务与**假 `bpy` 桩**，不需要安装 Blender：
 
 - 假 `bpy` 桩会**真的执行服务端生成的 Python 代码**，因此能验证生成逻辑本身（不只是响应格式）；
@@ -351,6 +391,17 @@ pytest
   写入 / 回读 / 渲染 / 恢复各阶段失败注入后 L0 与 Cel 两条基线都恢复并**分别报告**；
   保存令牌绑定参数面草稿与结构指纹（篡改 ⇒ `COMMIT_TOKEN_MISMATCH` 且不落盘，
   旧客户端不传这两个字段时行为完全不变）。
+- `/next` 托管相关（`tests/test_next_frontend.py`）：迁移期 `/` 与 `/next` 并存且互不影响；
+  未构建 ⇒ `503 FRONTEND_NOT_BUILT` + 构建步骤、**不回退旧页面**；
+  令牌只注入 HTML（静态资源逐字节直出，`index.html` 为 `no-store`，资源为 `immutable`）；
+  路径穿越（`../`、URL 编码、反斜杠、绝对路径、盘符）一律 404 且取不到 assets 之外的文件。
+- v4 前端（`web/`，Vitest 共 127 条）：递归 schema 解析与**未知 kind 降级为只读**；
+  `dirtyIds` 计算与提交前过滤（只读项 / 参考组 / 陌生 id 被剔除）；色标范围与严格递增、
+  2/3/4 档渲染、拖动与键盘输入的命令合并（一次拖动一条、不同色标不合并、复位/复制为原子命令）；
+  撤销/重做往返；复制到兼容组（数量不同即拒绝，不截断不补齐）；Sakura 恒只读；
+  结构失效后禁用预览与提交；外部值变化只提示；任务取代与代次丢弃旧结果；
+  失败任务保留最后一张成功预览；防缓存 URL；轮询结束/取消/超时/卸载；虚拟列表只挂可视行；
+  令牌请求头矩阵（写请求带、GET 不带、401/409/502 展示）；构建产物含唯一占位且无令牌形态串。
 
 ### 真实浏览器验收
 
@@ -398,6 +449,8 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 | GET | `/api/v4/session/baseline` | v4 基线：身份记录 + 结构指纹 + 基线值 + 降级清单（建立基线仍走 `POST /api/session/baseline`） |
 | POST | `/api/v4/preview` | v4 预览：L0 与 Cel 编进**同一个任务**，只渲染一次；可带 `expected_structure_hash` |
 | GET | `/api/v4/jobs/{job_id}` | v4 任务状态（与 `/api/jobs/{job_id}` 共用同一份存储） |
+| GET | `/next` | v4 工作台页面（构建产物；**未构建 ⇒ 503 `FRONTEND_NOT_BUILT`**，不回退旧页面） |
+| GET | `/next/assets/{path}` | v4 构建资源（内容哈希命名、长缓存；路径越界 ⇒ 404） |
 
 > 上表最后四行是 **v4 过渡接口**（Cel 竖切）。旧页面继续用前面的接口，行为一行不改；
 > `POST /api/session/baseline` 的响应里多了一个可选 `surface` 字段。
@@ -462,14 +515,14 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 - [x] **v4 提交 1：只读拓扑探针与技术方案** —— `GET /api/diagnostics/describe`（脱敏）+ `docs/技术方案_v4.md`
 - [x] **v4 提交 2：递归 schema、三层身份、Cel 适配器、通用执行器** —— `src/server/surface/`
 - [x] **v4 提交 3A：Cel 后端完整竖切（自动测试完成；真实 Blender 验收待办）** —— 基线采集只读拓扑 → `GET /api/v4/surface/schema` → `POST /api/v4/preview`（L0 + Cel 同一任务、只渲染一次、失败即恢复两条基线并分别报告）→ 身份/结构闸门写入前判定 → 保存令牌绑定参数面草稿与结构指纹
-- [ ] **v4 提交 3B：Vite/Preact 工作台与 Cel 编辑器**（`/next`，旧页面保持 `/`）
-- [ ] **v4 提交 4：完整参数族（世界/描边/渲染质量/灯光/相机/材质）与 L0–L3 调度**
-- [ ] **v4 提交 5：预设 v1→v2 迁移、撤销/重做、新 UI 切换并下线旧页面**
+- [x] **v4 提交 3B：Vite/Preact 工作台与 Cel 色阶编辑器（自动测试完成；真实 Blender 验收待办）** —— `web/` 工程（Vite + Preact + TypeScript + Vitest，自研轻量虚拟列表）→ `/next` 三栏工作台（顶部状态栏 / 导航 / 固定预览 / 检查器 / 底部操作栏）→ Cel 编辑器（色带拖动、位置与 RGBA、插值、复制到兼容组、Sakura 只读）→ 前端命令栈（撤销/重做）→ 任务代次与防缓存预览 → CI 独立 `web` job
+- [ ] **v4 提交 4：完整参数族（世界/描边/渲染质量/灯光/相机/材质）与 L0–L3 调度，L0 迁入递归 schema**
+- [ ] **v4 提交 5：预设 v1→v2 迁移、新 UI 切换到 `/` 并下线旧页面**
+- [ ] **校对 `/next` 的真实浏览器效果**（本提交只做了 Vitest 的 jsdom 断言；真机浏览器仍需人工看一眼）
 - [ ] **校准 Cel 的真实 socket 名**（在有 Blender 的机器上跑 `GET /api/diagnostics/describe` 回传；
       在此之前 Emission 强度保持 `editable: false` / `readonly_reason: "unconfirmed_capability"`）
 - [ ] **真实 Blender 验收保存流程**（人工步骤：另存为到新文件、覆盖当前工程、确认备份可打开、故意让保存失败并确认草稿保留）
-- [ ] **真实 Blender 验收 v4 竖切**（人工步骤：连续预览不累积污染、恢复基线逐项一致、保存重开后参数图一致）
-- [ ] 严格材质匹配与手工归类（L2）
+- [ ] **真实 Blender 验收 v4 竖切**（人工步骤：连续预览不累积污染、恢复基线逐项一致、保存重开后参数图一致）- [ ] 严格材质匹配与手工归类（L2）
 - [ ] A/B 对比、差异热力图、背景切换
 - [ ] 正式渲染与运行清单
 - [ ] 预设的「加载 / 应用到界面」（当前只支持保存与列出，加载留待后续）

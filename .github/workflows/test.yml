@@ -7,6 +7,7 @@ name: test
 # * 不依赖真实 Blender —— 测试使用假 MCP、假 bpy 与合成 PMX 占位文件。
 # * 不上传任何产物 —— 不含模型、贴图、预览图、日志，避免仓库 Actions 里出现工程素材。
 # * 真实 Blender / 真实浏览器验收仍是**人工**步骤，不进 GitHub Runner。
+# * 两个 job 互相独立：pytest **不要求** Node，web **不要求** Python。
 on:
   pull_request:
   push:
@@ -53,3 +54,47 @@ jobs:
 
       - name: 运行 pytest
         run: python -m pytest
+
+  # v4 前端（web/）的独立闸门。
+  #
+  # 为什么单独一个 job 而不是塞进 pytest：
+  # * 两者依赖完全不同（Node vs Python），合并就要在每个 job 里都装两套工具链；
+  # * 失败原因必须一眼可辨 —— Web 挂掉不能被 Python 的绿灯掩盖，反之亦然。
+  # * **pytest 不依赖 Node**：dist/ 未构建时 /next 返回 503 的诊断本身有用例覆盖，
+  #   因此 Python job 不需要 npm。
+  #
+  # 顺序刻意是 typecheck → build → test：`web/src/build/build.test.ts` 会断言 dist 的
+  # 真实内容（唯一令牌占位、无令牌形态串、无 sourcemap），先构建才验得到东西。
+  web:
+    name: web (Node ${{ matrix.node-version }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["22"]
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖（严格按 lockfile）
+        run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 生产构建（含产物校验）
+        run: npm run build
+
+      - name: 单元测试
+        run: npm run test
