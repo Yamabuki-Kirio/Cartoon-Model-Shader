@@ -1,5 +1,7 @@
 # Cartoon-Model-Shader
 
+> PMX 材质适配与一键渲染组件见 [`render_pipeline/`](render_pipeline/README.md)。该组件与浏览器调参工具保持独立边界，共享同一仓库维护。
+
 > **自用项目，不开源。**
 
 做 MMD 模型三渲二的时候下载了很多插件 —— Autocel 智能卡通化着色器、Cycles Render Engine、glTF 2.0 format、MCP for Blender、MiaoboxNode、MikuMikuRig、MMD Tools、MMD Tools Append、MMD 自动换头、mmd_kafei_tools、Pose Library、卡渲秘咒。顺序繁多，每次从零开始做出来的效果都不一样，所以做了个脚本自动把模型渲染成我理想中的情况，现在再做可视化界面方便调参数。
