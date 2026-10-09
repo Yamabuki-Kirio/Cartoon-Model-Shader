@@ -16,6 +16,20 @@ BLENDER_SCRIPT_ERROR = "BLENDER_SCRIPT_ERROR"
 BLENDER_UNEXPECTED_RESPONSE = "BLENDER_UNEXPECTED_RESPONSE"
 CONFIG_INVALID = "CONFIG_INVALID"
 INTERNAL_ERROR = "INTERNAL_ERROR"
+# MVP-02
+PARAM_INVALID = "PARAM_INVALID"
+NO_BASELINE = "NO_BASELINE"
+JOB_NOT_FOUND = "JOB_NOT_FOUND"
+PREVIEW_FAILED = "PREVIEW_FAILED"
+# 依赖枚举（view_transform → look）
+INVALID_DEPENDENT_ENUM = "INVALID_DEPENDENT_ENUM"
+# 取景（framing）
+FRAMING_STALE = "FRAMING_STALE"
+FRAMING_UNAVAILABLE = "FRAMING_UNAVAILABLE"
+
+#: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，
+#: 便于调用方直接读到 ``parameter`` / ``value`` / ``depends_on`` / ``allowed``。
+_FLATTEN_DETAILS_CODES = frozenset({INVALID_DEPENDENT_ENUM})
 
 # 错误码 -> (HTTP 状态码, 是否可重试, 面向用户的下一步建议)
 _ERROR_META: dict[str, tuple[int, bool, str]] = {
@@ -54,6 +68,42 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         True,
         "本地控制服务内部错误，请查看服务日志后重试。",
     ),
+    PARAM_INVALID: (
+        400,
+        False,
+        "提交的参数不在白名单内或取值越界。请刷新页面后重试。",
+    ),
+    NO_BASELINE: (
+        409,
+        True,
+        "尚未建立内存基线。请先在 Blender 连接正常时建立基线，再调整参数。",
+    ),
+    JOB_NOT_FOUND: (
+        404,
+        False,
+        "任务 ID 不存在或已过期（旧任务会在新预览提交后作废）。",
+    ),
+    PREVIEW_FAILED: (
+        502,
+        True,
+        "预览渲染失败。请确认 Blender 场景中存在相机与合成器节点组，然后重试。",
+    ),
+    INVALID_DEPENDENT_ENUM: (
+        400,
+        False,
+        "该取值在当前「视图变换」下不合法（视图变换决定了 Look 的可选档位）。"
+        "请换一个 Look，或先把「视图变换」调回原来的取值。",
+    ),
+    FRAMING_STALE: (
+        409,
+        True,
+        "建立基线之后，当前帧或相机被外部改动，预览构图会失真。请点「建立 / 刷新基线」重新锁定，再继续调参。",
+    ),
+    FRAMING_UNAVAILABLE: (
+        409,
+        True,
+        "无法自动取景：请确认场景里有可见的角色网格（已排除刚体代理与描边壳）以及一台活动相机。",
+    ),
 }
 
 
@@ -88,6 +138,11 @@ class ToonTunerError(Exception):
         }
         if self.details:
             error["details"] = self.details
+            # 依赖枚举类错误要求调用方能直接读到 parameter/value/depends_on/allowed，
+            # 因此额外平铺到 error 顶层（需求 6 的稳定错误形状）。
+            if self.code in _FLATTEN_DETAILS_CODES:
+                for key, value in self.details.items():
+                    error.setdefault(key, value)
         return {"ok": False, "error": error}
 
 
