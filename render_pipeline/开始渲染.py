@@ -1,0 +1,463 @@
+# -*- coding: utf-8 -*-
+"""
+开始渲染 —— v3.1 的【唯一入口】
+=====================================================================================
+用户只需要做一件事：
+
+    选择 PMX  →  开始渲染
+
+内部自动串起整条流程：
+
+    预检 → 自动分类 → 查找侧车映射 → 严格准入
+         ├─ 无需确认  → 直接渲染（本进程就是唯一渲染者）
+         └─ 需要确认  → 自动打开本地确认页 → 全部确认后**由服务端**继续渲染
+                        （本进程只做监视与汇报，不再自己起渲染）
+
+为什么需要确认时不由本进程渲染
+-------------------------------------------------------------------------------------
+一旦页面上也有「开始渲染」按钮，就有两个触发点了。如果本进程也渲染，就可能出现
+两个 Blender。所以约定：**确认路径下，渲染任务归服务端唯一所有**；
+本进程只写 job 文件、启动服务、轮询状态、报告终态。服务端内部再用锁 + 文件锁
+保证"自动续跑"和"页面按钮"只会有一个真正开始。
+
+用法：
+    python 开始渲染.py --pmx "模型.pmx"
+    python 开始渲染.py --fingerprint 545a9ba0        # 按指纹反查（推荐，免手写路径）
+    python 开始渲染.py --pmx "模型.pmx" --mode enhanced --auto-frame
+
+参数（除 --pmx/--fingerprint 外都有默认值）：
+    --out <目录>          输出目录，默认 output/<模型名>_<时间戳>（每次运行都是新目录）
+    --mode faithful|enhanced
+    --auto-frame 0|1      构图
+    --no-confirm-ui       即使需要确认也不开页面（只打印缺什么）
+    --port <n>            本地确认页端口，默认 8770
+"""
+import argparse
+import hashlib
+import io
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import webbrowser
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "_tools"))
+
+from render_lock import RenderLock, LockBusy    # noqa: E402
+
+ROOT = os.environ.get("TOON_MODEL_ROOT", "")
+SOURCE_BLEND = os.environ.get("TOON_SRC_BLEND", "")
+BLENDER = os.environ.get("TOON_BLENDER", "")
+RUNTIME_DIR = os.environ.get("TOON_RUNTIME_DIR", os.path.join(HERE, "runtime"))
+CONF_DIR = os.path.join(RUNTIME_DIR, "confirmation")
+PREVIEW_DIR = os.path.join(CONF_DIR, "previews")
+JOB_DIR = os.path.join(CONF_DIR, "jobs")
+LOCK_DIR = os.path.join(CONF_DIR, ".locks")
+PY = sys.executable
+
+TERMINAL = ("success", "rejected", "diagnostic", "failed")
+
+
+def out(*a):
+    print(*a, flush=True)
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1 << 20)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def locate(fingerprint=None, pmx=None, name=None):
+    """按指纹/文件名反查真实路径 —— 禁止手写路径（踩过三次坑）。"""
+    if pmx:
+        return pmx if os.path.isfile(pmx) else None
+    for r, _ds, fs in os.walk(ROOT):
+        for f in sorted(fs):
+            if not f.lower().endswith(".pmx"):
+                continue
+            p = os.path.join(r, f)
+            if name and f == name:
+                return p
+            if fingerprint:
+                try:
+                    if sha256_of(p).startswith(fingerprint):
+                        return p
+                except Exception:
+                    continue
+    return None
+
+
+# ---------------------------------------------------------------- 与确认服务通信
+def http_json(url, data=None, timeout=10):
+    body = json.dumps(data).encode("utf-8") if data is not None else None
+    headers = {"Content-Type": "application/json"} if body is not None else {}
+    req = urllib.request.Request(url, data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+# ---------------------------------------------------------------- Blender 派发
+def channel_ready(timeout=2.0):
+    """常驻 Blender 通道（9876）是否在线 —— 这是渲染唯一可用的通路。"""
+    try:
+        s = socket.create_connection(("127.0.0.1", 9876), timeout=timeout)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def send(cmd, timeout=60):
+    s = socket.create_connection(("127.0.0.1", 9876), timeout=10)
+    s.settimeout(timeout)
+    s.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
+    buf = b""
+    while True:
+        try:
+            chunk = s.recv(65536)
+        except socket.timeout:
+            s.close()
+            return {"__error__": "timeout"}
+        if not chunk:
+            break
+        buf += chunk
+        try:
+            return json.loads(buf.decode("utf-8"))
+        except json.JSONDecodeError:
+            continue
+    try:
+        return json.loads(buf.decode("utf-8"))
+    except Exception:
+        return {"__raw__": buf.decode("utf-8", "replace")}
+
+
+def launch_blender(argv, log_path):
+    code = ("import subprocess, json\n"
+            "p = subprocess.Popen(%r, stdout=open(%r,'w',encoding='utf-8',errors='replace'),"
+            " stderr=subprocess.STDOUT)\n"
+            "print('@@LAUNCH@@' + json.dumps({'pid': p.pid}))\n" % (argv, log_path))
+    return send({"type": "execute_code", "params": {"code": code}}, timeout=60)
+
+
+# ---------------------------------------------------------------- 各步骤
+def preflight(pmx, maps_dir=None):
+    """预检 + 分级，产出确认清单。返回 (conf_path, payload)。"""
+    import build_confirmation as BC
+    from material_classifier import MaterialClassifier
+    clf = MaterialClassifier()
+    payload = BC.build_one(pmx, clf, maps_dir or os.path.join(HERE, "model_material_maps"))
+    if not payload:
+        return None, None
+    os.makedirs(CONF_DIR, exist_ok=True)
+    fp = payload["model"]["fingerprint"].split(":", 1)[1]
+    jp = os.path.join(CONF_DIR, "%s_confirmation.json" % fp[:16])
+    with io.open(jp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=1)
+    return jp, payload
+
+
+def ensure_previews(pmx, conf_path):
+    """缺预览图就补（串行、按指纹派发）。"""
+    with io.open(conf_path, encoding="utf-8") as f:
+        conf = json.load(f)
+    req = [x for x in conf["items"] if x.get("requires_user")]
+    need = []
+    for x in req:
+        for k in ("mask_only", "overview_highlighted", "proposed_group"):
+            p = os.path.join(PREVIEW_DIR, os.path.basename(x["previews"][k]))
+            if not os.path.isfile(p):
+                need.append(p)
+    if not need:
+        return True
+    out("  生成 %d 张预览图（首次需要，之后会复用）…" % len(need))
+    done = os.path.join(HERE, "_tools", "_preview_run.done")
+    logp = os.path.join(PREVIEW_DIR, "_%s.log" % hashlib.sha256(pmx.encode()).hexdigest()[:8])
+    for p in (done, logp):
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+    argv = [BLENDER, "--background", "--factory-startup", "--python",
+            os.path.join(HERE, "_tools", "preview_gen.py"), "--",
+            "--pmx", pmx, "--confirmation", conf_path, "--out", PREVIEW_DIR,
+            "--resolve", SOURCE_BLEND, "--log", logp, "--done", done]
+    r = launch_blender(argv, logp)
+    if "@@LAUNCH@@" not in json.dumps(r):
+        out("  !! 预览图派发失败：%s" % str(r)[:150])
+        return False
+    t0 = time.time()
+    while time.time() - t0 < 600:
+        if os.path.isfile(done):
+            break
+        time.sleep(1.5)
+    st = open(done, encoding="utf-8").read().strip() if os.path.isfile(done) else "(超时)"
+    out("  预览图：%s" % st)
+    return st.startswith("OK")
+
+
+def write_job(pmx, out_dir, mode, auto_frame, maps_dir=None):
+    """把渲染任务写成 job 文件 —— 只有本地进程能写，浏览器无法提供。"""
+    fp = sha256_of(pmx)
+    os.makedirs(JOB_DIR, exist_ok=True)
+    job_path = os.path.join(JOB_DIR, "%s.job.json" % fp[:16])
+    job = {
+        "schema": "toon-render-job/1",
+        "auto_render": True,
+        "mode": mode,
+        "auto_frame": 1 if auto_frame else 0,
+        "source_blend": SOURCE_BLEND,
+        "blender": BLENDER,
+        "driver": os.path.join(HERE, "一键渲染_通用驱动.py"),
+        "script": os.path.join(HERE, "一键卡通渲染.py"),
+        "out_root": os.path.dirname(out_dir),
+        "maps_dir": maps_dir or os.path.join(HERE, "model_material_maps"),
+        "session_label": os.path.basename(pmx),
+        "targets": [{"fingerprint": fp, "pmx": pmx,
+                     "label": os.path.basename(pmx), "out": out_dir}],
+    }
+    with io.open(job_path, "w", encoding="utf-8") as f:
+        json.dump(job, f, ensure_ascii=False, indent=1)
+    return job_path
+
+
+def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps_dir=None):
+    """
+    启动确认页 → 等用户确认 → **服务端自动续跑渲染** → 轮询终态。
+    本进程全程不启动渲染，因此不可能与页面按钮产生两个 Blender。
+    返回大写终态 token。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    job_path = write_job(pmx, out_dir, mode, auto_frame, maps_dir)
+    logp = os.path.join(out_dir, "confirm_server.log")
+    buf = open(logp, "w", encoding="utf-8", errors="replace")
+    srv = subprocess.Popen([PY, os.path.join(HERE, "_tools", "confirm_server.py"),
+                            "--confirmation", conf_path, "--port", str(port),
+                            "--auto-render", "--job", job_path,
+                            "--model-root", ROOT,
+                            "--source-blend", SOURCE_BLEND,
+                            "--blender", BLENDER,
+                            "--runtime-dir", RUNTIME_DIR,
+                            "--maps-dir", maps_dir or os.path.join(HERE, "model_material_maps")],
+                           stdout=buf, stderr=subprocess.STDOUT)
+    url = "http://127.0.0.1:%d/" % port
+    try:
+        sid = None
+        t0 = time.time()
+        while time.time() - t0 < 30:
+            if srv.poll() is not None:
+                out("  !! 确认服务启动失败（退出码 %s），见 %s" % (srv.returncode, logp))
+                return "FAILED"
+            try:
+                d = http_json(url + "api/session", timeout=3)
+                sid = d.get("session_id")
+                if sid:
+                    break
+            except Exception:
+                time.sleep(0.5)
+        if not sid:
+            out("  !! 确认服务未就绪（30s 超时），见 %s" % logp)
+            return "FAILED"
+
+        out("  已启动本地确认页：%s" % url)
+        out("  会话 id：%s（渲染任务由服务端唯一持有）" % sid)
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+        out("  请在页面上逐条确认；全部确认后服务端会自动继续渲染，无需再点任何按钮。")
+
+        prev = None
+        while True:
+            try:
+                st = http_json("%sapi/session/%s/status" % (url, sid), timeout=5)
+            except Exception:
+                if srv.poll() is not None:
+                    out("  !! 确认服务已退出（退出码 %s），见 %s" % (srv.returncode, logp))
+                    return "FAILED"
+                time.sleep(1.5)
+                continue
+            key = (st.get("state"), st.get("attempt"), st.get("pending"))
+            if key != prev:
+                prev = key
+                extra = ""
+                if st.get("state") == "waiting":
+                    extra = "（还需确认 %d 项）" % st.get("pending", 0)
+                elif st.get("state") == "rendering":
+                    extra = "（第 %d 次尝试）" % st.get("attempt", 0)
+                out("  [%s] %s %s" % (time.strftime("%H:%M:%S"),
+                                      st.get("state_label") or st.get("state"), extra))
+            if st.get("state") in TERMINAL:
+                for r in (st.get("results") or []):
+                    out("      %-24s %s  %s"
+                        % (str(r.get("label"))[:24], r.get("outcome"),
+                           r.get("out_dir") or ""))
+                    if r.get("error"):
+                        out("        ↳ %s" % r["error"])
+                return (st.get("outcome") or "FAILED").upper()
+            time.sleep(1.5)
+    except KeyboardInterrupt:
+        out("\n  ！中断：确认服务会被停止；若渲染已在后台启动，它会继续跑完。")
+        raise
+    finally:
+        try:
+            srv.terminate()
+        except Exception:
+            pass
+        try:
+            buf.close()
+        except Exception:
+            pass
+
+
+def render(pmx, out_dir, mode, auto_frame):
+    """无需确认时的直接渲染。带跨进程锁，防止重复起 Blender。"""
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(LOCK_DIR, exist_ok=True)
+    lockp = os.path.join(LOCK_DIR, "%s.render.lock" % sha256_of(pmx)[:16])
+    try:
+        lk = RenderLock(lockp, tag="direct:start-render").acquire()
+    except LockBusy as e:
+        out("  !! 已有渲染在跑，拒绝重复启动：%s" % json.dumps(e.holder, ensure_ascii=False))
+        return 1
+    try:
+        logp = os.path.join(out_dir, "render.stdout.log")
+        done = os.path.join(out_dir, "render.done")
+        for p in (logp, done):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        argv = [BLENDER, "--background", "--factory-startup", "--python",
+                os.path.join(HERE, "一键渲染_通用驱动.py"), "--",
+                "--pmx", pmx, "--out", out_dir, "--mode", mode,
+                "--material-policy", "strict",
+                "--resolve", SOURCE_BLEND,
+                "--script", os.path.join(HERE, "一键卡通渲染.py"),
+                "--auto-frame", "1" if auto_frame else "0",
+                "--log", logp, "--done", done]
+        out("  渲染中…（日志 %s）" % logp)
+        r = launch_blender(argv, logp)
+        if "@@LAUNCH@@" not in json.dumps(r):
+            out("  !! 渲染派发失败：%s" % str(r)[:150])
+            return 1
+        t0 = time.time()
+        while time.time() - t0 < 1800:
+            if os.path.isfile(done):
+                break
+            time.sleep(2)
+        st = open(done, encoding="utf-8").read().strip() if os.path.isfile(done) else "(超时)"
+        out("  渲染终态：%s" % st)
+        return 0 if st.splitlines()[0].strip() == "SUCCESS" else 1
+    finally:
+        lk.release()
+
+
+def main():
+    global ROOT, SOURCE_BLEND, BLENDER, RUNTIME_DIR, CONF_DIR, PREVIEW_DIR, JOB_DIR, LOCK_DIR
+    ap = argparse.ArgumentParser(description="开始渲染（v3.1 唯一入口）")
+    ap.add_argument("--pmx")
+    ap.add_argument("--fingerprint")
+    ap.add_argument("--name")
+    ap.add_argument("--out")
+    ap.add_argument("--mode", default="faithful", choices=("faithful", "enhanced"))
+    ap.add_argument("--auto-frame", type=int, default=0)
+    ap.add_argument("--no-confirm-ui", action="store_true")
+    ap.add_argument("--port", type=int, default=8770)
+    ap.add_argument("--model-root", default=ROOT,
+                    help="按名称/指纹查找 PMX 的素材根目录；也可设 TOON_MODEL_ROOT")
+    ap.add_argument("--source-blend", default=SOURCE_BLEND,
+                    help="提供节点组的源 .blend；也可设 TOON_SRC_BLEND")
+    ap.add_argument("--blender", default=BLENDER,
+                    help="Blender 可执行文件；也可设 TOON_BLENDER")
+    ap.add_argument("--runtime-dir", default=RUNTIME_DIR,
+                    help="确认数据、预览、任务与锁的运行目录")
+    ap.add_argument("--maps-dir", default=os.path.join(HERE, "model_material_maps"),
+                    help="侧车映射目录（默认工程内 model_material_maps；试跑可指向临时目录）")
+    a = ap.parse_args()
+
+    ROOT = os.path.abspath(a.model_root) if a.model_root else ""
+    SOURCE_BLEND = os.path.abspath(a.source_blend) if a.source_blend else ""
+    BLENDER = os.path.abspath(a.blender) if a.blender else ""
+    RUNTIME_DIR = os.path.abspath(a.runtime_dir)
+    CONF_DIR = os.path.join(RUNTIME_DIR, "confirmation")
+    PREVIEW_DIR = os.path.join(CONF_DIR, "previews")
+    JOB_DIR = os.path.join(CONF_DIR, "jobs")
+    LOCK_DIR = os.path.join(CONF_DIR, ".locks")
+
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    if not a.pmx and not ROOT:
+        out("缺少模型根目录：使用 --model-root 或设置 TOON_MODEL_ROOT。")
+        return 2
+    pmx = locate(a.fingerprint, a.pmx, a.name)
+    if not pmx:
+        out("找不到模型。请用 --pmx <路径> 或 --fingerprint <指纹前若干位>。")
+        return 2
+
+    model_name = os.path.splitext(os.path.basename(pmx))[0]
+    if not SOURCE_BLEND or not os.path.isfile(SOURCE_BLEND):
+        out("缺少有效源工程：使用 --source-blend 或设置 TOON_SRC_BLEND。")
+        return 2
+    if not BLENDER or not os.path.isfile(BLENDER):
+        out("缺少有效 Blender：使用 --blender 或设置 TOON_BLENDER。")
+        return 2
+    out_dir = a.out or os.path.join(RUNTIME_DIR, "output",
+                                    "%s_%s" % (model_name, time.strftime("%m%d_%H%M%S")))
+    out("=" * 72)
+    out("开始渲染：%s" % os.path.basename(pmx))
+    out("  %s" % pmx)
+    out("=" * 72)
+    if not channel_ready():
+        out("  ！提示：常驻 Blender 通道（127.0.0.1:9876）当前不可用。")
+        out("           渲染依赖该通道，请先在 Blender 中开启 MCP 监听。")
+        out("           请先在 Blender 中开启 MCP 监听，否则渲染阶段会直接失败。")
+
+    out("[1/3] 预检与自动分类…")
+    conf_path, payload = preflight(pmx, a.maps_dir)
+    if not payload:
+        out("  !! 预检失败，无法解析该 PMX")
+        return 1
+    s = payload["summary_all"]
+    out("  材质 %d：语义自动 %d / 映射命中 %d / 需确认 %d / 无依据 %d"
+        % (s["total"], s["semantic_auto_confirmed"], s["model_map_confirmed"],
+           s["structure_suggested"], s["unresolved"]))
+
+    requiring = [x for x in payload["items"] if x["requires_user"]]
+    if not requiring:
+        out("[2/3] 无需人工确认 —— 直接渲染")
+        rc = render(pmx, out_dir, a.mode, bool(a.auto_frame))
+        out("[3/3] 完成（输出：%s）" % out_dir)
+        return rc
+
+    out("[2/3] 有 %d 个材质需要确认：%s"
+        % (len(requiring), "、".join(x["material"] for x in requiring)))
+    for x in requiring:
+        out("      · %s → 建议 %s（%s）"
+            % (x["material"], x["proposed_class"] or "—", x["stage"]))
+    if a.no_confirm_ui:
+        out("  --no-confirm-ui：只报告，不打开确认页")
+        return 1
+
+    ensure_previews(pmx, conf_path)
+    token = run_confirm_and_render(pmx, conf_path, out_dir, a.mode, bool(a.auto_frame),
+                                   a.port, a.maps_dir)
+    out("[3/3] 终态：%s" % token)
+    if token != "SUCCESS":
+        out("      （非 SUCCESS：按契约不得进入成品流程；确认结果已保留，可直接重试渲染）")
+    out("      输出目录：%s" % out_dir)
+    return 0 if token == "SUCCESS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

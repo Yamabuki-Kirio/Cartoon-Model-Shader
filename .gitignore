@@ -39,6 +39,15 @@ runtime/
 previews/
 .backups/
 *.blend.backup.*
+render_pipeline/output/
+render_pipeline/reports/
+render_pipeline/runtime/
+render_pipeline/model_material_maps/*.json
+!render_pipeline/model_material_maps/example.material-map.json
+*.done
+*.job.json
+*.render-result.json
+*.render.lock
 
 # ===== 编辑器 / IDE =====
 .vscode/
