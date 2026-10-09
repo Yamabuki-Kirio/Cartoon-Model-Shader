@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from . import blender_ops, color_looks, errors, framing, project_ops
+from . import blender_ops, color_looks, errors, framing, project_ops, surface_probe
 from .blender_mcp import BlenderMCPClient
 from .config import BlenderMCPConfig
 from .redact import redact
@@ -118,6 +118,15 @@ class BlenderBinder:
             color_looks.build_probe_code(view_transform, identifier)
         )
         return color_looks.parse_payload(captured)
+
+    def describe_surface(self) -> dict[str, Any]:
+        """只读拓扑描述（v4）：受管节点组 / ColorRamp 结构 / 对象与材质清单。
+
+        探针无入参、只读、不改任何 ``bpy`` 数据；脱敏在服务端侧再做一遍
+        （``surface_probe.redact_describe``），不依赖 Blender 侧自觉。
+        """
+        captured = self._client().execute_code(surface_probe.build_describe_code())
+        return surface_probe.parse_describe(captured)
 
     # -- 写入 -----------------------------------------------------------
     def apply_values(self, values: dict[str, Any]) -> dict[str, Any]:
