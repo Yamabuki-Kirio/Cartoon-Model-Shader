@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render } from "@testing-library/preact";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { AppError } from "../api/types";
-import { makeTestWorkspace, settle } from "../testing/endpoints";
+import { makeTestWorkspace, settle, settleTimers } from "../testing/endpoints";
 import { jobPayload } from "../testing/fixtures";
 import type { JobState } from "../api/types";
 
@@ -180,17 +180,67 @@ describe("工作台整体", () => {
     expect(hint()).toContain("一致");
   });
 
-  it("建立基线后可切到基线图", async () => {
-    const { workspace } = await setup();
-    const { getByText, container } = render(<App workspace={workspace} autoBootstrap={false} />);
+  it("建立基线：任务完成前不挂图，完成并切到基线图后才展示", async () => {
+    const statuses = ["queued", "running", "done"];
+    let poll = 0;
+    const { workspace } = await setup({
+      job: vi.fn(async (jobId: string) => {
+        const status = statuses[Math.min(poll, statuses.length - 1)];
+        poll += 1;
+        return jobPayload({ job_id: jobId, status }) as unknown as JobState;
+      }),
+    });
+    const { getByText, getByTestId, container } = render(
+      <App workspace={workspace} autoBootstrap={false} />
+    );
+
     // 走真实流程：点「刷新基线」（POST 会带回基线首张预览的 job_id）
-    await workspace.actions.refreshBaseline();
-    await settle(2);
-    fireEvent.click(getByText("基线图"));
-    await settle(2);
+    const started = workspace.actions.refreshBaseline();
+    await settleTimers(2);
+
+    // 任务还没结束：只有「正在生成基线预览…」，**没有** img（文件尚未落盘）
+    expect(getByTestId("preview-pending")).toBeTruthy();
+    expect(container.querySelector("img.preview-image")).toBeNull();
+    // 基线图按钮此刻不可用，并标明还在生成
+    const baselineChip = getByText(/^基线图/) as HTMLButtonElement;
+    expect(baselineChip.disabled).toBe(true);
+    expect(baselineChip.textContent).toContain("生成中");
+
+    await settleTimers(10);
+    await started;
+
+    // 完成后基线图可用，切过去能看到带防缓存参数的图
+    fireEvent.click(getByText(/^基线图/));
+    await settleTimers(2);
     const image = container.querySelector("img.preview-image") as HTMLImageElement;
     expect(image.src).toContain("/api/preview/base0");
-    expect(image.src).toContain("v=");
+    expect(image.src).toContain("v=base0");
+    // 终态任务不再占着「活动任务」位：状态栏显示空闲 + 上次结果
+    expect(getByTestId("status-job").getAttribute("data-active")).toBe("false");
+    expect(getByTestId("status-job").textContent).toContain("空闲");
+    expect(getByTestId("status-job").textContent).toContain("已完成");
+  });
+
+  it("基线任务失败：给出明确提示，不谎称画面正在生成", async () => {
+    const { workspace } = await setup({
+      job: vi.fn(async (jobId: string) =>
+        jobPayload({
+          job_id: jobId,
+          status: "failed",
+          result: null,
+          error: { code: "PREVIEW_FAILED", message: "渲染失败", retryable: true },
+        }) as unknown as JobState
+      ),
+    });
+    const { getByTestId, queryByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    await workspace.actions.refreshBaseline();
+    await settleTimers(4);
+
+    expect(queryByTestId("preview-pending")).toBeNull();
+    expect(getByTestId("baseline-preview-failed").textContent).toContain("基线已建立");
+    expect(getByTestId("status-job").getAttribute("data-active")).toBe("false");
+    // 基线本身是建立了的（调参照常可用）
+    expect(getByTestId("status-baseline").textContent).toContain("bl0000000001");
   });
 
   it("A/B 与热力图只预留入口（禁用）", async () => {

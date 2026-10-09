@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ownerGroupId } from "./workspace";
-import { baselinePayload, jobPayload, schemaPayload } from "../testing/fixtures";
-import { makeTestWorkspace, settle } from "../testing/endpoints";
+import { jobPayload, baselinePayload, schemaPayload } from "../testing/fixtures";
+import { makeTestWorkspace, settle, settleTimers } from "../testing/endpoints";
 import type { JobState } from "../api/types";
 
 function makeWorkspace(overrides: Record<string, unknown> = {}) {
@@ -165,7 +165,9 @@ describe("工作台状态机", () => {
 
     const state = workspace.store.getState();
     expect(state.error?.code).toBe("APPLY_VERIFY_FAILED");
-    expect(state.activeJob?.status).toBe("failed");
+    // 修正：任务已经终结，就**不该**继续占据「活动任务」位；它属于 lastJob。
+    expect(state.activeJob).toBeNull();
+    expect(state.lastJob?.status).toBe("failed");
     // 关键：画面还在（失败不得把最后一张成功预览挤掉）
     expect(state.lastSuccessfulPreview).toBe(good);
   });
@@ -209,8 +211,9 @@ describe("工作台状态机", () => {
     expect(state.dirtyIds.size).toBe(0);
     expect(state.canUndo).toBe(false);
     expect(state.notice).toContain("作废");
-    // 任务上下文照旧带上；最后一张成功预览**不受影响**
-    expect(state.activeJob?.status).toBe("failed");
+    // 任务上下文照旧留痕（lastJob），但**不**再算活动任务；最后一张成功预览不受影响
+    expect(state.activeJob).toBeNull();
+    expect(state.lastJob?.status).toBe("failed");
     expect(state.lastSuccessfulPreview).toBe(preview);
 
     // 阻断生效：再提交直接被拒，且不产生新任务
@@ -368,6 +371,152 @@ describe("工作台状态机", () => {
     expect(state.schema).toBeTruthy();
     expect(state.baseline).toBeNull();
     expect(state.error).toBeTruthy();
+  });
+});
+
+describe("建立基线：轮询首张预览任务", () => {
+  /** 记录状态迁移，用来断言「任务完成前不许有基线图」。 */
+  function recorder(workspace: ReturnType<typeof makeTestWorkspace>["workspace"]) {
+    const frames: Array<{ job: string | null; baseline: string; url: string | null }> = [];
+    const unsubscribe = workspace.store.subscribe(() => {
+      const state = workspace.store.getState();
+      frames.push({
+        job: state.activeJob?.status ?? null,
+        baseline: state.baselinePreviewStatus,
+        url: state.baselinePreviewUrl,
+      });
+    });
+    return { frames, stop: unsubscribe };
+  }
+
+  it("queued → running → done：完成后才给出基线图 URL", async () => {
+    const statuses = ["queued", "queued", "running", "running", "done"];
+    let poll = 0;
+    const { workspace } = makeTestWorkspace({
+      job: vi.fn(async (jobId: string) => {
+        const status = statuses[Math.min(poll, statuses.length - 1)];
+        poll += 1;
+        return jobPayload({ job_id: jobId, status }) as unknown as JobState;
+      }),
+    });
+    await workspace.actions.bootstrap();
+
+    const { frames, stop } = recorder(workspace);
+    const started = workspace.actions.refreshBaseline();
+    await settleTimers(12);
+    await started;
+    stop();
+
+    // 轮询真的经过了排队与渲染两个阶段
+    const jobStates = frames.map((frame) => frame.job).filter((value): value is string => value !== null);
+    expect(jobStates).toContain("queued");
+    expect(jobStates).toContain("running");
+
+    // 任务没结束时：状态是 pending，且**没有** URL（否则 img 会指向还没落盘的文件）
+    const pendingFrames = frames.filter((frame) => frame.baseline === "pending");
+    expect(pendingFrames.length).toBeGreaterThan(0);
+    expect(pendingFrames.every((frame) => frame.url === null)).toBe(true);
+
+    const state = workspace.store.getState();
+    expect(state.baselineId).toBe("bl0000000001");
+    expect(state.baselinePreviewStatus).toBe("ready");
+    expect(state.baselinePreviewUrl).toBe("/api/preview/base0");
+    // 终态清理：任务结束后不再占着活动位，但留下「上次」痕迹
+    expect(state.activeJob).toBeNull();
+    expect(state.lastJob?.status).toBe("done");
+    expect(state.loading).toBe(false);
+  });
+
+  it("基线任务失败：基线仍算建立，但基线图判为失败并给提示", async () => {
+    const { workspace } = makeTestWorkspace({
+      job: vi.fn(async (jobId: string) =>
+        jobPayload({
+          job_id: jobId,
+          status: "failed",
+          result: null,
+          error: { code: "PREVIEW_FAILED", message: "渲染失败", retryable: true },
+        }) as unknown as JobState
+      ),
+    });
+    await workspace.actions.bootstrap();
+    await expect(workspace.actions.refreshBaseline()).resolves.toBe(true);
+
+    const state = workspace.store.getState();
+    expect(state.baselineId).toBeTruthy();
+    expect(state.baselinePreviewStatus).toBe("failed");
+    expect(state.baselinePreviewUrl).toBeNull();
+    expect(state.notice).toContain("基线已建立");
+    expect(state.activeJob).toBeNull();
+    expect(state.lastJob?.status).toBe("failed");
+    expect(state.loading).toBe(false);
+  });
+
+  it("基线任务被取代：改判为失败而不是永远停在「生成中」", async () => {
+    const { workspace } = makeTestWorkspace({
+      job: vi.fn(async (jobId: string) =>
+        jobPayload({ job_id: jobId, status: "superseded", result: null }) as unknown as JobState
+      ),
+    });
+    await workspace.actions.bootstrap();
+    await workspace.actions.refreshBaseline();
+
+    const state = workspace.store.getState();
+    expect(state.baselinePreviewStatus).toBe("failed");
+    expect(state.baselinePreviewUrl).toBeNull();
+    expect(state.notice).toContain("取代");
+    expect(state.activeJob).toBeNull();
+  });
+
+  it("刷新基线途中提交预览：基线图改判为失败，不会卡在 pending", async () => {
+    // 基线任务一直排队（永不完结），此时用户点了「应用并预览」
+    const { workspace } = makeTestWorkspace({
+      job: vi.fn(async (jobId: string) =>
+        jobPayload({
+          job_id: jobId,
+          status: jobId.startsWith("base") ? "running" : "done",
+        }) as unknown as JobState
+      ),
+    });
+    await workspace.actions.bootstrap();
+
+    const notices: string[] = [];
+    const stop = workspace.store.subscribe(() => {
+      const notice = workspace.store.getState().notice;
+      if (notice) {
+        notices.push(notice);
+      }
+    });
+
+    const started = workspace.actions.refreshBaseline();
+    await settleTimers(2);
+    expect(workspace.store.getState().baselinePreviewStatus).toBe("pending");
+
+    await workspace.actions.applyAndPreview();
+    await settleTimers(8);
+    await started;
+    stop();
+
+    const state = workspace.store.getState();
+    expect(state.baselinePreviewStatus).toBe("failed");
+    // 改判时给出原因（之后被新任务的成功提示覆盖，所以要在过程里看）
+    expect(notices.some((notice) => notice.includes("取代"))).toBe(true);
+    // 新任务照常完成并给出画面
+    expect(state.activeJob).toBeNull();
+    expect(state.lastSuccessfulPreview?.jobId).toBe("job0000000000001");
+  });
+
+  it("刷新基线失败时基线图状态同步改判，不会假装还在生成", async () => {
+    const { workspace } = makeTestWorkspace({
+      createBaseline: vi.fn(async () => {
+        throw new Error("Blender 连不上");
+      }),
+    });
+    await workspace.actions.bootstrap();
+    await expect(workspace.actions.refreshBaseline()).resolves.toBe(false);
+    const state = workspace.store.getState();
+    expect(state.error).toBeTruthy();
+    expect(state.baselinePreviewStatus).toBe("failed");
+    expect(state.loading).toBe(false);
   });
 });
 
