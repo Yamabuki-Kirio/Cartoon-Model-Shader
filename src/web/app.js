@@ -1,5 +1,5 @@
 /* Cartoon-Model-Shader · 前端
- * 连接状态 + 当前工程/场景摘要 + L0 曝光调参与预览。
+ * 连接状态 + 当前工程/场景摘要 + L0 曝光调参与预览 + 预设保存 / 应用到工程。
  * 所有动态文本一律用 textContent 写入，绝不拼接 HTML，避免对象名注入。
  */
 (function () {
@@ -10,6 +10,11 @@
   /* L0 参数停止调整后触发预览的去抖窗口（需求：250–400ms） */
   var DEBOUNCE_MS = 300;
   var DEFAULT_TARGET = "127.0.0.1:9876";
+  /* 本机会话令牌：由服务端在 GET / 的响应里注入（静态文件里没有它）。
+     所有写接口都必须带上它，否则后端一律 401 拒绝。 */
+  var SESSION_TOKEN =
+    typeof window.__TOON_TUNER_TOKEN__ === "string" ? window.__TOON_TUNER_TOKEN__ : "";
+  var TOKEN_HEADER = "X-Toon-Tuner-Token";
 
   function el(id) {
     return document.getElementById(id);
@@ -90,6 +95,39 @@
     auto_headshot: "临时自动取景 · 头像"
   };
 
+  /* 保存预设 / 应用到工程 */
+  var saveView = {
+    presetCard: el("preset-card"),
+    presetName: el("preset-name"),
+    presetSave: el("preset-save-btn"),
+    presetRefresh: el("preset-refresh-btn"),
+    presetStatus: el("preset-status"),
+    presetBody: el("preset-body"),
+    presetEmpty: el("preset-empty"),
+    presetTable: document.querySelector("#preset-card .table-wrap"),
+
+    card: el("commit-card"),
+    modeSaveAs: el("commit-mode-save-as"),
+    modeOverwrite: el("commit-mode-overwrite"),
+    targetRow: el("commit-target-row"),
+    target: el("commit-target"),
+    paths: el("commit-paths"),
+    absTarget: el("commit-abs-target"),
+    absBackup: el("commit-abs-backup"),
+    warning: el("commit-warning-text"),
+    confirm: el("commit-confirm"),
+    apply: el("commit-apply-btn"),
+    status: el("commit-status"),
+    applied: el("commit-applied"),
+    readback: el("commit-readback"),
+    backup: el("commit-backup"),
+    saved: el("commit-saved"),
+    rollback: el("commit-rollback"),
+    raw: el("commit-raw")
+  };
+  var SAVE_MODE_SAVE_AS = "save_as";
+  var SAVE_MODE_OVERWRITE = "overwrite";
+
   var lastStatus = null;
   var sceneLoaded = false;
   var pollTimer = null;
@@ -165,8 +203,21 @@
   }
 
   async function request(path, options) {
+    var opts = options || {};
+    var headers = {};
+    var index;
+    var keys = Object.keys(opts.headers || {});
+    for (index = 0; index < keys.length; index += 1) {
+      headers[keys[index]] = opts.headers[keys[index]];
+    }
+    /* 令牌挂在**每一条**请求上：写接口没有它就是 401，读接口带了也无害。
+       这样前端只有一处需要关心令牌，不会漏掉某个新接口。 */
+    if (SESSION_TOKEN) {
+      headers[TOKEN_HEADER] = SESSION_TOKEN;
+    }
+    opts = Object.assign({}, opts, { headers: headers });
     try {
-      var response = await fetch(path, options || {});
+      var response = await fetch(path, opts);
       var body = null;
       try {
         body = await response.json();
@@ -194,6 +245,8 @@
     nodes.objectsCard.classList.add("hidden");
     tuner.card.classList.add("hidden");
     framingView.bar.classList.add("hidden");
+    saveView.presetCard.classList.add("hidden");
+    saveView.card.classList.add("hidden");
     sceneLoaded = false;
   }
 
@@ -1303,8 +1356,373 @@
     schedulePreview();
   }
 
+  // -- 保存预设 / 应用到工程 ---------------------------------------------
+  function setSaveStatus(node, text, kind) {
+    if (!node) {
+      return;
+    }
+    node.textContent = String(text === null || text === undefined || text === "" ? "—" : text);
+    node.classList.remove("is-ok", "is-err", "is-busy");
+    if (kind) {
+      node.classList.add("is-" + kind);
+    }
+  }
+
+  /* 诊断面板里隐去令牌：它在页面里本来就可见，但没必要写进可复制的文本块。 */
+  function redactedForDisplay(value) {
+    if (Array.isArray(value)) {
+      return value.map(redactedForDisplay);
+    }
+    if (value && typeof value === "object") {
+      var out = {};
+      Object.keys(value).forEach(function (key) {
+        out[key] = key === "token" ? "<已隐去>" : redactedForDisplay(value[key]);
+      });
+      return out;
+    }
+    return value;
+  }
+
+  function describeSaveError(error) {
+    if (!error) {
+      return "本地服务无响应，请稍后重试。";
+    }
+    if (error.code === "SESSION_TOKEN_INVALID") {
+      return "会话令牌失效（服务可能已重启）：请刷新页面（F5）后重试。";
+    }
+    return error.message || error.code || "保存失败。";
+  }
+
+  function currentSaveMode() {
+    return saveView.modeOverwrite && saveView.modeOverwrite.checked
+      ? SAVE_MODE_OVERWRITE
+      : SAVE_MODE_SAVE_AS;
+  }
+
+  function resetCommitStatuses() {
+    setSaveStatus(saveView.applied, "—");
+    setSaveStatus(saveView.readback, "—");
+    setSaveStatus(saveView.backup, "—");
+    setSaveStatus(saveView.saved, "—");
+    setSaveStatus(saveView.rollback, "—");
+  }
+
+  /* 应用 / 回读 / 备份 / 保存 / 失败后回滚：失败时后端也会把这份状态带回来。 */
+  function renderCommitStatuses(status) {
+    var block = status || {};
+    if (block.applied === true) {
+      setSaveStatus(saveView.applied, "已写入 Blender", "ok");
+    } else {
+      setSaveStatus(saveView.applied, "未执行", "err");
+    }
+    if (block.readback_verified === true) {
+      setSaveStatus(saveView.readback, "逐项一致", "ok");
+    } else if (block.readback_verified === false && block.mismatches && block.mismatches.length) {
+      var items = block.mismatches.map(function (item) {
+        return item.id + "（期望 " + JSON.stringify(item.expected) + "，实得 " + JSON.stringify(item.actual) + "）";
+      });
+      setSaveStatus(saveView.readback, "不一致：" + items.join("；"), "err");
+    } else {
+      setSaveStatus(saveView.readback, "未执行", "err");
+    }
+    var backup = block.backup || {};
+    if (!backup.required) {
+      setSaveStatus(saveView.backup, "无需备份（目标不存在）");
+    } else if (backup.created) {
+      setSaveStatus(saveView.backup, "已生成备份", "ok");
+    } else {
+      setSaveStatus(saveView.backup, "备份失败，已拒绝覆盖", "err");
+    }
+    setSaveStatus(
+      saveView.saved,
+      block.saved === true ? "已保存到磁盘" : "未保存（草稿已保留）",
+      block.saved === true ? "ok" : "err"
+    );
+    /* 回滚状态必须显式呈现：回滚没确认成功时，Blender 里的取值可能不是提交前的状态。 */
+    var rollback = block.rollback;
+    if (!rollback) {
+      setSaveStatus(saveView.rollback, "—");
+    } else if (rollback.verified === true) {
+      setSaveStatus(saveView.rollback, "已恢复到提交前的基线，回读校验通过", "ok");
+    } else if (rollback.attempted === true) {
+      setSaveStatus(
+        saveView.rollback,
+        "未能确认恢复（" + (rollback.code || "ROLLBACK_FAILED") + "）：请到 Blender 里人工核对该取值",
+        "err"
+      );
+    } else if (block.saved === true) {
+      setSaveStatus(saveView.rollback, "未触发");
+    } else {
+      setSaveStatus(saveView.rollback, rollback.reason || "未触发");
+    }
+  }
+
+  function renderConfirmBlock(source, resetCheck) {
+    var data = source || {};
+    if (!data.target_path && !data.backup_path) {
+      return;
+    }
+    setText(saveView.absTarget, data.target_path, "—");
+    setText(saveView.absBackup, data.backup_path || "（目标文件不存在，无需备份）");
+    saveView.paths.classList.remove("hidden");
+    /* 第一次只「给用户看」：此时复选框必须是未勾选状态，逼出一次真正的二次确认。
+       apply 流程里用户已经勾过并提交了确认，这里就不要把他的勾去掉。 */
+    if (resetCheck !== false) {
+      saveView.confirm.checked = false;
+    }
+    if (data.warnings && data.warnings.length) {
+      setText(saveView.warning, data.warnings.join(" ｜ "));
+    } else {
+      setText(saveView.warning, "覆盖后原文件内容将被本次草稿替换。");
+    }
+  }
+
+  function hideConfirmBlock() {
+    saveView.paths.classList.add("hidden");
+    saveView.confirm.checked = false;
+  }
+
+  /* 覆盖模式：在用户点按钮之前就把「会写到哪、备份放哪」摊开。 */
+  async function probeCommitTargets() {
+    if (!baselineValues) {
+      return;
+    }
+    var mode = currentSaveMode();
+    if (mode !== SAVE_MODE_OVERWRITE) {
+      hideConfirmBlock();
+      return;
+    }
+    var result = await request("/api/session/commit/prepare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: mode, draft: collectDraft(), confirm: false })
+    });
+    if (!result.body) {
+      setSaveStatus(saveView.status, "无法访问本地服务。", "err");
+      return;
+    }
+    if (result.body.ok) {
+      renderConfirmBlock(result.body);
+      setSaveStatus(saveView.status, "覆盖前需要二次确认：请核对绝对路径后勾选确认。", "busy");
+      return;
+    }
+    var error = result.body.error || {};
+    if (error.code === "SAVE_CONFIRM_REQUIRED") {
+      renderConfirmBlock(error.details || {});
+      setSaveStatus(saveView.status, "覆盖前需要二次确认：请核对绝对路径后勾选确认。", "busy");
+      return;
+    }
+    hideConfirmBlock();
+    setSaveStatus(saveView.status, describeSaveError(error), "err");
+  }
+
+  function onSaveModeChange() {
+    var mode = currentSaveMode();
+    /* 另存为：目标由用户填写；覆盖：目标由 Blender 当前工程决定，输入框没有意义 */
+    if (mode === SAVE_MODE_SAVE_AS) {
+      saveView.targetRow.classList.remove("hidden");
+      hideConfirmBlock();
+    } else {
+      saveView.targetRow.classList.add("hidden");
+    }
+    saveView.confirm.checked = false;
+    resetCommitStatuses();
+    probeCommitTargets();
+  }
+
+  async function onCommitApply() {
+    if (!baselineValues) {
+      setSaveStatus(saveView.status, "尚未建立基线：请先点「建立 / 刷新基线」。", "err");
+      return;
+    }
+    var mode = currentSaveMode();
+    var targetPath = saveView.target.value ? saveView.target.value.trim() : "";
+    if (mode === SAVE_MODE_SAVE_AS && !targetPath) {
+      setSaveStatus(saveView.status, "请先填写目标文件的绝对路径（须以 .blend 结尾）。", "err");
+      return;
+    }
+    /* ★ 草稿只取一次，prepare 与 commit 必须用完全相同的那一份：
+       后端把令牌绑在完整草稿上，两次取值之间任何抖动都会被判为篡改。 */
+    var draft = collectDraft();
+    var confirmed = saveView.confirm.checked;
+
+    saveView.apply.disabled = true;
+    resetCommitStatuses();
+    setSaveStatus(saveView.status, "正在准备保存…", "busy");
+
+    var prepareBody = { mode: mode, draft: draft, confirm: confirmed };
+    if (mode === SAVE_MODE_SAVE_AS) {
+      prepareBody.target_path = targetPath;
+    }
+    var prepared = await request("/api/session/commit/prepare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(prepareBody)
+    });
+    if (!prepared.body) {
+      saveView.apply.disabled = false;
+      setSaveStatus(saveView.status, "无法访问本地服务。", "err");
+      return;
+    }
+    if (prepared.body.ok !== true) {
+      var error = prepared.body.error || {};
+      renderCommitStatuses(error.details && error.details.status);
+      saveView.raw.textContent = JSON.stringify(redactedForDisplay(prepared.body), null, 2);
+      if (error.code === "SAVE_CONFIRM_REQUIRED") {
+        var details = error.details || {};
+        if (details.target_path) {
+          renderConfirmBlock(details);
+          setSaveStatus(
+            saveView.status,
+            "即将覆盖已有文件：请核对上面的绝对路径与预计备份路径，勾选确认后再点一次「应用到工程」。",
+            "busy"
+          );
+        } else {
+          /* 例如「确认之后目标文件才出现」：此时没有可展示的已确认路径，
+             必须让用户重新走一遍准备流程（会带上新的备份路径）。 */
+          hideConfirmBlock();
+          setSaveStatus(
+            saveView.status,
+            describeSaveError(error) + "请重新点「应用到工程」走一遍确认。",
+            "err"
+          );
+        }
+        saveView.apply.disabled = false;
+        return;
+      }
+      saveView.apply.disabled = false;
+      setSaveStatus(saveView.status, describeSaveError(error), "err");
+      return;
+    }
+
+    renderConfirmBlock(prepared.body, false);
+    setSaveStatus(saveView.status, "正在应用草稿并回读校验…", "busy");
+
+    var commitBody = { token: prepared.body.token, mode: mode, draft: draft };
+    if (mode === SAVE_MODE_SAVE_AS) {
+      commitBody.target_path = targetPath;
+    }
+    var committed = await request("/api/session/commit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(commitBody)
+    });
+    saveView.apply.disabled = false;
+    if (!committed.body) {
+      setSaveStatus(saveView.status, "无法访问本地服务。", "err");
+      return;
+    }
+    saveView.raw.textContent = JSON.stringify(redactedForDisplay(committed.body), null, 2);
+
+    if (committed.body.ok !== true) {
+      var commitError = committed.body.error || {};
+      renderCommitStatuses(commitError.details && commitError.details.status);
+      setSaveStatus(saveView.status, describeSaveError(commitError), "err");
+      return;
+    }
+
+    renderCommitStatuses(committed.body.status);
+    var backupPath = committed.body.backup_path;
+    setSaveStatus(
+      saveView.status,
+      "已保存到 " + committed.body.target_path + (backupPath ? "（覆盖前备份：" + backupPath + "）" : "（新文件，无需备份）"),
+      "ok"
+    );
+    /* 工程内容现在就是这份草稿：把基线换成刚写入的实际取值，
+       后续预览才会从「磁盘上的工程」而不是旧基线恢复。 */
+    if (committed.body.status && committed.body.status.applied_values) {
+      baselineValues = committed.body.status.applied_values;
+      applyValuesToControls(baselineValues);
+    }
+    if (committed.body.baseline_id) {
+      tuner.baselineInfo.textContent =
+        "基线 " + committed.body.baseline_id + " · " + formatTime(committed.body.saved_at) +
+        " · 已随保存刷新";
+    }
+  }
+
+  // -- 预设 ---------------------------------------------------------------
+  function renderPresets(items) {
+    saveView.presetBody.textContent = "";
+    var list = items || [];
+    if (!list.length) {
+      saveView.presetTable.classList.add("hidden");
+      saveView.presetEmpty.classList.remove("hidden");
+      return;
+    }
+    saveView.presetTable.classList.remove("hidden");
+    saveView.presetEmpty.classList.add("hidden");
+    list.forEach(function (item) {
+      var row = document.createElement("tr");
+      [
+        item.name,
+        formatTime(item.updated_at),
+        item.parameter_count === null || item.parameter_count === undefined ? "—" : item.parameter_count,
+        item.blender || "—"
+      ].forEach(function (value, index) {
+        var cell = document.createElement("td");
+        cell.textContent = String(value);
+        if (index === 2) {
+          cell.className = "num";
+        }
+        row.appendChild(cell);
+      });
+      saveView.presetBody.appendChild(row);
+    });
+  }
+
+  async function loadPresets() {
+    var result = await request("/api/presets");
+    if (!result.body || result.body.ok !== true) {
+      setSaveStatus(saveView.presetStatus, "预设列表读取失败。", "err");
+      return;
+    }
+    renderPresets(result.body.presets);
+  }
+
+  async function onSavePreset() {
+    var name = saveView.presetName.value ? saveView.presetName.value.trim() : "";
+    if (!name) {
+      setSaveStatus(saveView.presetStatus, "请先填写预设名称（支持中文）。", "err");
+      return;
+    }
+    if (!baselineValues) {
+      setSaveStatus(saveView.presetStatus, "尚未建立基线：无法校验草稿，请先建立基线。", "err");
+      return;
+    }
+    saveView.presetSave.disabled = true;
+    setSaveStatus(saveView.presetStatus, "正在保存预设…", "busy");
+    var result = await request("/api/presets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: name,
+        draft: collectDraft(),
+        framing: currentFramingOptions()
+      })
+    });
+    saveView.presetSave.disabled = false;
+    if (!result.body) {
+      setSaveStatus(saveView.presetStatus, "无法访问本地服务。", "err");
+      return;
+    }
+    if (result.body.ok !== true) {
+      setSaveStatus(saveView.presetStatus, describeSaveError(result.body.error), "err");
+      return;
+    }
+    setSaveStatus(
+      saveView.presetStatus,
+      (result.body.updated ? "已更新预设「" : "已保存预设「") + result.body.name + "」（" +
+        result.body.parameter_count + " 项参数）",
+      "ok"
+    );
+    loadPresets();
+  }
+
   async function initTuner() {
     tuner.card.classList.remove("hidden");
+    saveView.presetCard.classList.remove("hidden");
+    saveView.card.classList.remove("hidden");
     if (!schemaLoaded) {
       var loaded = await loadSchema();
       if (!loaded) {
@@ -1312,6 +1730,7 @@
       }
     }
     await ensureBaseline(false);
+    loadPresets();
   }
 
   function startPolling() {
@@ -1339,6 +1758,15 @@
   updateMarginReadout();
   setFramingSource(framingView.mode.value);
   setFramingStale(false, "");
+
+  /* 保存预设 / 应用到工程 */
+  saveView.presetSave.addEventListener("click", onSavePreset);
+  saveView.presetRefresh.addEventListener("click", loadPresets);
+  saveView.modeSaveAs.addEventListener("change", onSaveModeChange);
+  saveView.modeOverwrite.addEventListener("change", onSaveModeChange);
+  saveView.apply.addEventListener("click", onCommitApply);
+  resetCommitStatuses();
+  onSaveModeChange();
 
   refreshStatus();
   startPolling();

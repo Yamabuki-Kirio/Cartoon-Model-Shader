@@ -9,9 +9,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from . import blender_ops, color_looks, errors, framing
+from . import blender_ops, color_looks, errors, framing, project_ops
 from .blender_mcp import BlenderMCPClient
 from .config import BlenderMCPConfig
+from .redact import redact
 
 PREVIEW_DIR_NAME = "toon-tuner-previews"
 #: 预览渲染的**长边**像素数（另一条边按工程纵横比等比缩放，绝不改变纵横比）
@@ -182,5 +183,37 @@ class BlenderBinder:
                 errors.PREVIEW_FAILED,
                 "Blender 报告渲染未产出文件。",
                 details={"path_tail": Path(str(payload.get("path", ""))).name},
+            )
+        return payload
+
+    # -- 工程读写（保存功能）----------------------------------------------
+    def read_project(self) -> dict[str, Any]:
+        """只读：当前工程路径 + 是否有未保存改动。不写任何 ``bpy`` 数据。"""
+        captured = self._client().execute_code(project_ops.build_project_state_code())
+        return project_ops.normalize_project_state(project_ops.parse_payload(captured))
+
+    def save_project(self, target_path: str, mode: str) -> dict[str, Any]:
+        """把工程存到 ``target_path``（``mode`` 决定 save_as / save_mainfile）。
+
+        Blender 侧失败不抛异常而是回结构化 ``failure``，这里翻译成稳定错误码
+        ``SAVE_FAILED``，并把「失败在哪一步」留在 details 里（不含绝对路径）。
+        """
+        captured = self._client().execute_code(
+            project_ops.build_save_code(target_path, mode)
+        )
+        payload = project_ops.parse_payload(captured)
+        failure = payload.get("failure")
+        if payload.get("saved") is not True:
+            detail = ""
+            if isinstance(failure, dict):
+                detail = str(failure.get("message") or failure.get("type") or "")
+            raise errors.ToonTunerError(
+                errors.SAVE_FAILED,
+                f"Blender 保存工程失败：{redact(detail) or '未给出可识别的原因'}",
+                details={
+                    "mode": mode,
+                    "target_name": Path(str(payload.get("target", target_path))).name,
+                    "failure_type": (failure or {}).get("type") if isinstance(failure, dict) else None,
+                },
             )
         return payload

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -10,6 +12,7 @@ from src.server.app import create_app
 from src.server.config import AppConfig, BlenderMCPConfig, ServerConfig
 from src.server.scene_probe import PROBE_SCHEMA
 from tests.fake_mcp_server import FAKE_PROBE_PAYLOAD, FakeMCPServer, find_free_port
+from tests.support import TOKEN_HEADER, authed, unauthed
 
 
 def make_config(port: int, *, response_timeout: float = 0.6) -> AppConfig:
@@ -25,7 +28,8 @@ def make_config(port: int, *, response_timeout: float = 0.6) -> AppConfig:
 
 
 def make_client(port: int, *, response_timeout: float = 0.6) -> TestClient:
-    return TestClient(create_app(make_config(port, response_timeout=response_timeout)))
+    """带会话令牌的客户端。写接口一律需要 ``X-Toon-Tuner-Token``。"""
+    return authed(create_app(make_config(port, response_timeout=response_timeout)))
 
 
 # -- 基础 ---------------------------------------------------------------
@@ -148,3 +152,53 @@ def test_error_envelope_shape_is_stable() -> None:
     assert set(body.keys()) == {"ok", "error"}
     assert set(body["error"].keys()) >= {"code", "message", "retryable", "hint"}
     assert body["ok"] is False
+
+
+# -- 会话令牌 -----------------------------------------------------------
+def test_write_endpoints_reject_missing_token() -> None:
+    """没有令牌的写请求一律 401，且不得产生任何副作用。"""
+    with FakeMCPServer("ok") as server:
+        app = create_app(make_config(server.port))
+        response = unauthed(app).post("/api/blender/reconnect")
+        assert response.status_code == 401
+        body = response.json()
+        assert body["ok"] is False
+        assert body["error"]["code"] == errors.SESSION_TOKEN_INVALID
+        assert body["error"]["details"]["reason"] == "missing"
+
+
+def test_write_endpoints_reject_wrong_token() -> None:
+    with FakeMCPServer("ok") as server:
+        app = create_app(make_config(server.port))
+        client = unauthed(app)
+        response = client.post(
+            "/api/blender/reconnect", headers={TOKEN_HEADER: "not-the-real-token"}
+        )
+        assert response.status_code == 401
+        body = response.json()
+        assert body["error"]["code"] == errors.SESSION_TOKEN_INVALID
+        assert body["error"]["details"]["reason"] == "mismatch"
+        # 错误信息里绝不能回显令牌内容
+        assert "not-the-real-token" not in response.text
+
+
+def test_read_endpoints_do_not_require_token() -> None:
+    """只读接口不需要令牌，否则用户直接打开页面就什么都看不到。"""
+    with FakeMCPServer("ok") as server:
+        client = unauthed(create_app(make_config(server.port)))
+        assert client.get("/api/health").status_code == 200
+        assert client.get("/api/blender/status").status_code == 200
+
+
+def test_index_injects_token_without_touching_static_file() -> None:
+    """令牌只在响应里注入；磁盘上的静态文件里不得出现令牌。"""
+    with FakeMCPServer("ok") as server:
+        app = create_app(make_config(server.port))
+        token = app.state.session_token
+        html = unauthed(app).get("/").text
+        assert token in html
+        assert "window.__TOON_TUNER_TOKEN__" in html
+
+        source = Path("src/web/index.html").read_text(encoding="utf-8")
+        assert token not in source
+        assert "window.__TOON_TUNER_TOKEN__ = " not in source

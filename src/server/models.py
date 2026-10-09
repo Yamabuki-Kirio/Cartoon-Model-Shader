@@ -241,3 +241,117 @@ class FramingContextResponse(BaseModel):
     resolution: list[int] = Field(default_factory=list)
     baseline: dict[str, Any] = Field(default_factory=dict)
     framing_modes: dict[str, Any] = Field(default_factory=dict)
+
+
+# -- 预设（presets）---------------------------------------------------------
+# 注意：这两个模型**没有任何路径字段**。预设目录与文件名一律由服务端决定，
+# 因此「路径穿越」在接口契约层面就不存在，而不是靠运行期过滤。
+
+
+class PresetSaveRequest(BaseModel):
+    """保存预设：只需要名称 + 完整草稿。多余字段一律 422 拒绝。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="预设名称，支持中文；只作为显示名与去重键，不参与路径拼接")
+    draft: dict[str, Any] = Field(
+        default_factory=dict, description="完整草稿：参数 id 到取值的映射"
+    )
+    framing: FramingOptions | None = Field(
+        default=None, description="保存时使用的取景方式，仅供复现预览构图"
+    )
+
+
+class PresetItem(BaseModel):
+    id: str
+    name: str
+    created_at: str | None = None
+    updated_at: str | None = None
+    blender: str | None = None
+    baseline_id: str | None = None
+    parameter_count: int | None = None
+    framing: dict[str, Any] = Field(default_factory=dict)
+
+
+class PresetListResponse(BaseModel):
+    """预设列表。
+
+    刻意**不回传预设目录的绝对路径**：仓库的脱敏约定是「对外响应不含本机绝对路径」，
+    而预设目录属于本机实现细节（保存路径的绝对路径只出现在「应用到工程」的确认信息里，
+    那是任务书明确要求展示的例外）。
+    """
+
+    ok: Literal[True] = True
+    protocol: str = "toon-tuner-presets/1"
+    presets: list[PresetItem] = Field(default_factory=list)
+
+
+class PresetSaveResponse(BaseModel):
+    ok: Literal[True] = True
+    id: str
+    name: str
+    created_at: str
+    updated_at: str
+    parameter_count: int
+    updated: bool = Field(description="True = 覆盖了同名预设；False = 新建")
+
+
+# -- 应用到工程（commit）----------------------------------------------------
+
+
+class CommitPrepareRequest(BaseModel):
+    """准备保存：只校验，不写盘。默认「另存为」。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["save_as", "overwrite"] = "save_as"
+    draft: dict[str, Any] = Field(default_factory=dict)
+    target_path: str | None = Field(
+        default=None,
+        description="仅 save_as 使用：绝对路径且以 .blend 结尾；overwrite 由 Blender 当前工程决定",
+    )
+    confirm: bool = Field(
+        default=False, description="覆盖已有文件必须为 True（先看清绝对路径与备份路径再确认）"
+    )
+
+
+class CommitPrepareResponse(BaseModel):
+    ok: Literal[True] = True
+    token: str = Field(description="一次性短效确认令牌，绑定基线/草稿/模式/目标路径")
+    mode: str
+    target_path: str
+    backup_path: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+    baseline_id: str
+    draft_hash: str
+    parameter_count: int = 0
+    normalized: list[dict[str, Any]] = Field(default_factory=list)
+    expires_at: str
+    expires_in_seconds: int
+    confirmation_required: bool = False
+
+
+class CommitRequest(BaseModel):
+    """执行保存：消费令牌，逐项比对绑定。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str
+    mode: Literal["save_as", "overwrite"] = "save_as"
+    draft: dict[str, Any] = Field(default_factory=dict)
+    target_path: str | None = None
+
+
+class CommitResponse(BaseModel):
+    ok: Literal[True] = True
+    mode: str
+    target_path: str
+    backup_path: str | None = None
+    saved: bool
+    status: dict[str, Any] = Field(default_factory=dict)
+    steps: list[str] = Field(default_factory=list)
+    normalized: list[dict[str, Any]] = Field(default_factory=list)
+    baseline_id: str | None = None
+    baseline_refreshed: bool = False
+    saved_at: str
+    warnings: list[str] = Field(default_factory=list)

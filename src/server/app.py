@@ -15,11 +15,20 @@
 * ``POST /api/preview``            提交草稿 + 取景方式，产出预览任务
 * ``GET  /api/jobs/{id}``          任务状态
 * ``GET  /api/preview/{id}``       预览图（HTTP 端点，不暴露本机路径）
+* ``GET  /api/presets``            列出本地预设
+* ``POST /api/presets``            校验并保存当前完整草稿为预设
+* ``POST /api/session/commit/prepare`` 校验基线/草稿/模式/目标路径，签发一次性确认令牌
+* ``POST /api/session/commit``     消费令牌 → 应用完整草稿 → 回读校验 → 备份 → 保存工程
 
 安全边界：
 * 只监听 127.0.0.1（见 config 回环校验）。
+* **所有写接口**（本文件里全部 POST）都必须带上 ``X-Toon-Tuner-Token``：
+  进程启动时随机生成，只通过 ``GET /`` 的页面响应注入，不落盘、不进日志。
 * 不提供任何接受任意 Python 的接口；Blender 侧代码只能来自内置模板。
 * 自动取景只用**临时预览相机**，绝不改动用户相机；渲染后必定恢复 ``scene.camera``。
+* 预设接口**不接受任何路径参数**：目录与文件名全部由服务端决定。
+* 保存工程只接受白名单化的模式与「绝对 .blend 路径」；覆盖前必先生成同目录备份，
+  且确认令牌与基线/草稿/模式/目标路径逐项绑定，不可复用或篡改。
 * look 是依赖 ``view_transform`` 的枚举：后端在**下发脚本前**完成依赖校验，
   非法组合返回稳定错误 ``INVALID_DEPENDENT_ENUM``，不退化成 ``BLENDER_SCRIPT_ERROR``。
 """
@@ -34,31 +43,49 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import SERVICE_NAME, __version__, errors, framing as framing_module, params as params_module, scene_probe
+from . import (
+    SERVICE_NAME,
+    __version__,
+    errors,
+    framing as framing_module,
+    params as params_module,
+    presets as presets_module,
+    scene_probe,
+    security,
+)
 from .binder import BlenderBinder, preview_dir, preview_png_name
 from .blender_mcp import BlenderMCPClient
+from .commit import CommitService
 from .config import AppConfig, ConfigError, load_config
 from .models import (
     BaselineRequest,
     BaselineResponse,
     BlenderStatusResponse,
     ColorLooksResponse,
+    CommitPrepareRequest,
+    CommitPrepareResponse,
+    CommitRequest,
+    CommitResponse,
     ErrorResponse,
     FramingContextResponse,
     HealthResponse,
     JobResponse,
     ParamSchemaResponse,
+    PresetListResponse,
+    PresetSaveRequest,
+    PresetSaveResponse,
     PreviewSubmitRequest,
     PreviewSubmitResponse,
     RestoreResponse,
     SceneResponse,
 )
+from .presets import PresetStore
 from .redact import redact
-from .session import PreviewService, preview_url_for
+from .session import PreviewService, preview_url_for, validate_draft
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
@@ -154,6 +181,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     gateway = BlenderGateway(cfg)
     binder = BlenderBinder(cfg.blender_mcp)
     preview = PreviewService(binder)
+    #: 所有写接口的统一闸门；令牌只在进程启动时生成一次。
+    guard = security.SessionGuard()
+    presets = PresetStore(cfg.presets_dir or presets_module.default_preset_dir())
+    commit = CommitService(binder, preview)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -172,6 +203,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     app.state.config = cfg
     app.state.gateway = gateway
     app.state.preview = preview
+    app.state.session_guard = guard
+    #: 测试与「GET /」注入用；**不**经任何 API 暴露。
+    app.state.session_token = guard.token
+    app.state.presets = presets
+    app.state.commit = commit
+
+    # 写接口统一的依赖：缺失/错误令牌一律 401 拒绝。
+    require_token = [Depends(security.require_session_token)]
 
     # -- 全局异常处理：把内部异常统一成稳定错误码 -------------------------
     @app.exception_handler(errors.ToonTunerError)
@@ -216,6 +255,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         "/api/blender/reconnect",
         response_model=BlenderStatusResponse,
         tags=["blender"],
+        dependencies=require_token,
     )
     async def blender_reconnect() -> dict[str, Any]:
         return await gateway.reconnect()
@@ -232,7 +272,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "groups": schema["groups"],
         }
 
-    @app.post("/api/session/baseline", response_model=BaselineResponse, tags=["session"])
+    @app.post(
+        "/api/session/baseline",
+        response_model=BaselineResponse,
+        tags=["session"],
+        dependencies=require_token,
+    )
     async def create_baseline(body: BaselineRequest | None = None) -> dict[str, Any]:
         """采集内存基线（含取景快照），并**立即**用基线参数创建一次预览任务。
 
@@ -311,17 +356,28 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         response_model=ColorLooksResponse,
         responses={502: {"model": ErrorResponse}, 503: {"model": ErrorResponse}, 504: {"model": ErrorResponse}},
         tags=["color"],
+        dependencies=require_token,
     )
     async def color_looks_refresh() -> dict[str, Any]:
         """重新扫描 look 能力表（换了 OCIO 配置时用）。只改能力表，不动工程取值。"""
         payload = await preview.refresh_look_capability()
         return {"ok": True, **payload}
 
-    @app.post("/api/session/restore", response_model=RestoreResponse, tags=["session"])
+    @app.post(
+        "/api/session/restore",
+        response_model=RestoreResponse,
+        tags=["session"],
+        dependencies=require_token,
+    )
     async def restore_baseline() -> dict[str, Any]:
         return await preview.restore_baseline()
 
-    @app.post("/api/preview", response_model=PreviewSubmitResponse, tags=["preview"])
+    @app.post(
+        "/api/preview",
+        response_model=PreviewSubmitResponse,
+        tags=["preview"],
+        dependencies=require_token,
+    )
     async def submit_preview(body: PreviewSubmitRequest) -> dict[str, Any]:
         options = framing_module.validate_options(
             body.framing.model_dump() if body.framing is not None else None
@@ -358,6 +414,84 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             )
         return FileResponse(path, media_type="image/png", filename=path.name)
 
+    # -- 预设 -------------------------------------------------------------
+    @app.get("/api/presets", response_model=PresetListResponse, tags=["presets"])
+    async def list_presets() -> dict[str, Any]:
+        """列出本地预设（只读，不校验令牌）。
+
+        请求里没有、也不接受任何路径参数：目录与文件名完全由服务端决定。
+        """
+        return {"ok": True, "presets": presets.list()}
+
+    @app.post(
+        "/api/presets",
+        response_model=PresetSaveResponse,
+        tags=["presets"],
+        dependencies=require_token,
+    )
+    async def save_preset(body: PresetSaveRequest) -> dict[str, Any]:
+        """校验并保存当前完整草稿。
+
+        与预览、保存走**同一套**草稿校验（白名单 / 范围 / 依赖枚举），
+        因此非法取值与越界参数在这里就被拒绝，不会写进预设文件。
+        """
+        name = presets_module.validate_name(body.name)
+        baseline = preview.baseline
+        if baseline is None:
+            raise errors.ToonTunerError(
+                errors.NO_BASELINE, "尚未建立内存基线，无法校验并保存预设。"
+            )
+        coerced = validate_draft(body.draft, baseline)
+        return {
+            "ok": True,
+            **presets.save(
+                name,
+                coerced,
+                framing=(body.framing.model_dump() if body.framing is not None else None),
+                blender=baseline.blender,
+                baseline_id=baseline.baseline_id,
+            ),
+        }
+
+    # -- 应用到工程 -------------------------------------------------------
+    @app.post(
+        "/api/session/commit/prepare",
+        response_model=CommitPrepareResponse,
+        tags=["commit"],
+        dependencies=require_token,
+    )
+    async def commit_prepare(body: CommitPrepareRequest) -> dict[str, Any]:
+        """校验基线 / 草稿 / 保存模式 / 目标路径，签发**一次性短效**确认令牌。
+
+        覆盖已有文件时**不传 confirm 不签发令牌**，而是回 ``SAVE_CONFIRM_REQUIRED``，
+        其 details 里带着目标绝对路径与预计备份路径 —— 这正是「先看清再确认」那一步。
+        """
+        return await commit.prepare(
+            mode=body.mode,
+            draft=body.draft,
+            target_path=body.target_path,
+            confirm=body.confirm,
+        )
+
+    @app.post(
+        "/api/session/commit",
+        response_model=CommitResponse,
+        tags=["commit"],
+        dependencies=require_token,
+    )
+    async def commit_apply(body: CommitRequest) -> dict[str, Any]:
+        """消费令牌 → 应用完整草稿 → 回读校验 → 备份 → 保存工程。
+
+        任一步失败都**不会保存**，草稿保留在界面上；失败响应的 ``details.status``
+        带有应用 / 回读 / 备份 / 保存四个状态。
+        """
+        return await commit.commit(
+            token=body.token,
+            mode=body.mode,
+            draft=body.draft,
+            target_path=body.target_path,
+        )
+
     # -- 静态页面 ---------------------------------------------------------
     index_file = WEB_DIR / "index.html"
     if WEB_DIR.is_dir():
@@ -365,8 +499,14 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     async def index() -> Any:
+        """单页界面。
+
+        令牌在**响应时**注入：磁盘上的 ``index.html`` 只有占位注释，
+        因此令牌永远不会出现在静态文件、构建产物或日志里。
+        """
         if index_file.is_file():
-            return FileResponse(index_file)
+            html = index_file.read_text(encoding="utf-8")
+            return HTMLResponse(security.inject_token(html, guard.token))
         return JSONResponse(
             status_code=500,
             content=errors.ToonTunerError(

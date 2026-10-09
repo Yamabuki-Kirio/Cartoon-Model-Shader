@@ -26,6 +26,27 @@ INVALID_DEPENDENT_ENUM = "INVALID_DEPENDENT_ENUM"
 # 取景（framing）
 FRAMING_STALE = "FRAMING_STALE"
 FRAMING_UNAVAILABLE = "FRAMING_UNAVAILABLE"
+# 会话令牌（所有写接口）
+SESSION_TOKEN_INVALID = "SESSION_TOKEN_INVALID"
+# 预设（presets）
+PRESET_NAME_INVALID = "PRESET_NAME_INVALID"
+PRESET_SAVE_FAILED = "PRESET_SAVE_FAILED"
+# 保存 / 应用到工程
+SAVE_TARGET_INVALID = "SAVE_TARGET_INVALID"
+SAVE_CONFIRM_REQUIRED = "SAVE_CONFIRM_REQUIRED"
+PROJECT_NOT_SAVED = "PROJECT_NOT_SAVED"
+BACKUP_FAILED = "BACKUP_FAILED"
+COMMIT_TOKEN_INVALID = "COMMIT_TOKEN_INVALID"
+COMMIT_TOKEN_EXPIRED = "COMMIT_TOKEN_EXPIRED"
+COMMIT_TOKEN_USED = "COMMIT_TOKEN_USED"
+COMMIT_TOKEN_MISMATCH = "COMMIT_TOKEN_MISMATCH"
+BASELINE_STALE = "BASELINE_STALE"
+APPLY_VERIFY_FAILED = "APPLY_VERIFY_FAILED"
+SAVE_FAILED = "SAVE_FAILED"
+#: 失败后回滚基线失败。不单独作为顶层错误码抛出（顶层保留**原始失败原因**，
+#: 否则「为什么失败」就被盖掉了）；它出现在 ``error.details.status.rollback.code``，
+#: 用来把「场景可能仍不是提交前的状态」这件事明确报出来。
+ROLLBACK_FAILED = "ROLLBACK_FAILED"
 
 #: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，
 #: 便于调用方直接读到 ``parameter`` / ``value`` / ``depends_on`` / ``allowed``。
@@ -103,6 +124,82 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         409,
         True,
         "无法自动取景：请确认场景里有可见的角色网格（已排除刚体代理与描边壳）以及一台活动相机。",
+    ),
+    SESSION_TOKEN_INVALID: (
+        401,
+        False,
+        "缺少或错误的本机会话令牌。请刷新页面重新取得令牌后重试；写接口一律拒绝无令牌请求。",
+    ),
+    PRESET_NAME_INVALID: (
+        400,
+        False,
+        "预设名称不合法：不能为空、不能超过 64 字、不能包含路径分隔符或 Windows 保留字符。",
+    ),
+    PRESET_SAVE_FAILED: (
+        500,
+        True,
+        "预设写入失败：请确认本地磁盘可写后重试。服务端采用「临时文件 + 原子替换」，不会留下半截文件。",
+    ),
+    SAVE_TARGET_INVALID: (
+        400,
+        False,
+        "保存目标非法：必须是绝对路径且以 .blend 结尾；覆盖模式下目标由 Blender 当前工程决定，不接受客户端指定。",
+    ),
+    SAVE_CONFIRM_REQUIRED: (
+        409,
+        True,
+        "覆盖已有文件需要二次确认。请核对绝对路径与预计备份路径后，再以确认标记重新提交。",
+    ),
+    PROJECT_NOT_SAVED: (
+        409,
+        True,
+        "「覆盖当前工程」只能用于已保存过的工程。请先在 Blender 里保存一次，或改用「另存为」。",
+    ),
+    BACKUP_FAILED: (
+        500,
+        True,
+        "备份失败，已拒绝覆盖。请确认工程所在目录可写、磁盘空间充足后重试。",
+    ),
+    COMMIT_TOKEN_INVALID: (
+        409,
+        False,
+        "确认令牌无效（不存在或格式不对）。请重新点击「应用到工程」走一遍准备流程。",
+    ),
+    COMMIT_TOKEN_EXPIRED: (
+        409,
+        True,
+        "确认令牌已过期（有效期很短）。请重新准备一次并尽快确认。",
+    ),
+    COMMIT_TOKEN_USED: (
+        409,
+        False,
+        "确认令牌已被使用过；令牌是一次性的，不能复用。请重新准备。",
+    ),
+    COMMIT_TOKEN_MISMATCH: (
+        409,
+        False,
+        "确认令牌与本次提交不匹配（基线 / 草稿 / 保存模式 / 目标路径必须与准备阶段完全一致）。",
+    ),
+    BASELINE_STALE: (
+        409,
+        True,
+        "基线已失效（例如工程被重新保存或基线被刷新）。请先重新建立基线，再重新准备保存。",
+    ),
+    APPLY_VERIFY_FAILED: (
+        502,
+        True,
+        "草稿写入后回读不一致，因此**没有保存**，草稿保留在界面上。请检查 Blender 场景状态后重试。",
+    ),
+    SAVE_FAILED: (
+        502,
+        True,
+        "Blender 保存工程失败，草稿保留在界面上。请确认目标目录可写、工程未被其他程序占用后重试。",
+    ),
+    ROLLBACK_FAILED: (
+        500,
+        True,
+        "失败后未能把 Blender 恢复到提交前的状态。请到 Blender 里人工确认曝光/辉光取值，"
+        "必要时点「恢复基线」；磁盘上的工程文件未被写入。",
     ),
 }
 

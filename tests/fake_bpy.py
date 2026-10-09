@@ -742,9 +742,49 @@ class FakeOpsRender:
         self._bpy.render_scene_camera_history.append(self._bpy.last_render_camera)
 
 
+#: 落盘的「.blend」占位内容（只要非空即可，用于断言文件确实被写出来）
+BLEND_BYTES = b"BLENDER-v300RENDH" + b"\x00" * 32
+
+
+class FakeOpsWm:
+    """``bpy.ops.wm``：保存工程。
+
+    复刻真实行为里**与正确性有关**的三点：
+    * ``save_as_mainfile`` 之后 ``bpy.data.filepath`` 变为新路径、``is_dirty`` 变 False；
+    * ``save_mainfile`` 存回**当前** ``filepath``；未保存过则报错；
+    * 目标目录不存在时抛异常（服务端据此回 ``SAVE_FAILED``，而不是假装成功）。
+    """
+
+    def __init__(self, bpy: "FakeBpy") -> None:
+        self._bpy = bpy
+
+    def save_as_mainfile(self, filepath: Any = None, check_existing: bool = True, **kwargs: Any) -> None:
+        self._write(str(filepath), "save_as", check_existing)
+
+    def save_mainfile(self, check_existing: bool = True, **kwargs: Any) -> None:
+        current = self._bpy.data.filepath
+        if not current:
+            raise RuntimeError("尚未保存过工程，save_mainfile 无目标可写。")
+        self._write(current, "save_mainfile", check_existing)
+
+    def _write(self, target: str, kind: str, check_existing: bool) -> None:
+        if self._bpy.save_error is not None:
+            raise RuntimeError(self._bpy.save_error)
+        path = Path(target)
+        if not path.parent.is_dir():
+            raise RuntimeError(f"目标目录不存在：{path.parent.name}")
+        path.write_bytes(BLEND_BYTES)
+        self._bpy.data.filepath = str(path)
+        self._bpy.data.is_dirty = False
+        self._bpy.save_calls.append(
+            {"kind": kind, "path": str(path), "check_existing": bool(check_existing)}
+        )
+
+
 class _Ops:
     def __init__(self, bpy: "FakeBpy") -> None:
         self.render = FakeOpsRender(bpy)
+        self.wm = FakeOpsWm(bpy)
 
 
 class _NodeGroupMap:
@@ -810,7 +850,25 @@ class FakeBpy:
         self.last_render_resolution: tuple[int, int, int] | None = None
         self.last_render_camera: str | None = None
         self.render_scene_camera_history: list[str | None] = []
+        #: 保存调用轨迹（供断言 check_existing=False 等）
+        self.save_calls: list[dict[str, Any]] = []
+        #: 测试注入：设置后任何保存都抛 RuntimeError（模拟磁盘/权限失败）
+        self.save_error: str | None = None
         self.build_default_scene()
+
+    # -- 工程（.blend）状态 ------------------------------------------------
+    def set_project(self, path: str | Path, *, dirty: bool = False, create: bool = True) -> Path:
+        """把桩切成「已经打开某个 .blend」的状态。
+
+        ``dirty=True`` 模拟「磁盘上有上一次保存的版本，但内存里还有未保存改动」。
+        """
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if create and not target.exists():
+            target.write_bytes(BLEND_BYTES)
+        self.data.filepath = str(target)
+        self.data.is_dirty = bool(dirty)
+        return target
 
     @property
     def view_settings(self) -> FakeViewSettings:
