@@ -1,10 +1,11 @@
 name: test
 
-# MVP-03：把「跑一遍 pytest」变成自动闸门。
+# Windows 自动测试闸门：覆盖浏览器调参工具与 render_pipeline。
 #
 # 边界（有意为之）：
 # * 只在 windows-latest 上跑 —— 本工具只承诺 Windows；用其它平台跑等于承诺了不支持的平台。
-# * 不依赖真实 Blender —— 测试自带假 MCP 服务器与假 bpy 桩，真的执行服务端生成的代码。
+# * 不依赖真实 Blender —— 测试自带假 MCP 服务器、假 bpy 桩与合成 PMX 占位文件，
+#   真的执行服务端生成的代码。
 # * 不上传任何产物 —— 不含模型、贴图、预览图、日志，避免仓库 Actions 里出现工程素材。
 # * 真实 Blender / 真实浏览器验收仍是**人工**步骤，不进 GitHub Runner。
 on:
