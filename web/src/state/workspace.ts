@@ -284,9 +284,13 @@ export function createWorkspace(options: WorkspaceOptions) {
       },
       onSucceeded: (job, result) => handleSuccess(job, result),
       onFailed: (job, error) => {
-        // ⚠ 只写 error，**不动** lastSuccessfulPreview ——
-        //   失败画面不得替换最后一张成功预览。
-        store.setState({ activeJob: job, error: jobErrorToDetail(error), loading: false });
+        // ⚠ **不动** lastSuccessfulPreview —— 失败画面不得替换最后一张成功预览。
+        //
+        // 但错误必须走**同一条**路由：服务端的预览任务同样会以
+        // `STRUCTURE_CHANGED` / `IDENTITY_MISSING` 终结（结构在提交后被改、
+        // 对象被重命名或删除）。若这里只写一句 error，草稿不会作废、
+        // `historyBlocked` 仍为 false，用户还能接着提交 —— 结构失效保护等于没生效。
+        routeErrorDetail(jobErrorToDetail(error), { activeJob: job });
       },
     },
   });
@@ -422,6 +426,23 @@ export function createWorkspace(options: WorkspaceOptions) {
     return { elements: deepCopy(elements), interpolation };
   }
 
+  /**
+   * 错误路由的**唯一入口**。
+   *
+   * 两条来源都必须经过这里：同步异常（`handleError`）与预览任务终态（`onFailed`）。
+   * 结构失效保护只有一份，漏掉任何一条来源，用户都能继续提交一份已经作废的草稿。
+   *
+   * `patch` 只用来顺带带上任务上下文（如 `activeJob`），**不得**用它覆盖
+   * `error` / `historyBlocked` / `draft` 这些由下面统一决定的字段。
+   */
+  function routeErrorDetail(detail: ErrorDetail, patch: Partial<WorkspaceState> = {}): void {
+    if (isStructureFatalCode(detail.code)) {
+      actions.applyStructureFatal(detail, patch);
+      return;
+    }
+    store.setState({ ...patch, error: detail, loading: false });
+  }
+
   const actions = {
     bootstrap,
     refreshBaseline,
@@ -439,7 +460,10 @@ export function createWorkspace(options: WorkspaceOptions) {
       store.setState({ notice: null });
     },
     clearError(): void {
-      store.setState({ error: null, historyBlocked: false });
+      // **只**清提示。`historyBlocked` 是安全锁，只能由「成功刷新基线」解除
+      // （见 `refreshBaseline`）—— 否则用户点一下「关闭」就能绕过
+      // 「必须刷新基线」这条限制，锁形同虚设。
+      store.setState({ error: null });
     },
 
     /** 标量 / 枚举：`seal` 表示结束一次连续输入（失焦 / 回车）。 */
@@ -634,12 +658,13 @@ export function createWorkspace(options: WorkspaceOptions) {
     },
 
     /** 结构失效：草稿作废、命令栈清空、预览禁用，但**保留**最后一张成功预览。 */
-    applyStructureFatal(detail: ErrorDetail): void {
+    applyStructureFatal(detail: ErrorDetail, patch: Partial<WorkspaceState> = {}): void {
       runner.dispose();
       history.clear();
       syncHistoryDepths();
       draftVersion += 1;
       store.setState({
+        ...patch,
         draft: emptyDraft(),
         dirtyIds: new Set<string>(),
         historyBlocked: true,
@@ -650,15 +675,7 @@ export function createWorkspace(options: WorkspaceOptions) {
     },
 
     handleError(error: unknown): void {
-      const detail = toDetail(error);
-      if (
-        error instanceof AppError &&
-        (error.code === "STRUCTURE_CHANGED" || error.code === "IDENTITY_MISSING")
-      ) {
-        actions.applyStructureFatal(detail);
-        return;
-      }
-      store.setState({ error: detail, loading: false });
+      routeErrorDetail(toDetail(error));
     },
 
     effectiveFor(nodeId: string): unknown {
@@ -679,6 +696,16 @@ export function createWorkspace(options: WorkspaceOptions) {
 }
 
 export type Workspace = ReturnType<typeof createWorkspace>;
+
+/**
+ * 会让**整份草稿与已签发确认令牌一起作废**的错误码。
+ *
+ * 判定只认稳定错误码、不认文案 —— 文案会改，错误码不会。
+ * 两个来源（同步异常、预览任务终态）共用这一个判据，避免两处判据漂移。
+ */
+export function isStructureFatalCode(code: string): boolean {
+  return code === "STRUCTURE_CHANGED" || code === "IDENTITY_MISSING";
+}
 
 /** 从参数 id 反推所属分组节点 id（`cel.Cel_Skin.ramp` → `cel.Cel_Skin`）。 */
 export function ownerGroupId(paramId: string): string {

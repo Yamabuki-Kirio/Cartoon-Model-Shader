@@ -144,18 +144,32 @@ export class ApiClient {
   }
 }
 
+/**
+ * FastAPI 的**请求校验错误**形状：默认是 `{detail: [...]}`（HTTP 422），
+ * 少数被自行包装过的路径是顶层数组。两种都要认，否则 422 会被显示成 INTERNAL_ERROR。
+ */
+function isValidationErrorPayload(payload: unknown): boolean {
+  if (Array.isArray(payload)) {
+    return true;
+  }
+  if (payload !== null && typeof payload === "object") {
+    return Array.isArray((payload as { detail?: unknown }).detail);
+  }
+  return false;
+}
+
 function extractError(payload: unknown, status: number): Partial<ErrorDetail> {
   const envelope = payload as { error?: Partial<ErrorDetail> } | null;
   if (envelope && typeof envelope === "object" && envelope.error) {
     return envelope.error;
   }
-  if (Array.isArray(payload)) {
-    // FastAPI 的 422 校验错误：形状与错误信封不同，这里统一成稳定结构。
+  if (isValidationErrorPayload(payload)) {
+    // 形状与错误信封不同，这里统一成稳定结构（含原始 detail，便于排查）。
     return {
       code: "REQUEST_INVALID",
       message: "请求格式不正确（服务端拒绝了该请求体）。",
       retryable: false,
-      details: { status },
+      details: { status, detail: payload },
     };
   }
   return {

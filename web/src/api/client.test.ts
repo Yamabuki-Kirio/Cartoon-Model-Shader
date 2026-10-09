@@ -110,6 +110,32 @@ describe("API 客户端：令牌与错误", () => {
     });
   });
 
+  it("标准 422（{detail: [...]}）同样被认成 REQUEST_INVALID，而不是 INTERNAL_ERROR", async () => {
+    // FastAPI 的默认形状就是 {detail: [...]}。只认顶层数组会把最常见的校验失败
+    // 显示成「服务端内部错误」，用户据此排查会完全跑偏。
+    const fake = (async () =>
+      jsonResponse(
+        { detail: [{ loc: ["body", "draft"], msg: "Input should be a valid object", type: "dict_type" }] },
+        422
+      )) as unknown as typeof fetch;
+    await expect(makeClient(fake).post("/api/v4/preview", {})).rejects.toMatchObject({
+      code: "REQUEST_INVALID",
+      status: 422,
+      retryable: false,
+    });
+    try {
+      await makeClient(fake).post("/api/v4/preview", {});
+    } catch (error) {
+      // 原始 detail 保留在 details 里，便于排查；但**不**当作成功或内部错误。
+      expect((error as AppError).details).toMatchObject({ status: 422 });
+    }
+  });
+
+  it("普通对象（既无 error 也非校验错误）仍是 INTERNAL_ERROR", async () => {
+    const fake = (async () => jsonResponse({ detail: "not-an-array" }, 500)) as unknown as typeof fetch;
+    await expect(makeClient(fake).get("/api/health")).rejects.toMatchObject({ code: "INTERNAL_ERROR" });
+  });
+
   it("网络异常翻译成 NETWORK_ERROR（不是静默成功）", async () => {
     const fake = (async () => {
       throw new TypeError("fetch failed");

@@ -27,6 +27,16 @@ export interface RampStripProps {
  * * **松开时** `sealHistory()`，于是下一次拖动是**新的一条**撤销记录；
  * * 位置夹在左右邻居之间（严格递增），首尾色标固定在 0 / 1 —— 当前不提供增删色标，
  *   端点被拖走后用户无法补回。
+ *
+ * 两个实现要点（都是被真实缺陷逼出来的，别改回去）：
+ *
+ * 1. **「正在拖动第几号色标」放在 `useRef` 里，判定只读 ref。**
+ *    若读 `useState` 的值，`beginDrag` 里 `setDragging(i)` 之后本轮注册的监听器
+ *    仍捕获着 `dragging === null`（state 更新要等下一次渲染），move 会被整段挡掉、
+ *    up 也认不出拖动 —— 表现为「拖了没反应，历史也不封存」。state 只用于渲染高亮。
+ * 2. **监听器挂在轨道的 JSX 上，靠 Pointer Capture 收全事件**，而不是
+ *    `window.addEventListener` 把当轮闭包钉死。挂在 JSX 上意味着每次渲染都是最新 props，
+ *    `elements` 永不发霉；Pointer Capture 则保证指针拖出轨道后事件仍回到轨道元素。
  */
 export function RampStrip({
   workspace,
@@ -37,53 +47,84 @@ export function RampStrip({
   editable,
 }: RampStripProps) {
   const trackRef = useRef<HTMLDivElement | null>(null);
+  const dragIndexRef = useRef<number | null>(null);
   const [dragging, setDragging] = useState<number | null>(null);
 
-  function positionFromEvent(clientX: number): number {
+  function positionFromEvent(clientX: number): number | null {
     const track = trackRef.current;
     if (!track) {
-      return 0;
+      return null;
     }
     const rect = track.getBoundingClientRect();
     if (rect.width <= 0) {
-      return 0;
+      // 布局尚未就绪（或元素不可见）：宁可不动，也不要写入一个凭 0 宽度算出的位置。
+      return null;
     }
-    return clamp01((clientX - rect.left) / rect.width);
+    const clientXNumber = Number(clientX);
+    if (!Number.isFinite(clientXNumber)) {
+      return null;
+    }
+    return clamp01((clientXNumber - rect.left) / rect.width);
   }
 
-  function onPointerMove(event: PointerEvent) {
-    if (dragging === null) {
-      return;
-    }
-    const desired = positionFromEvent(event.clientX);
-    const clamped = clampPositionForIndex(elements, dragging, desired);
-    if (Math.abs(clamped - (elements[dragging]?.position ?? 0)) < 1e-9) {
-      return;
-    }
-    const next = elements.map((element, index) =>
-      index === dragging ? { position: clamped, color: element.color } : element
+  function withPosition(index: number, position: number) {
+    return elements.map((element, itemIndex) =>
+      itemIndex === index ? { position, color: element.color } : element
     );
-    workspace.actions.dragElement(groupId, dragging, next, interpolation);
   }
 
-  function endDrag() {
-    if (dragging === null) {
+  function onTrackPointerMove(event: Event) {
+    const index = dragIndexRef.current;
+    if (index === null) {
       return;
     }
+    const position = positionFromEvent((event as unknown as PointerEvent).clientX);
+    if (position === null) {
+      return;
+    }
+    const clamped = clampPositionForIndex(elements, index, position);
+    if (Math.abs(clamped - (elements[index]?.position ?? 0)) < 1e-9) {
+      return;
+    }
+    workspace.actions.dragElement(groupId, index, withPosition(index, clamped), interpolation);
+  }
+
+  function endDrag(event?: Event) {
+    const index = dragIndexRef.current;
+    if (index === null) {
+      return;
+    }
+    dragIndexRef.current = null;
     setDragging(null);
-    window.removeEventListener("pointermove", onPointerMove);
-    window.removeEventListener("pointerup", endDrag);
+    const track = trackRef.current;
+    const pointerId = (event as unknown as PointerEvent | undefined)?.pointerId;
+    if (track && typeof pointerId === "number" && typeof track.releasePointerCapture === "function") {
+      try {
+        track.releasePointerCapture(pointerId);
+      } catch {
+        // 指针已经释放 / 捕获从未建立：无需处理。
+      }
+    }
+    // 封存历史：下一次拖动是一条**新的**撤销记录。
     workspace.actions.sealHistory();
   }
 
-  function beginDrag(index: number, event: PointerEvent) {
+  function beginDrag(index: number, event: Event) {
     if (!editable) {
       return;
     }
     event.preventDefault();
+    const track = trackRef.current;
+    const pointerId = (event as unknown as PointerEvent).pointerId;
+    if (track && typeof pointerId === "number" && typeof track.setPointerCapture === "function") {
+      try {
+        track.setPointerCapture(pointerId);
+      } catch {
+        // 不支持捕获的环境（如 jsdom）退化为「只在轨道内拖动」。
+      }
+    }
+    dragIndexRef.current = index;
     setDragging(index);
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", endDrag, { once: true });
   }
 
   return (
@@ -93,6 +134,9 @@ export function RampStrip({
         ref={trackRef}
         data-testid={`ramp-track-${groupId}`}
         style={{ background: rampToCssGradient(elements, interpolation) }}
+        onPointerMove={onTrackPointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
       >
         {elements.map((element, index) => {
           const bounds = neighborBounds(elements, index);
@@ -108,7 +152,7 @@ export function RampStrip({
               aria-label={`${node.label} 第 ${index + 1} 个色标`}
               disabled={!editable || fixed}
               title={fixed ? "端点色标固定在 0 / 1" : `位置 ${element.position.toFixed(3)}`}
-              onPointerDown={(event) => beginDrag(index, event as unknown as PointerEvent)}
+              onPointerDown={(event) => beginDrag(index, event as unknown as Event)}
             />
           );
         })}
