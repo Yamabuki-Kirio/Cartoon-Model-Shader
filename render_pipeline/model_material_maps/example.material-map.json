@@ -1,0 +1,14 @@
+{
+  "schema": "toon-material-map/1",
+  "model": {
+    "display_name": "示例模型",
+    "fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "assignments": {
+    "示例材质": {
+      "group": "face_detail",
+      "source": "user_confirmed",
+      "hint": "虚构示例；请勿用于真实模型"
+    }
+  }
+}
