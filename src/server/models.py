@@ -241,3 +241,110 @@ class FramingContextResponse(BaseModel):
     resolution: list[int] = Field(default_factory=list)
     baseline: dict[str, Any] = Field(default_factory=dict)
     framing_modes: dict[str, Any] = Field(default_factory=dict)
+
+
+# -- MVP-03：本地预设 -------------------------------------------------------
+
+
+class PresetParameter(BaseModel):
+    """单个参数在预设里的记录（与 run 记录同构）。
+
+    * ``configured_value`` —— 配置值（可能来自旧预设的显示标签）；
+    * ``effective_value``  —— 真正写进 Blender 的真实 identifier；
+    * ``active``           —— 是否参与应用；``false`` 只作记录。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    configured_value: Any = None
+    effective_value: Any = None
+    active: bool = True
+
+
+class PresetSaveRequest(BaseModel):
+    """新建 / 覆盖保存预设。
+
+    ``parameters`` 的值可以是 ``PresetParameter`` 三元组，也可以是**裸取值**
+    （此时视作 ``configured = effective = 该值`` 且 ``active = true``）。
+
+    ``schema`` 可带可不带：带了就用它判定版本（旧版本会得到明确的
+    ``PRESET_SCHEMA_UNSUPPORTED``，而不是被字段校验挡成笼统的 422）；
+    不带则由服务端写入当前版本。字段名用 ``schema_version`` 避开 Pydantic
+    基类上的 ``schema`` 属性，对外仍以 ``schema`` 出现。
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    name: str
+    schema_version: str | None = Field(default=None, alias="schema")
+    pipeline_mode: str = "faithful"
+    framing_mode: str = "current_camera"
+    framing_margin: float = 0.15
+    preview_quality: str = "standard"
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class PresetRenameRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+
+
+class PresetDuplicateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+
+
+class PresetSummary(BaseModel):
+    preset_id: str
+    name: str
+    schema_version: str = Field(alias="schema", serialization_alias="schema")
+    created_at: str
+    updated_at: str
+    pipeline_mode: str
+    framing_mode: str
+    framing_margin: float
+    preview_quality: str
+    parameter_count: int
+    active_count: int
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PresetDetail(PresetSummary):
+    parameters: dict[str, PresetParameter] = Field(default_factory=dict)
+
+
+class PresetSkip(BaseModel):
+    file: str
+    code: str
+    message: str
+
+
+class PresetListResponse(BaseModel):
+    """``GET /api/presets``：预设列表 + 运行设置白名单。
+
+    ``storage`` 是**未展开**的展示写法（如 ``%LOCALAPPDATA%\\CartoonModelShader\\presets``），
+    绝不含本机绝对路径。
+    """
+
+    ok: Literal[True] = True
+    protocol: str = "toon-tuner-presets/1"
+    storage: str = ""
+    presets: list[PresetSummary] = Field(default_factory=list)
+    skipped: list[PresetSkip] = Field(default_factory=list)
+    quality_tiers: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    pipeline_modes: list[str] = Field(default_factory=list)
+    framing_modes: list[str] = Field(default_factory=list)
+    defaults: dict[str, Any] = Field(default_factory=dict)
+
+
+class PresetDetailResponse(BaseModel):
+    ok: Literal[True] = True
+    preset: PresetDetail
+
+
+class PresetDeleteResponse(BaseModel):
+    ok: Literal[True] = True
+    deleted: PresetSummary

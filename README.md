@@ -22,6 +22,7 @@ MMD 刚入门，渲染水平很低，见谅。只用于自用。
 | 等待方式 | **不使用固定 `sleep`**；以任务 ID + 状态查询 / 推送等待 Blender 完成 |
 | 首版范围 | 当前场景中的**一个主要角色**；角色须处于管线支持的基准坐标 |
 | 参数面 | 界面由 46 项 schema 驱动，MVP 先开放约 20 项高价值参数（**当前已开放 10 项 L0**，见下文） |
+| 预设存储 | 落在用户目录 `%LOCALAPPDATA%\CartoonModelShader\presets`，**不进仓库**；写入前拒绝任何本机路径、模型/贴图路径与凭据（不做静默清洗） |
 
 ## 三层架构
 
@@ -88,6 +89,7 @@ Cartoon-Model-Shader/
 │   │   ├── params.py                L0 参数白名单（类型/范围/绑定）
 │   │   ├── framing.py               预览取景：只读构图诊断 + 临时预览相机 + 基线失效比对
 │   │   ├── color_looks.py           依赖枚举：view_transform → 合法 look 的探测/迁移/校验
+│   │   ├── presets.py               本地预设：存储 / 校验 / 敏感内容扫描 / 加载成草稿
 │   │   ├── blender_ops.py           由白名单生成只读/写入/渲染代码
 │   │   ├── binder.py                高层绑定：读基线 / 写草稿 / 渲染预览
 │   │   ├── session.py               内存基线 + 任务队列（旧任务自动作废）
@@ -99,7 +101,9 @@ Cartoon-Model-Shader/
 │   ├── fake_bpy.py                  可执行 bpy 桩（复刻 view_frame 等真实行为）
 │   ├── test_framing.py              取景/构图/临时相机/基线失效用例
 │   ├── test_color_looks.py          依赖枚举：能力探测/value-label/写入顺序/原子化/迁移用例
+│   ├── test_presets.py              本地预设：目录解析/文件名净化/校验/敏感内容/CRUD/API 用例
 │   └── browser_check.mjs            真实浏览器验收（本机 Chrome/Edge + CDP）
+├── .github/workflows/test.yml       Windows CI：3.11 + 3.12 矩阵，只跑 pytest，不上传产物
 ├── config.example.json
 ├── requirements.txt
 ├── pytest.ini
@@ -138,6 +142,11 @@ uvicorn src.server.app:app --host 127.0.0.1 --port 8765
 **MVP-02 补充 · 预览取景**：顶部取景栏 + 四种取景方式 + 临时预览相机自动取景 + 基线失效保护（详见下文「预览取景（构图）」）。
 
 **MVP-02 修正 · 依赖枚举联动**：`视图变换` 与 `Look` 不再当独立参数 —— 切换视图变换会立即刷新 Look 候选、按规范化名称迁移旧值，后端在下发脚本前完成依赖校验（详见下文「依赖枚举（视图变换 → Look）」）。
+
+**MVP-03 第一批 · Windows CI + 本地预设存储后端**：建立自动闸门，并让预设落到用户目录
+（`%LOCALAPPDATA%\CartoonModelShader\presets`，**不进仓库**）—— 保存/读取/重命名/复制/删除全部可用，
+写入前扫描并**拒绝**任何本机路径、模型/贴图路径与凭据。
+**本批次不含**：预设的界面入口、A/B 对比、质量档位的实际应用、会话恢复（见「本地预设（存储后端）」）。
 
 **本阶段只输出临时预览 PNG**：不保存工程、不覆盖 `.blend`、不做正式渲染、不导入模型。
 
@@ -216,6 +225,60 @@ uvicorn src.server.app:app --host 127.0.0.1 --port 8765
 6. **记录三类值** —— 任务结果里每个参数都记 `configured_value`（你配置的）/ `effective_value`（真正写进 Blender 的）/
    `display_label`（界面显示标签），旧预设里的老名字加载时自动迁移。
 
+### 本地预设（存储后端）
+
+预设是**用户的资产**，所以落在文件系统而不是浏览器 `localStorage`（清缓存即丢、无法备份分享）：
+
+```
+%LOCALAPPDATA%\CartoonModelShader\presets\
+```
+
+可用环境变量 `TOON_TUNER_PRESET_DIR` 整体覆盖。**默认路径绝不在仓库内**（有测试钉住这一点）。
+
+一份预设长这样：
+
+```json
+{
+  "schema": "toon-tuner-preset/1",
+  "preset_id": "15f92ca1b396",
+  "name": "柔和辉光",
+  "created_at": "2026-10-09T10:58:47+08:00",
+  "updated_at": "2026-10-09T10:58:47+08:00",
+  "pipeline_mode": "enhanced",
+  "framing_mode": "auto_full_body",
+  "framing_margin": 0.15,
+  "preview_quality": "standard",
+  "parameters": {
+    "color.exposure": { "configured_value": 0.2, "effective_value": 0.2, "active": true }
+  }
+}
+```
+
+几个关键点：
+
+1. **身份与文件名分开**。文件名由 `name` 净化而来（方便直接浏览/备份目录，中文原样保留）；
+   稳定身份是文件内的 `preset_id`。重命名只改名字与文件名，**身份不变**，引用不会失效。
+2. **禁止保存**：`.blend` 绝对路径、用户目录、模型名或贴图路径、MCP Token（及任何凭据）、
+   临时预览路径。命中即**拒绝写入**，不做静默清洗 —— 清洗会让你以为存下了、其实被改过。
+3. **旧 schema 明确报错**。只接受 `toon-tuner-preset/1`；其它版本抛 `PRESET_SCHEMA_UNSUPPORTED`，
+   **不自动迁移、不猜版本** —— 猜错就是静默改变取值。
+4. **枚举参数不做本机绑定**。浮点参数按 `ParamSpec` 的上下限校验；枚举只做结构性校验 ——
+   预设要能跨 Blender 版本使用，真正的合法性留给提交预览时对着**当时的**能力表判定。
+5. **目录里的坏文件要说出来**。读不动/版本不对/`preset_id` 重复的文件会进列表响应的 `skipped`
+   并附错误码与原因，不会被静默丢掉。
+6. **接口不回本机路径**。`storage` 只在目录等于默认位置时给 `%LOCALAPPDATA%\...` 写法，
+   其余一律回 `<自定义预设目录>`；连相对部分都不给 —— 那部分可能嵌套用户名。
+7. **预设接口完全不依赖 Blender**（有一条测试把配置指向必然连不上的端口，增删改查照常工作）。
+
+`materialize_draft()`（预设 → 可直接提交的草稿）已实现并测试：只取 `active=true` 的参数、
+优先用 `effective_value`、并复用依赖枚举那套规则规范化 `look`。判得了视图就**严格校验**
+（非法则抛 `INVALID_DEPENDENT_ENUM`），判不了就带出原值并明确说明「延后到提交预览时校验」。
+
+`preview_quality` 的三个档位已能保存与校验（快速 360×660/4、标准 540×990/8、高质量 1080×1980/16），
+但**实际应用到渲染**属于下一批 —— 届时按工程纵横比等比缩放到档位长边，不强行套用名义宽高。
+
+> 本批次只做了后端存储与接口，**界面上还没有预设入口**。
+
 ### 配置
 
 复制 `config.example.json` 为 `config.local.json`（已被 `.gitignore` 排除）按需覆盖 host / port / 超时。
@@ -229,6 +292,10 @@ uvicorn src.server.app:app --host 127.0.0.1 --port 8765
 ```powershell
 pytest
 ```
+
+CI（`.github/workflows/test.yml`）在 **windows-latest** 上用 **Python 3.11 / 3.12** 各跑一遍：
+装 `requirements.txt` → `python -m pytest`。**不依赖真实 Blender**、**不上传任何产物**
+（模型、预览图、日志都不留）。真实 Blender / 真实浏览器验收仍是**人工步骤**，不进 Runner。
 
 测试使用内置假 MCP 服务与**假 `bpy` 桩**，不需要安装 Blender：
 
@@ -245,6 +312,16 @@ pytest
   归一化的四种等价匹配与回退、写入阶段顺序、写 look 失败时 `view_transform` 被回滚、
   非法组合抛 `INVALID_DEPENDENT_ENUM`（且不产生任务、不碰 Blender）、切换视图后完整草稿可预览、
   恢复基线逐项一致、旧预设名称迁移、前端 value/label 与代次守卫契约。
+- 预设相关（`tests/test_presets.py`）：`%LOCALAPPDATA%` 解析与环境变量覆盖、默认目录不在仓库内、
+  文件名净化（保留中文 / 去保留字符 / 设备名 / 长度上限 / 净化不改 `name`）、
+  schema 缺省与 null 按当前版本、**旧 schema 报错不迁移**、顶层与参数条目未知字段拒绝、
+  浮点上下限与 `bool` 拒绝、枚举不被本机枚举绑定、
+  敏感内容（盘符/UNC/用户目录/AppData/%TEMP%/预览目录/贴图与模型路径/凭据名与凭据值）一律拒绝且不落盘、
+  CRUD 全流程、**覆盖保存保留身份与创建时间**、伪造 `preset_id` 无效、重命名身份不变且文件同步改名、
+  **复制的到新身份**（回归：曾回退成源身份）、净化后同名文件不互相覆盖、原子写入不留临时文件、
+  坏文件/旧 schema/重复身份进 `skipped`、列表响应不含本机绝对路径、
+  加载成草稿（只取 active / 优先 effective / 严格拒绝非法 look / 判不了时明确延后）、
+  预设接口在 Blender 连不上时依然可用。
 - 取景相关（`tests/test_framing.py`）：当前相机模式不改动相机与当前帧、三种自动取景均完整入画、
   安全边距生效、模型离世界原点仍正确、排除刚体代理与描边壳、预览后恢复原 `scene.camera`、
   **渲染抛错也恢复且无临时相机残留**、切帧/换相机/移动相机/改焦距/改 shift 判为失效、
@@ -287,16 +364,27 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 | POST | `/api/preview` | 入参 `{"draft": {"参数id": 取值}, "framing": {"mode": ..., "margin": ...}}`，返回 `job_id`；**不接受任何代码** |
 | GET | `/api/jobs/{job_id}` | 任务状态查询（替代固定 `sleep`） |
 | GET | `/api/preview/{job_id}` | 取回该任务的预览 PNG（浏览器唯一的取图入口） |
+| GET | `/api/presets` | 本地预设列表 + 运行设置白名单（`quality_tiers` / `pipeline_modes` / `framing_modes` / `defaults`）；读不动的文件进 `skipped` |
+| GET | `/api/presets/{id}` | 读取单个预设（含逐参数 `configured_value` / `effective_value` / `active`） |
+| POST | `/api/presets` | 新建预设；`parameters` 可给三元组，也可只给裸取值 |
+| PUT | `/api/presets/{id}` | 覆盖保存（`preset_id` 与 `created_at` 由服务端保留，客户端改不动） |
+| POST | `/api/presets/{id}/rename` | 重命名（**身份不变**） |
+| POST | `/api/presets/{id}/duplicate` | 复制为新预设（**新身份**，默认名字加「副本」） |
+| DELETE | `/api/presets/{id}` | 删除预设 |
 
 `status` 取值：`connected` / `disconnected` / `timeout` / `protocol_error` / `blender_error`。
 任务 `status` 取值：`queued` / `running` / `done` / `failed` / `superseded`。
 新任务提交时，排队中与运行中的旧任务会立即进入 `superseded` 终态并丢弃结果。
 
-常用错误码：`PARAM_INVALID`（参数越界/未知字段）、`MISSING_BASELINE`（未建基线）、
+常用错误码：`PARAM_INVALID`（参数越界/未知字段）、`NO_BASELINE`（未建基线）、
 `FRAMING_STALE`（409，基线建立后帧或相机被外部改动，retryable —— 刷新基线即可恢复）、
 `FRAMING_UNAVAILABLE`（409，拿不到当前取景上下文）、
 `INVALID_DEPENDENT_ENUM`（400，依赖枚举取值非法，例如 Standard 下提交 `AgX - Punchy`；返回体里带
 `parameter` / `value` / `depends_on` / `allowed`，`retryable=false`）。
+
+预设相关错误码：`PRESET_NOT_FOUND`（404）、`PRESET_INVALID`（400，未知参数/越界取值/含禁止保存的内容）、
+`PRESET_SCHEMA_UNSUPPORTED`（400，schema 版本不支持，**不自动迁移**）、
+`PRESET_NAME_CONFLICT`（409，同名预设，名称不区分大小写）、`PRESET_STORAGE_ERROR`（500，目录读写失败）。
 
 ### Blender 5.x 适配记录
 
@@ -328,6 +416,11 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 | 切换视图变换后 Look 下拉框变了 | 这是有意的：Look 的合法档位由视图变换决定。旧档位有等价项会按名称迁移并给出说明，没有等价项则回退 `None` |
 | 预览报 `INVALID_DEPENDENT_ENUM` | 该 Look 在当前「视图变换」下不合法。提示里会列出可选档位；换一个档位，或先把视图变换调回去 |
 | 旧预设里的 Look 名字不认了 | 预设里的显示名会在加载时按当前视图迁移成真实 identifier；若确实没有等价档位会回退 `None` 并给出告警 |
+| 预设保存在哪 | `%LOCALAPPDATA%\CartoonModelShader\presets`（不在仓库里）。用 `TOON_TUNER_PRESET_DIR` 可改位置 |
+| 提示预设「schema 版本不支持」 | 这不是本工具写的预设，或来自更早/更新的版本。**不会自动迁移**（迁移错了就是静默改取值），请用对应版本打开后另存 |
+| 提示预设含「禁止保存的内容」 | 预设里带了本机路径、模型/贴图路径或凭据。这是有意拒绝的：清洗会让你以为存下了、其实被改过 |
+| 提示预设重名 | 名称不区分大小写、忽略首尾空格。换一个名字，或先重命名原有预设 |
+| 预设列表里出现「已跳过」的文件 | 该文件读不动、版本不对或 `preset_id` 重复。列表里会附错误码与原因，修好或删掉即可 |
 | 页面打不开 | 确认 uvicorn 已在 8765 运行 |
 
 ## 开发状态
@@ -338,6 +431,8 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 - [x] **MVP-02：L0 曝光/辉光调参与无污染预览** —— 内存基线 → 整份草稿应用 → 单次预览渲染 → `job_id` 状态查询 → 回滚基线并校验（只出临时 PNG，不保存工程）
 - [x] **MVP-02 补充：预览取景** —— 顶部取景诊断栏（帧/相机/动画/是否入画）→ 四种取景方式 → 临时预览相机自动取景（`finally` 必定恢复原相机）→ 基线失效保护（切帧/动相机即停止自动预览）
 - [x] **MVP-02 修正：依赖枚举联动** —— 按 `view_transform` 探测 Look 合法集合 → value/label 分离 → 切换视图即刷新候选并迁移旧值 → 下发前依赖校验（`INVALID_DEPENDENT_ENUM`）→ 写入顺序固定 + 原子回滚
+- [x] **MVP-03 第一批：Windows CI + 本地预设存储后端** —— `windows-latest` × Python 3.11/3.12 自动闸门；预设落到 `%LOCALAPPDATA%\CartoonModelShader\presets`（不进仓库），保存/读取/重命名/复制/删除 + schema 与敏感内容校验 + 加载成草稿
+- [ ] **MVP-03 其余批次**：预设界面入口、A/B 对比、预览质量档位的实际应用、会话恢复
 - [ ] 保存预设 / 应用到工程（**须在「恢复基线」通过重复测试后才开始**）
 - [ ] Cel 色阶编辑器（7 组，L1）
 - [ ] 严格材质匹配与手工归类（L2）
