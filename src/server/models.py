@@ -348,3 +348,64 @@ class PresetDetailResponse(BaseModel):
 class PresetDeleteResponse(BaseModel):
     ok: Literal[True] = True
     deleted: PresetSummary
+
+
+# -- 应用到工程（commit）----------------------------------------------------
+
+
+class CommitPrepareRequest(BaseModel):
+    """准备保存：只校验，不写盘。默认「另存为」。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["save_as", "overwrite"] = "save_as"
+    draft: dict[str, Any] = Field(default_factory=dict)
+    target_path: str | None = Field(
+        default=None,
+        description="仅 save_as 使用：绝对路径且以 .blend 结尾；overwrite 由 Blender 当前工程决定",
+    )
+    confirm: bool = Field(
+        default=False, description="覆盖已有文件必须为 True（先看清绝对路径与备份路径再确认）"
+    )
+
+
+class CommitPrepareResponse(BaseModel):
+    ok: Literal[True] = True
+    token: str = Field(description="一次性短效确认令牌，绑定基线/草稿/模式/目标路径")
+    mode: str
+    target_path: str
+    backup_path: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+    baseline_id: str
+    draft_hash: str
+    parameter_count: int = 0
+    normalized: list[dict[str, Any]] = Field(default_factory=list)
+    expires_at: str
+    expires_in_seconds: int
+    confirmation_required: bool = False
+
+
+class CommitRequest(BaseModel):
+    """执行保存：消费令牌，逐项比对绑定。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str
+    mode: Literal["save_as", "overwrite"] = "save_as"
+    draft: dict[str, Any] = Field(default_factory=dict)
+    target_path: str | None = None
+
+
+class CommitResponse(BaseModel):
+    ok: Literal[True] = True
+    mode: str
+    target_path: str
+    backup_path: str | None = None
+    saved: bool
+    status: dict[str, Any] = Field(default_factory=dict)
+    steps: list[str] = Field(default_factory=list)
+    normalized: list[dict[str, Any]] = Field(default_factory=list)
+    baseline_id: str | None = None
+    baseline_refreshed: bool = False
+    saved_at: str
+    warnings: list[str] = Field(default_factory=list)

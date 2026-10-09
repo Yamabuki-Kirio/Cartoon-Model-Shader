@@ -4,6 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Cartoon-Model-Shader · 卡通渲染调参</title>
+  <!-- 会话令牌占位：令牌由服务端在响应 GET / 时注入。
+       静态文件里永远不含令牌，页面脚本只管读取 window.__TOON_TUNER_TOKEN__。 -->
+  <!--TOON_TUNER_TOKEN-->
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -184,13 +187,105 @@
         </div>
       </div>
     </section>
+
+    <section class="card hidden" id="preset-card">
+      <h2>保存预设</h2>
+      <p class="muted">
+        把当前整份草稿（L0 全部 10 项）存成本地预设。名称支持中文，只作为显示名与去重键，
+        <strong>不参与文件路径</strong>：落盘文件名由服务端生成，接口不接受任何路径参数。
+        与预览、保存走同一套校验，越界取值或非法的「Look / 视图变换」组合会被直接拒绝。
+      </p>
+      <div class="save-row">
+        <label for="preset-name">预设名称</label>
+        <input type="text" id="preset-name" maxlength="64" placeholder="例如：夜战·高对比" />
+        <button type="button" id="preset-save-btn" class="primary">保存预设</button>
+        <button type="button" id="preset-refresh-btn">刷新列表</button>
+      </div>
+      <p class="save-status" id="preset-status">—</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>更新时间</th>
+              <th class="num">参数数</th>
+              <th>Blender</th>
+            </tr>
+          </thead>
+          <tbody id="preset-body"></tbody>
+        </table>
+      </div>
+      <p class="muted hidden" id="preset-empty">还没有任何预设。</p>
+    </section>
+
+    <section class="card hidden" id="commit-card">
+      <h2>应用到工程</h2>
+      <p class="muted">
+        顺序固定：<strong>应用完整草稿 → 回读逐项校验 → 备份 → 保存</strong>。
+        回读不一致、备份失败或 Blender 保存失败，都<strong>不会写盘</strong>，草稿保留在界面上。
+      </p>
+      <div class="commit-mode">
+        <label class="radio">
+          <input type="radio" name="commit-mode" id="commit-mode-save-as" value="save_as" checked />
+          另存为（默认）
+        </label>
+        <label class="radio">
+          <input type="radio" name="commit-mode" id="commit-mode-overwrite" value="overwrite" />
+          覆盖当前工程
+        </label>
+      </div>
+
+      <div class="save-row" id="commit-target-row">
+        <label for="commit-target">目标文件（绝对路径，须以 .blend 结尾）</label>
+        <input type="text" id="commit-target" placeholder="例如 &lt;盘符&gt;:\工程目录\模型_导出.blend" />
+      </div>
+
+      <div class="commit-paths hidden" id="commit-paths">
+        <dl class="kv-grid">
+          <dt>目标绝对路径</dt>
+          <dd class="mono" id="commit-abs-target">—</dd>
+          <dt>预计备份路径</dt>
+          <dd class="mono" id="commit-abs-backup">—</dd>
+        </dl>
+        <div class="commit-warning" id="commit-warning-box" role="alert">
+          <strong>覆盖会破坏原文件：请先核对上面的绝对路径。</strong>
+          <span id="commit-warning-text"></span>
+        </div>
+        <label class="confirm-row">
+          <input type="checkbox" id="commit-confirm" />
+          我已核对绝对路径与备份位置，确认覆盖
+        </label>
+      </div>
+
+      <div class="actions">
+        <button type="button" id="commit-apply-btn" class="primary">应用到工程</button>
+      </div>
+      <p class="save-status" id="commit-status">—</p>
+      <dl class="kv-grid commit-status-grid">
+        <dt>应用</dt>
+        <dd id="commit-applied">—</dd>
+        <dt>回读校验</dt>
+        <dd id="commit-readback">—</dd>
+        <dt>备份</dt>
+        <dd id="commit-backup">—</dd>
+        <dt>保存</dt>
+        <dd id="commit-saved">—</dd>
+        <dt>失败后回滚</dt>
+        <dd id="commit-rollback">—</dd>
+      </dl>
+      <details>
+        <summary>技术细节（排错用，令牌已隐去）</summary>
+        <pre class="raw" id="commit-raw"></pre>
+      </details>
+    </section>
   </main>
 
   <footer class="page-footer">
     <span>
-      本阶段只输出临时预览 PNG：不保存工程、不覆盖文件、不导入模型、不提供任意 Python 执行接口。
-      预览会临时修改曝光/辉光参数，渲染后自动回滚到基线。自动取景只新建临时预览相机，
-      不改动你的相机与动画，渲染后（含失败）必定恢复原相机。
+      预览只产出临时 PNG，不改动工程文件；只有点「应用到工程」才会写盘，且默认是<strong>另存为</strong>。
+      覆盖已有文件前必须二次确认，并在同目录先生成带时间戳的备份；回读校验不通过就绝不保存。
+      自动取景只新建临时预览相机，不改动你的相机与动画，渲染后（含失败）必定恢复原相机。
+      不导入模型，也不提供任何任意 Python 执行接口。
     </span>
   </footer>
 

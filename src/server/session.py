@@ -2,6 +2,11 @@
 
 核心不变量（需求文档）
 ----------------------
+* 供预设 / 提交(commit) 复用的三个公开入口：``validate_draft``（白名单 + 范围 +
+  **依赖枚举**校验）、``normalize_values``（按能力表把取值规范成可写入形式）、
+  ``verify_values``（回读逐项比对）。三者与预览走**完全相同**的判定逻辑，
+  避免「预览能过、保存却写坏工程」这种两条实现漂移出来的缺口。
+
 * 每次预览都 **先恢复内存基线 → 再一次性应用完整草稿**，绝不在上一次结果上叠加。
 * 旧任务自动作废：新任务提交时，排队中与运行中的旧任务立即标记为 ``superseded``，
   其结果被丢弃。
@@ -361,9 +366,9 @@ class PreviewService:
             self._baseline = baseline
         # 恢复基线也要走**同一套映射逻辑**，不能盲目回写旧字符串：
         # 若 OCIO 配置或视图变换已变，旧 look 可能不再合法。
-        values, notes = _normalize_values(baseline.values, baseline.look_map)
+        values, notes = normalize_values(baseline.values, baseline.look_map)
         readback = await self._call(self._binder.apply_values, values)
-        verified, mismatches = _verify(baseline.values, readback)
+        verified, mismatches = verify_values(baseline.values, readback)
         return {
             "ok": True,
             "baseline_id": baseline.baseline_id,
@@ -409,8 +414,8 @@ class PreviewService:
             baseline = self._baseline
             if baseline is None:  # pragma: no cover - 与上面同锁，仅防御
                 raise errors.ToonTunerError(errors.NO_BASELINE, "尚未建立内存基线，无法预览。")
-            coerced = _validate_draft(draft, baseline)
-            effective, notes = _normalize_values(
+            coerced = validate_draft(draft, baseline)
+            effective, notes = normalize_values(
                 {**baseline.values, **coerced}, baseline.look_map
             )
 
@@ -490,7 +495,7 @@ class PreviewService:
 
             job.steps.append("恢复基线")
             # 恢复也走同一套依赖映射（不能盲目回写旧字符串）
-            restore_values, _ = _normalize_values(dict(baseline.values), baseline.look_map)
+            restore_values, _ = normalize_values(dict(baseline.values), baseline.look_map)
             await self._call(self._binder.apply_values, restore_values)
             if self._is_superseded(job):
                 return self._finish(job, JOB_SUPERSEDED, note="恢复基线后被取代")
@@ -516,9 +521,9 @@ class PreviewService:
                 return self._finish(job, JOB_SUPERSEDED, note="渲染完成后被取代")
 
             job.steps.append("恢复基线并校验")
-            final_values, _ = _normalize_values(dict(baseline.values), baseline.look_map)
+            final_values, _ = normalize_values(dict(baseline.values), baseline.look_map)
             readback = await self._call(self._binder.apply_values, final_values)
-            verified, mismatches = _verify(baseline.values, readback)
+            verified, mismatches = verify_values(baseline.values, readback)
 
             result = {
                 "preview_url": preview_url_for(job.job_id),
@@ -557,8 +562,16 @@ class PreviewService:
         async with self._blender_lock:
             return await asyncio.to_thread(fn, *args)
 
+    async def call_binder(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """让「应用到工程」等其它服务复用**同一把 Blender 串行锁**。
 
-def _validate_draft(draft: Any, baseline: Baseline) -> dict[str, Any]:
+        保存流程必须与预览排队在同一条串行通道上：否则一次保存可以和一次预览
+        同时写场景，回读校验会读到对方刚写进去的值。
+        """
+        return await self._call(fn, *args)
+
+
+def validate_draft(draft: Any, baseline: Baseline) -> dict[str, Any]:
     if not isinstance(draft, dict):
         raise errors.ToonTunerError(errors.PARAM_INVALID, "draft 必须是对象。")
 
@@ -635,7 +648,7 @@ def _coerce_enum(spec: params.ParamSpec, raw: Any, baseline: Baseline) -> str:
     return raw
 
 
-def _normalize_values(
+def normalize_values(
     values: dict[str, Any], look_map: dict[str, list[dict[str, str]]] | None
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """按依赖映射把一组取值规范成「可直接写入 Blender」的形式（需求 8）。
@@ -713,7 +726,7 @@ def _parameter_records(baseline: Baseline, job: Job, readback: dict[str, Any]) -
     return records
 
 
-def _verify(expected: dict[str, Any], readback: dict[str, Any]) -> tuple[bool, list[dict[str, Any]]]:
+def verify_values(expected: dict[str, Any], readback: dict[str, Any]) -> tuple[bool, list[dict[str, Any]]]:
     actual = values_from_read(readback)
     mismatches: list[dict[str, Any]] = []
     for param_id, want in expected.items():

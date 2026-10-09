@@ -39,6 +39,7 @@ from tests.fake_bpy import (
     run_generated_code,
 )
 from tests.fake_mcp_server import FakeMCPServer
+from tests.support import authed
 
 RENDER_MARKER = JSON_MARKER
 
@@ -92,6 +93,25 @@ def make_app(server: FakeMCPServer) -> TestClient:
     return create_app(config)
 
 
+def test_write_endpoints_reject_missing_token_in_framing_suite() -> None:
+    """取景侧的写接口同样受会话令牌保护（缺令牌 401，且不产生任何任务）。"""
+    from tests.support import unauthed
+
+    fake = FakeBpy()
+    with FakeMCPServer(executor=lambda code: run_generated_code(code, fake)) as server:
+        app = make_app(server)
+        client = unauthed(app)
+        for path, payload in (
+            ("/api/session/baseline", {"framing": {"mode": "current_camera"}}),
+            ("/api/preview", {"draft": {"color.exposure": 1.0}}),
+            ("/api/session/restore", None),
+            ("/api/color/looks/refresh", None),
+        ):
+            response = client.post(path, json=payload) if payload is not None else client.post(path)
+            assert response.status_code == 401, path
+            assert response.json()["error"]["code"] == "SESSION_TOKEN_INVALID"
+
+
 def wait_job(client: TestClient, job_id: str, timeout: float = 10.0) -> dict:
     deadline = time.monotonic() + timeout
     body: dict = {}
@@ -114,7 +134,7 @@ def project_fake() -> FakeBpy:
 @pytest.fixture()
 def tuner_client(project_fake: FakeBpy):
     with FakeMCPServer(executor=lambda code: run_generated_code(code, project_fake)) as server:
-        with TestClient(make_app(server)) as client:
+        with authed(make_app(server)) as client:
             yield client, project_fake
 
 

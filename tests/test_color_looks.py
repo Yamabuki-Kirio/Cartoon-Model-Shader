@@ -36,6 +36,7 @@ from tests.fake_bpy import (
     run_generated_code,
 )
 from tests.fake_mcp_server import FakeMCPServer
+from tests.support import authed
 
 LOOK_MARKER = color_looks.LOOK_MARKER
 
@@ -589,7 +590,7 @@ def test_session_restore_normalizes_look_when_no_longer_valid() -> None:
     fake = FakeBpy()
     look_map = {"AgX": [{"value": "None", "label": "None"}]}
     values = {"color.view_transform": "AgX", "color.look": "AgX - High Contrast"}
-    normalized, notes = session._normalize_values(values, look_map)  # noqa: SLF001
+    normalized, notes = session.normalize_values(values, look_map)
     assert normalized["color.look"] == "None"
     assert notes and notes[0]["warning"]
 
@@ -602,7 +603,7 @@ def test_session_restore_normalizes_look_when_no_longer_valid() -> None:
 def test_api_color_looks_endpoint() -> None:
     fake = FakeBpy()
     with FakeMCPServer(executor=lambda code: run_generated_code(code, fake)) as server:
-        with TestClient(make_app(server)) as client:
+        with authed(make_app(server)) as client:
             body = client.get("/api/color/looks").json()
             assert body["ok"] is True
             assert body["look_map"] == {}  # 还没建基线
@@ -633,7 +634,7 @@ def test_api_color_looks_endpoint() -> None:
 def test_api_rejects_invalid_dependent_enum() -> None:
     fake = FakeBpy()
     with FakeMCPServer(executor=lambda code: run_generated_code(code, fake)) as server:
-        with TestClient(make_app(server)) as client:
+        with authed(make_app(server)) as client:
             client.post("/api/session/baseline", json={})
             response = client.post(
                 "/api/preview",
@@ -661,7 +662,7 @@ def test_api_accepts_legacy_look_label_and_records_migration() -> None:
     在只提供通用档位的 Blender 上会被规范化为 High Contrast。"""
     fake = FakeBpy(capability=LEGACY_LOOK_CAPABILITY)
     with FakeMCPServer(executor=lambda code: run_generated_code(code, fake)) as server:
-        with TestClient(make_app(server)) as client:
+        with authed(make_app(server)) as client:
             client.post("/api/session/baseline", json={})
             response = client.post(
                 "/api/preview", json={"draft": {"color.look": "AgX - High Contrast"}}
@@ -678,7 +679,7 @@ def test_api_accepts_legacy_look_label_and_records_migration() -> None:
 def test_api_job_result_records_configured_effective_and_label() -> None:
     fake = FakeBpy()
     with FakeMCPServer(executor=lambda code: run_generated_code(code, fake)) as server:
-        with TestClient(make_app(server)) as client:
+        with authed(make_app(server)) as client:
             client.post("/api/session/baseline", json={})
             response = client.post(
                 "/api/preview",
