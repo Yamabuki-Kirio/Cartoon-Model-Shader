@@ -63,6 +63,7 @@ from . import (
     presets as presets_module,
     scene_probe,
     security,
+    surface_probe,
 )
 from .binder import BlenderBinder, preview_dir, preview_png_name
 from .blender_mcp import BlenderMCPClient
@@ -552,6 +553,23 @@ def create_app(
             draft=body.draft,
             target_path=body.target_path,
         )
+
+    # -- 诊断（只读，不需要令牌）------------------------------------------
+    @app.get("/api/diagnostics/describe", tags=["diagnostics"])
+    async def diagnostics_describe() -> dict[str, Any]:
+        """只读拓扑描述：受管节点组、ColorRamp 结构、对象/材质/贴图清单。
+
+        用途：Cel 色带的真实节点与插座名无法凭空确定，也不能靠猜。先在真机跑这个接口，
+        拿到拓扑后 schema 生成器**以探测结果为准**生成可编辑节点；探不到的组一律降级为
+        ``supported: false`` 的只读节点。
+
+        **脱敏**：不返回工程路径、贴图路径、令牌或用户目录；键名像路径的字段整体丢弃。
+        只读接口，因此按既有规则不校验会话令牌。
+        """
+        payload = await preview.call_binder(binder.describe_surface)
+        return {"ok": True, **surface_probe.describe_groups(
+            surface_probe.redact_describe(payload)
+        )}
 
     # -- 静态页面 ---------------------------------------------------------
     index_file = WEB_DIR / "index.html"

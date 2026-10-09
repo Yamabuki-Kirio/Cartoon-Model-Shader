@@ -22,6 +22,7 @@ import math
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 # 一个最小合法 PNG（1x1 透明），用于校验「确实落盘了图片」
@@ -125,14 +126,49 @@ class FakeInputs:
         return socket
 
 
+class FakeColorRampElement:
+    def __init__(self, position: float, color: tuple[float, float, float, float]) -> None:
+        self.position = float(position)
+        self.color = tuple(float(v) for v in color)
+
+
+class FakeColorRamp:
+    """ColorRamp：``elements`` / ``interpolation``，行为贴近 bpy。
+
+    元素数量是**结构**信息（技术方案 §1 决策 3）：探针必须能读到它，
+    而写入路径永远走整体替换。
+    """
+
+    def __init__(
+        self,
+        elements: list[tuple[float, tuple[float, float, float, float]]] | None = None,
+        interpolation: str = "LINEAR",
+    ) -> None:
+        if elements is None:
+            elements = [
+                (0.0, (0.05, 0.05, 0.08, 1.0)),
+                (0.5, (0.5, 0.48, 0.46, 1.0)),
+                (1.0, (0.95, 0.94, 0.92, 1.0)),
+            ]
+        self.elements = [FakeColorRampElement(pos, col) for pos, col in elements]
+        self.interpolation = interpolation
+
+
 class FakeNode:
-    def __init__(self, name: str, node_type: str, inputs: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        node_type: str,
+        inputs: dict[str, Any] | None = None,
+        color_ramp: FakeColorRamp | None = None,
+    ) -> None:
         self.name = name
         self.label = name
         self.type = node_type
         self.bl_idname = "CompositorNode" + node_type.title()
         self.mute = False
         self.inputs = FakeInputs(inputs or {})
+        self.color_ramp = color_ramp
 
 
 class _NodeMap:
@@ -706,9 +742,11 @@ class FakeDepsgraph:
 
 
 class FakeImage:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, *, size: tuple[int, int] = (0, 0), colorspace: str = "sRGB") -> None:
         self.name = name
         self.saved_to: list[str] = []
+        self.size = (int(size[0]), int(size[1]))
+        self.colorspace_settings = SimpleNamespace(name=colorspace)
 
     def save_render(self, filepath: str, scene: Any = None) -> None:
         path = Path(filepath)
@@ -724,6 +762,54 @@ class _ImageMap:
 
     def get(self, name: str) -> FakeImage | None:
         return self._by_name.get(name)
+
+    def add(self, image: FakeImage) -> FakeImage:
+        self._by_name[image.name] = image
+        return image
+
+    def __iter__(self) -> Iterator[FakeImage]:
+        return iter(list(self._by_name.values()))
+
+    def __len__(self) -> int:
+        return len(self._by_name)
+
+
+class FakeMaterial:
+    def __init__(
+        self,
+        name: str,
+        *,
+        blend_method: str = "OPAQUE",
+        use_nodes: bool = True,
+        base_color: tuple[float, float, float, float] = (0.8, 0.8, 0.8, 1.0),
+    ) -> None:
+        self.name = name
+        self.blend_method = blend_method
+        self.use_nodes = use_nodes
+        self.diffuse_color = base_color
+
+
+class _MaterialMap:
+    """``bpy.data.materials``：迭代 + get。"""
+
+    def __init__(self, items: list[FakeMaterial] | None = None) -> None:
+        self._items = list(items or [])
+
+    def add(self, material: FakeMaterial) -> FakeMaterial:
+        self._items.append(material)
+        return material
+
+    def get(self, name: str) -> FakeMaterial | None:
+        for item in self._items:
+            if item.name == name:
+                return item
+        return None
+
+    def __iter__(self) -> Iterator[FakeMaterial]:
+        return iter(list(self._items))
+
+    def __len__(self) -> int:
+        return len(self._items)
 
 
 class FakeOpsRender:
@@ -803,6 +889,7 @@ class _Data:
         self.is_dirty = False
         self.objects = FakeObjects(bpy)
         self.cameras = FakeCameras(bpy)
+        self.materials = _MaterialMap()
 
 
 class _App:
@@ -841,6 +928,8 @@ class FakeBpy:
         }
         #: 是否让 PyOpenColorIO 可用（关闭时只能退回 RNA，用于验证降级路径）
         self.ocio_available = True
+        #: Cel 组 → 材质数（只读影响面，供探针/Schema 使用）
+        self.cel_material_counts: dict[str, int] = {}
         self._scene = FakeScene(self, capability)
         self.context = _Context(self)
         self.app = _App()
@@ -869,6 +958,39 @@ class FakeBpy:
         self.data.filepath = str(target)
         self.data.is_dirty = bool(dirty)
         return target
+
+    # -- Cel 色阶节点组（v4 竖切用）--------------------------------------
+    def add_cel_group(
+        self,
+        name: str,
+        *,
+        element_count: int = 3,
+        interpolation: str = "LINEAR",
+        materials: int = 0,
+        emission_strength: float | None = None,
+    ) -> FakeNodeGroup:
+        """往 ``bpy.data.node_groups`` 里注册一个 Cel 组。
+
+        刻意包含一个带 ``color_ramp`` 的 ColorRamp 节点（真实管线以它承载色阶），
+        以及一个可选的 Emission 节点 —— 后者用来验证「探到才生成可编辑节点」。
+        """
+        elements = []
+        for index in range(max(2, int(element_count))):
+            ratio = index / max(1, (max(2, int(element_count)) - 1))
+            elements.append((round(ratio, 4), (round(ratio * 0.9, 4), 0.2, 1.0 - round(ratio * 0.5, 4), 1.0)))
+        ramp = FakeColorRamp(elements=elements, interpolation=interpolation)
+
+        nodes: list[FakeNode] = [
+            FakeNode("ColorRamp", "VALTORGB", color_ramp=ramp),
+        ]
+        if emission_strength is not None:
+            nodes.append(
+                FakeNode("Emission", "EMISSION", {"Strength": float(emission_strength)})
+            )
+        group = FakeNodeGroup(name, nodes)
+        self.node_groups[name] = group
+        self.cel_material_counts[name] = int(materials)
+        return group
 
     @property
     def view_settings(self) -> FakeViewSettings:
