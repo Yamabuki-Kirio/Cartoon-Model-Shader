@@ -34,7 +34,9 @@ export function makeTestEndpoints(overrides: Partial<WorkspaceEndpoints> = {}): 
       seq: 7,
       status: "queued",
     })),
-    job: vi.fn(async () => jobPayload() as unknown as JobState),
+    // 按请求的 job_id 回话：真实服务端就是这样，夹具里也必须自洽，
+    // 否则「按 job_id 判定这是不是基线任务」这类实现根本测不出来。
+    job: vi.fn(async (jobId: string) => jobPayload({ job_id: jobId }) as unknown as JobState),
     blenderStatus: vi.fn(async () => ({
       ok: true,
       status: "connected",
@@ -72,5 +74,17 @@ export function makeTestWorkspace(overrides: Partial<WorkspaceEndpoints> = {}) {
 export async function settle(times = 12): Promise<void> {
   for (let index = 0; index < times; index += 1) {
     await Promise.resolve();
+  }
+}
+
+/**
+ * 推进**定时器**级别的等待。
+ *
+ * `settle()` 只冲刷微任务；而任务轮询里的 `wait` 走的是 `setTimeout`，
+ * 多轮轮询（queued → running → done）必须让宏任务也跑起来才看得见中间态。
+ */
+export async function settleTimers(times = 8): Promise<void> {
+  for (let index = 0; index < times; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
   }
 }

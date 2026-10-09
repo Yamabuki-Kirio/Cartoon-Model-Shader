@@ -49,9 +49,13 @@ export function StatusBar({ workspace }: { workspace: Workspace }) {
         {state.dirtyIds.size} 项已改
         {state.previewStale ? <b class="warn"> · 画面已过期</b> : null}
       </span>
-      <span class="status-item" data-testid="status-job">
+      <span class="status-item" data-testid="status-job" data-active={state.activeJob ? "true" : "false"}>
         <em>任务</em>
-        {state.activeJob ? jobLabel(state.activeJob.status) : "空闲"}
+        {state.activeJob
+          ? jobLabel(state.activeJob.status)
+          : state.lastJob
+            ? `空闲（上次：${jobLabel(state.lastJob.status)}）`
+            : "空闲"}
       </span>
       <span class="status-item" data-testid="status-rollback">
         <em>回滚</em>

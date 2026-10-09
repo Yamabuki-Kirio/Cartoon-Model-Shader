@@ -43,7 +43,7 @@ import {
   setDraftValue,
   valuesEqual,
 } from "./draft";
-import { JobRunner, type JobSubmitPayload } from "./jobs";
+import { JobRunner, type JobOutcome, type JobSubmitPayload } from "./jobs";
 import { createStore, type Store } from "./store";
 
 export interface PreviewState {
@@ -59,18 +59,32 @@ export interface PreviewState {
   at: number;
 }
 
+/**
+ * 基线首张预览的可用状态。
+ *
+ * 基线本身在 `POST /api/session/baseline` 返回时就已建立，但**画面**要等它顺带创建的
+ * 预览任务跑完才有文件。两者必须分开表达，否则界面只能二选一：
+ * 要么在文件落盘前挂上一张 404 的图，要么谎称「基线还没有画面」。
+ */
+export type BaselinePreviewStatus = "none" | "pending" | "ready" | "failed";
+
 export interface WorkspaceState {
   schema: SurfaceSchema | null;
   baseline: SurfaceBaselinePublic | null;
   baselineId: string | null;
   baselineCapturedAt: string | null;
   baselinePreviewUrl: string | null;
+  /** 基线首张预览：任务跑完之前不允许展示图。 */
+  baselinePreviewStatus: BaselinePreviewStatus;
   draft: SurfaceDraft;
   effective: Record<string, unknown>;
   structureHash: string | null;
   externalChanges: ExternalChange[];
   dirtyIds: Set<string>;
+  /** **只在跑**的任务。终态任务由 `lastJob` 承载，绝不留在活跃位上。 */
   activeJob: JobState | null;
+  /** 最近一个**终态**任务的快照（成功 / 失败 / 被取代），用于显示「上次」与步骤轨迹。 */
+  lastJob: JobState | null;
   lastSuccessfulPreview: PreviewState | null;
   /** 画面基于的草稿比当前草稿旧（提交后又编辑过）。 */
   previewStale: boolean;
@@ -153,6 +167,13 @@ export function createWorkspace(options: WorkspaceOptions) {
   let previewedVersion = 0;
   /** 提交那一刻的草稿版本；用来判断「画面是否正好对应提交时的草稿」。 */
   let previewedVersionForSubmit = 0;
+  /**
+   * 正在跟踪的**基线首张预览**任务 id。
+   *
+   * 基线响应里就带着 `job_id`，但那时图片文件还不存在 —— 必须轮询到 `done`
+   * 才能把 URL 交给 `img`。这个变量就是「当前那一次」的凭据（每次只跟踪一个）。
+   */
+  let baselineJobId: string | null = null;
 
   const store: Store<WorkspaceState> = createStore<WorkspaceState>({
     schema: null,
@@ -160,12 +181,14 @@ export function createWorkspace(options: WorkspaceOptions) {
     baselineId: null,
     baselineCapturedAt: null,
     baselinePreviewUrl: null,
+    baselinePreviewStatus: "none",
     draft: emptyDraft(),
     effective: {},
     structureHash: null,
     externalChanges: [],
     dirtyIds: new Set<string>(),
     activeJob: null,
+    lastJob: null,
     lastSuccessfulPreview: null,
     previewStale: false,
     undoDepth: 0,
@@ -255,9 +278,15 @@ export function createWorkspace(options: WorkspaceOptions) {
       // 只有「画面正是当前草稿」时才承认它是已预览版本。
       previewedVersion = previewedVersionForSubmit;
     }
+    // 基线首张预览：**任务跑完**（文件已落盘）才允许展示基线图。
+    // 这里的判定与 `stale` 无关 —— 基线图是不是「当前草稿的画面」不影响它已经生成。
+    const isBaselineJob = baselineJobId !== null && job.job_id === baselineJobId;
+    if (isBaselineJob) {
+      baselineJobId = null;
+    }
     store.setState({
-      activeJob: job,
       lastSuccessfulPreview: preview,
+      ...(isBaselineJob ? { baselinePreviewStatus: "ready" as const, baselinePreviewUrl: rawUrl } : {}),
       // 新草稿产生时旧任务结果**不写进 effective**，并标记画面对应的草稿已过期。
       ...(stale ? {} : { effective: { ...store.getState().effective, ...applied } }),
       previewStale: draftVersion !== previewedVersion,
@@ -267,6 +296,54 @@ export function createWorkspace(options: WorkspaceOptions) {
       notice: stale
         ? "本次画面基于提交时的草稿；你在渲染期间又改过草稿，已标记为过期。"
         : null,
+    });
+  }
+
+  /**
+   * **统一终态清理**（与 `JobRunner.onTerminal` 配对）。
+   *
+   * `onSucceeded` / `onFailed` 负责「结果」，这里负责「不再活动」：
+   *
+   * * 终态任务一律离开 `activeJob` —— 否则界面会一直显示「渲染中」，
+   *   而 `activeJob` 也就失去了「活动」的含义；
+   * * 终态快照记进 `lastJob`，让状态栏还能说出「上次」是什么结果；
+   * * 基线首张预览若以失败 / 被取代收场，要**单独**改判（基线本身已经建立，
+   *   不成立的只是那张画面），否则界面会永远停在「正在生成基线预览…」。
+   */
+  function handleTerminal(job: JobState, outcome: JobOutcome): void {
+    const patch: Partial<WorkspaceState> = {
+      activeJob: null,
+      lastJob: job,
+      loading: false,
+    };
+    if (baselineJobId !== null && job.job_id === baselineJobId) {
+      baselineJobId = null;
+      if (outcome !== "succeeded") {
+        patch.baselinePreviewStatus = "failed";
+        patch.baselinePreviewUrl = null;
+        patch.notice = baselinePreviewFailedNotice(outcome);
+      }
+    }
+    store.setState(patch);
+  }
+
+  /**
+   * 提交新任务会**取代**在途的基线预览。这时它不可能再被我们跟踪到终态，
+   * 必须当场改判 —— 否则界面永远停在「正在生成基线预览…」。
+   *
+   * 之所以按「失败」而不是「继续等」处理：`AbortController` 只能取消**前端**的轮询，
+   * 服务端那个任务仍会跑完；我们既无法确认文件何时落盘，也无法确认它是否成功。
+   * 与其挂一张可能 404 的图，不如如实说「没确认生成」，让用户点一次「刷新基线」。
+   */
+  function abandonPendingBaselinePreview(): void {
+    if (store.getState().baselinePreviewStatus !== "pending") {
+      return;
+    }
+    baselineJobId = null;
+    store.setState({
+      baselinePreviewStatus: "failed",
+      baselinePreviewUrl: null,
+      notice: baselinePreviewFailedNotice("superseded"),
     });
   }
 
@@ -283,14 +360,22 @@ export function createWorkspace(options: WorkspaceOptions) {
         });
       },
       onSucceeded: (job, result) => handleSuccess(job, result),
-      onFailed: (job, error) => {
+      // 失败任务的 `job` 不必在这里写状态：紧接着的 `onTerminal` 会用同一份快照
+      // 记进 `lastJob`（并清掉 activeJob），写两次只会多一次渲染。
+      onFailed: (_job, error) => {
         // ⚠ **不动** lastSuccessfulPreview —— 失败画面不得替换最后一张成功预览。
         //
         // 但错误必须走**同一条**路由：服务端的预览任务同样会以
         // `STRUCTURE_CHANGED` / `IDENTITY_MISSING` 终结（结构在提交后被改、
         // 对象被重命名或删除）。若这里只写一句 error，草稿不会作废、
         // `historyBlocked` 仍为 false，用户还能接着提交 —— 结构失效保护等于没生效。
-        routeErrorDetail(jobErrorToDetail(error), { activeJob: job });
+        routeErrorDetail(jobErrorToDetail(error));
+      },
+      onTerminal: (job, outcome) => handleTerminal(job, outcome),
+      onCancelled: () => {
+        // 本地取消（新任务取代旧的 / 用户主动取消）同样是终态：活跃位必须清掉。
+        // 注意这里**不**碰 lastJob —— 被取消的任务没有一个可展示的终态快照。
+        store.setState({ activeJob: null });
       },
     },
   });
@@ -310,44 +395,79 @@ export function createWorkspace(options: WorkspaceOptions) {
     }
   }
 
+  function baselinePreviewFailedNotice(outcome: JobOutcome | "superseded"): string {
+    return outcome === "superseded"
+      ? "基线预览任务已被更新的任务取代，基线本身已建立；如需首张画面，请再点「刷新基线」。"
+      : "基线已建立，但首张预览未能生成；可点「刷新基线」重试。";
+  }
+
   async function refreshBaseline(choice?: FramingChoice): Promise<boolean> {
     const framing = choice ?? store.getState().framingChoice;
-    store.setState({ loading: true, error: null, notice: null, framingChoice: framing });
+    // 上一次的基线预览若还挂着，这次刷新同样会取代它 —— 先如实改判，别让它停在 pending。
+    baselineJobId = null;
+    store.setState({
+      loading: true,
+      error: null,
+      notice: null,
+      framingChoice: framing,
+      baselinePreviewStatus: "pending",
+      baselinePreviewUrl: null,
+    });
+    let created: Awaited<ReturnType<WorkspaceEndpoints["createBaseline"]>>;
     try {
-      const created = await endpoints.createBaseline({ framing });
-      runner.dispose();
-      history.clear();
-      syncHistoryDepths();
-      const schema = await loadSchema();
-      const surface = created.surface ?? null;
-      draftVersion = 0;
-      previewedVersion = 0;
-      previewedVersionForSubmit = 0;
-      store.setState({
-        baselineId: created.baseline_id ?? null,
-        baselineCapturedAt: created.captured_at ?? null,
-        baseline: surface,
-        baselinePreviewUrl: created.preview_url ?? null,
-        draft: emptyDraft(),
-        dirtyIds: new Set<string>(),
-        effective: {},
-        structureHash: surface?.structure_hash ?? null,
-        externalChanges: [],
-        previewStale: false,
-        historyBlocked: false,
-        activeJob: null,
-        loading: false,
-        notice:
-          surface && surface.available === false
-            ? "v4 拓扑探针未成功，Cel 参数暂不可用（L0 与保存流程不受影响）。"
-            : null,
-        activeGroupId: store.getState().activeGroupId ?? firstGroupId(schema),
-      });
-      return true;
+      created = await endpoints.createBaseline({ framing });
     } catch (error) {
-      store.setState({ error: toDetail(error), loading: false });
+      store.setState({
+        error: toDetail(error),
+        loading: false,
+        baselinePreviewStatus: "failed",
+      });
       return false;
     }
+
+    history.clear();
+    syncHistoryDepths();
+    const schema = await loadSchema();
+    const surface = created.surface ?? null;
+    draftVersion = 0;
+    previewedVersion = 0;
+    previewedVersionForSubmit = 0;
+    const previewUrlFromResponse =
+      typeof created.preview_url === "string" ? created.preview_url : null;
+    const jobId = typeof created.job_id === "string" && created.job_id ? created.job_id : null;
+    store.setState({
+      baselineId: created.baseline_id ?? null,
+      baselineCapturedAt: created.captured_at ?? null,
+      baseline: surface,
+      // 基线图**先不给 URL**：轮询到任务完成再给，否则 img 会指向一个还没落盘的文件。
+      baselinePreviewUrl: jobId ? null : previewUrlFromResponse,
+      baselinePreviewStatus: jobId ? "pending" : previewUrlFromResponse ? "ready" : "none",
+      draft: emptyDraft(),
+      dirtyIds: new Set<string>(),
+      effective: {},
+      structureHash: surface?.structure_hash ?? null,
+      externalChanges: [],
+      previewStale: false,
+      historyBlocked: false,
+      activeJob: null,
+      lastJob: null,
+      loading: jobId !== null,
+      notice:
+        surface && surface.available === false
+          ? "v4 拓扑探针未成功，Cel 参数暂不可用（L0 与保存流程不受影响）。"
+          : null,
+      activeGroupId: store.getState().activeGroupId ?? firstGroupId(schema),
+    });
+
+    if (!jobId) {
+      return true;
+    }
+
+    // 轮询基线任务：完成（成功）后才展示基线图；失败 / 被取代由终态清理改判。
+    // 返回 `false` 只代表该预览没成 —— **基线本身已经建立**，所以这里仍返回 `true`。
+    baselineJobId = jobId;
+    await runner.adopt(jobId);
+    return true;
   }
 
   async function readBaseline(): Promise<void> {
@@ -360,10 +480,10 @@ export function createWorkspace(options: WorkspaceOptions) {
         baselineId: baseline.baseline_id ?? null,
         baselineCapturedAt: baseline.captured_at ?? null,
         // 只读基线的响应里没有 preview_url（那是建立基线时才知道的 job）。
-        // 所以这里只在服务端真的给了它时才填，否则「基线图」按钮保持禁用 ——
-        // 宁可少一个按钮，也不要指向一张不存在的图。
+        // 所以这里只在服务端真的给了它时才填，否则「基线图」保持不可用 ——
+        // 宁可少一张图，也不要指向一个不存在的文件。
         ...(typeof baseline.preview_url === "string"
-          ? { baselinePreviewUrl: baseline.preview_url }
+          ? { baselinePreviewUrl: baseline.preview_url, baselinePreviewStatus: "ready" as const }
           : {}),
         structureHash: baseline.structure_hash ?? null,
         loading: false,
@@ -640,6 +760,8 @@ export function createWorkspace(options: WorkspaceOptions) {
       const draft = sanitizeDraft(state.schema, state.draft);
       previewedVersionForSubmit = draftVersion;
       store.setState({ loading: true, error: null, notice: null, framingChoice: framing });
+      // 新任务会取代在途的基线预览 —— 那次基线图不可能再被我们跟踪到，如实改判。
+      abandonPendingBaselinePreview();
       const payload: JobSubmitPayload = {
         draft,
         framing,
@@ -659,12 +781,19 @@ export function createWorkspace(options: WorkspaceOptions) {
 
     /** 结构失效：草稿作废、命令栈清空、预览禁用，但**保留**最后一张成功预览。 */
     applyStructureFatal(detail: ErrorDetail, patch: Partial<WorkspaceState> = {}): void {
+      // 在途的基线预览同样被掐断（`dispose` 不会再走到终态清理），必须当场改判，
+      // 否则基线图会永远停在「正在生成…」。
+      const pendingBaseline = store.getState().baselinePreviewStatus === "pending";
+      baselineJobId = null;
       runner.dispose();
       history.clear();
       syncHistoryDepths();
       draftVersion += 1;
       store.setState({
         ...patch,
+        ...(pendingBaseline
+          ? { baselinePreviewStatus: "failed" as const, baselinePreviewUrl: null }
+          : {}),
         draft: emptyDraft(),
         dirtyIds: new Set<string>(),
         historyBlocked: true,

@@ -219,9 +219,12 @@ export function baselinePayload(options: { structureHash?: string; baselineId?: 
 }
 
 export function jobPayload(overrides: Record<string, unknown> = {}) {
+  // `job_id` 与 `preview_url` 必须自洽：真实服务端的预览 URL 就是
+  // `/api/preview/<job_id>`。夹具里各自写死会让「按 job_id 取图」的实现测不出来。
+  const jobId = typeof overrides.job_id === "string" ? overrides.job_id : "job0000000000001";
   return {
     ok: true,
-    job_id: "job0000000000001",
+    job_id: jobId,
     seq: 7,
     status: "done",
     created_at: "2026-10-09T18:00:01+08:00",
@@ -231,7 +234,7 @@ export function jobPayload(overrides: Record<string, unknown> = {}) {
     kind: "surface",
     external_changes: [],
     result: {
-      preview_url: "/api/preview/job0000000000001",
+      preview_url: `/api/preview/${jobId}`,
       render_resolution: [540, 990, 100],
       applied_surface: {
         "cel.Cel_Skin.ramp": [
