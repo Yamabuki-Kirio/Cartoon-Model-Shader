@@ -133,6 +133,9 @@ class BaselineResponse(BaseModel):
     #: ``view_transform`` -> ``[{value, label}]``：Blender 真实接受的 look 档位
     look_map: dict[str, list[dict[str, str]]] = Field(default_factory=dict)
     preview_resolution: list[int] = Field(default_factory=list)
+    #: v4 参数面基线（只读拓扑探针 + 递归 schema + 三层指纹）。
+    #: **新增的可选字段**：旧页面不看它，因此 L0 响应契约不变。
+    surface: dict[str, Any] | None = None
     job_id: str | None = None
     job_status: str | None = None
     preview_url: str | None = None
@@ -211,6 +214,24 @@ class PreviewSubmitResponse(BaseModel):
     framing: dict[str, Any] = Field(default_factory=dict)
 
 
+class V4PreviewRequest(BaseModel):
+    """v4 预览：草稿里可以同时出现 L0 参数 id 与 Cel 参数 id。
+
+    * L0（``color.*`` / ``glow.*``）走既有校验路径；
+    * Cel（``cel.*``）走递归 schema + 通用执行器；
+    * 两者编译进**同一个任务**，因此只渲染一次、一起回滚。
+
+    ``expected_structure_hash`` 是客户端手里的结构指纹：与当前基线不一致时在
+    提交阶段就拒绝（不产生任务）。真正的身份/结构闸门在任务里再跑一遍。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    draft: dict[str, Any] = Field(default_factory=dict, description="完整草稿：参数 id 到取值的映射")
+    framing: FramingOptions | None = None
+    expected_structure_hash: str | None = None
+
+
 class JobResponse(BaseModel):
     ok: bool = True
     job_id: str
@@ -221,6 +242,10 @@ class JobResponse(BaseModel):
     superseded: bool = False
     steps: list[str] = Field(default_factory=list)
     framing_request: dict[str, Any] | None = None
+    #: v4 任务标识（纯 L0 任务不带此字段）
+    kind: str | None = None
+    #: 值层外部改动：只报告，不作废草稿与令牌
+    external_changes: list[dict[str, Any]] = Field(default_factory=list)
     result: dict[str, Any] | None = None
     error: ErrorDetail | None = None
 
@@ -313,6 +338,10 @@ class CommitPrepareRequest(BaseModel):
     confirm: bool = Field(
         default=False, description="覆盖已有文件必须为 True（先看清绝对路径与备份路径再确认）"
     )
+    #: v4（可选）：参数面草稿。传了就一并绑进确认令牌，篡改即拒绝。
+    surface_draft: dict[str, Any] | None = None
+    #: v4（可选）：客户端持有的结构指纹。与基线不一致时在 prepare 阶段就拒绝。
+    structure_hash: str | None = None
 
 
 class CommitPrepareResponse(BaseModel):
@@ -325,6 +354,10 @@ class CommitPrepareResponse(BaseModel):
     baseline_id: str
     draft_hash: str
     parameter_count: int = 0
+    #: v4：绑定的参数面草稿条数（0 = 本次没绑）
+    surface_parameter_count: int = 0
+    #: v4：绑定的结构指纹（None = 本次没绑）
+    structure_hash: str | None = None
     normalized: list[dict[str, Any]] = Field(default_factory=list)
     expires_at: str
     expires_in_seconds: int
@@ -340,6 +373,8 @@ class CommitRequest(BaseModel):
     mode: Literal["save_as", "overwrite"] = "save_as"
     draft: dict[str, Any] = Field(default_factory=dict)
     target_path: str | None = None
+    surface_draft: dict[str, Any] | None = None
+    structure_hash: str | None = None
 
 
 class CommitResponse(BaseModel):

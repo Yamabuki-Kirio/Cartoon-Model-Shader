@@ -24,8 +24,6 @@ from typing import Any
 from .binding import Binding
 from .schema import (
     COST_L1,
-    COST_L3,
-    ColorNode,
     EnumNode,
     GroupNode,
     RampElement,
@@ -33,9 +31,11 @@ from .schema import (
     REASON_NOT_FOUND,
     REASON_REFERENCE_ONLY,
     REASON_STRUCTURAL,
+    REASON_UNCONFIRMED_CAPABILITY,
     SOURCE_SCENE,
     SOURCE_UNSUPPORTED,
     ScalarNode,
+    max_cost,
 )
 
 GROUP = "cel"
@@ -175,6 +175,9 @@ def build_group_node(
         )
 
     # -- 发光强度 ---------------------------------------------------------
+    # ⚠ 只读。命中与否照实报告，但**一律不写**：真实 Blender 里 Emission 强度的
+    #   插座名尚未通过真机拓扑确认（提交 3A 的既定口径），此时写入等于猜。
+    #   拿到 `/api/diagnostics/describe` 的真实输出、把候选名校准之后再开放编辑。
     emission = _emission_sockets(group)
     if len(emission) == 1:
         socket = emission[0]["socket"]
@@ -186,17 +189,20 @@ def build_group_node(
                 group=GROUP,
                 cost=COST_L1,
                 label=f"{name} Emission 强度",
-                binding=Binding(
-                    "NODE_GROUP", f"{name}/{emission[0]['node_name']}", "mute"
-                ),
                 value=value,
                 baseline=value,
                 effective=value,
                 minimum=0.0,
                 maximum=100.0,
                 step=0.05,
-                editable=not readonly_by_role,
-                readonly_reason=REASON_REFERENCE_ONLY if readonly_by_role else None,
+                supported=True,
+                editable=False,
+                readonly_reason=REASON_UNCONFIRMED_CAPABILITY,
+                value_source=SOURCE_SCENE,
+                note=(
+                    "只读：已探测到候选 Emission 强度插座，但在真实 Blender 拓扑确认之前"
+                    "不写入（避免写错插座）。"
+                ),
             )
         )
     elif not emission:
@@ -277,7 +283,11 @@ def build_group_node(
         id=_cel_prefix(name),
         kind="group",
         group=GROUP,
-        cost=COST_L3 if any(isinstance(c, RampNode) for c in children) else COST_L1,
+        # 分组的层级 = 子树最高层级。**不能**因为「子树里有色带」就整组标 L3：
+        # 色带的**色标取值**是 L1（只更新草稿 + 用户触发预览），只有色标**数量**
+        # 属于 L3 结构性改动，而它已经由 element_count 单独声明为只读。
+        # 整组标 L3 会让 max_cost() 永远返回 L3，调度器会把普通调参当成结构性操作。
+        cost=max_cost(children) if children else COST_L1,
         label=name,
         supported=exists,
         editable=bool(exists and not readonly_by_role),

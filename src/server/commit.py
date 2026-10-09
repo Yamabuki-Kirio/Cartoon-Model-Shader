@@ -46,10 +46,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import errors, project_ops, session as session_module
+from . import errors, project_ops, session as session_module, surface_probe
 from .binder import BlenderBinder
 from .project_ops import MODE_OVERWRITE, MODE_SAVE_AS, SAVE_MODES
 from .session import Baseline, PreviewService, validate_draft, verify_values
+from .surface import param_values, verify_ops
 
 #: 确认令牌有效期（秒）。刻意很短：prepare 只是为了「让用户看一眼」。
 TOKEN_TTL_SECONDS = 120
@@ -94,6 +95,10 @@ class CommitTicket:
     backup_path: str | None = None
     warnings: list[str] = field(default_factory=list)
     used: bool = False
+    #: v4：令牌是否绑定了参数面草稿（旧客户端为 False，行为完全不变）
+    surface_bound: bool = False
+    #: v4：签发时的结构指纹。结构一变，令牌立即失效。
+    structure_hash: str | None = None
 
     @property
     def expired(self) -> bool:
@@ -109,6 +114,7 @@ class CommitTicket:
             "expires_at": self.expires_at_iso,
             "expires_in_seconds": TOKEN_TTL_SECONDS,
             "confirmation_required": self.backup_path is not None,
+            "structure_hash": self.structure_hash,
         }
 
 
@@ -128,6 +134,8 @@ class CommitService:
         draft: Any,
         target_path: Any = None,
         confirm: bool = False,
+        surface_draft: Any = None,
+        structure_hash: Any = None,
     ) -> dict[str, Any]:
         normalised_mode = self._normalise_mode(mode)
         baseline = self._require_baseline()
@@ -135,6 +143,18 @@ class CommitService:
         effective, notes = session_module.normalize_values(
             {**baseline.values, **coerced}, baseline.look_map
         )
+
+        # v4 接线：只完成**绑定**，不改旧客户端的任何行为。
+        # 一旦客户端带了 surface_draft / structure_hash，就要求 v4 基线存在、
+        # 结构指纹一致，并把参数面草稿一并绑进确认令牌 ——
+        # 否则「用户确认过的那份草稿」与实际落盘的内容可以不是一回事。
+        surface_plan: list[Any] | None = None
+        surface_values: dict[str, Any] | None = None
+        token_structure: str | None = None
+        if surface_draft is not None or structure_hash is not None:
+            token_structure = self._require_structure_match(structure_hash)
+            surface_plan = self._surface().plan(surface_draft or {})
+            surface_values = param_values(surface_plan)
 
         target, warnings, needs_backup = await self._resolve_target(
             normalised_mode, target_path
@@ -161,11 +181,17 @@ class CommitService:
 
         ticket = self._issue(
             baseline_id=baseline.baseline_id,
-            draft_hash=draft_fingerprint(coerced),
+            draft_hash=(
+                draft_fingerprint(coerced)
+                if surface_values is None
+                else draft_fingerprint({"l0": coerced, "surface": surface_values})
+            ),
             mode=normalised_mode,
             target_path=target,
             backup_path=planned_backup,
             warnings=warnings,
+            surface_bound=surface_values is not None,
+            structure_hash=token_structure,
         )
         payload = dict(ticket.to_public())
         payload.update(
@@ -173,11 +199,54 @@ class CommitService:
                 "ok": True,
                 "baseline_id": baseline.baseline_id,
                 "parameter_count": len(effective),
+                "surface_parameter_count": len(surface_values or {}),
                 "normalized": notes,
                 "draft_hash": ticket.draft_hash,
             }
         )
         return payload
+
+    # -- v4 结构绑定 -------------------------------------------------------
+    def _surface(self):
+        return self._preview.surface
+
+    def _require_structure_match(self, provided: Any) -> str:
+        """v4 结构指纹对账（**本地比较**，不调 Blender）。
+
+        真正的「工程侧结构有没有变」需要只读探针，那一步在 ``commit`` 里、
+        在**任何写入之前**做。这里只保证「客户端手里的指纹」与基线一致。
+        """
+        current = self._surface().baseline
+        if current is None:
+            raise errors.ToonTunerError(
+                errors.NO_BASELINE,
+                "尚未建立 v4 参数面基线，无法绑定结构指纹。请先建立基线。",
+            )
+        if provided and str(provided) != current.structure_hash:
+            raise errors.ToonTunerError(
+                errors.STRUCTURE_CHANGED,
+                "客户端持有的结构指纹与当前基线不一致：工程结构已变化，请刷新基线。",
+                details={"expected": str(provided), "current": current.structure_hash},
+            )
+        return current.structure_hash
+
+    async def _assert_surface_fresh(self) -> dict[str, Any]:
+        """写入之前的 v4 结构闸门：用只读探针实测一次，绝不只信本地指纹。"""
+        verdict = await self._preview.check_surface_structure()
+        if verdict.get("identity_missing"):
+            raise errors.ToonTunerError(
+                errors.IDENTITY_MISSING,
+                "受管对象被重命名或删除（本工具不做猜测迁移）："
+                + "、".join(verdict["identity_missing"][:4]),
+                details={"identity_missing": verdict["identity_missing"]},
+            )
+        if verdict.get("structure_changed"):
+            raise errors.ToonTunerError(
+                errors.STRUCTURE_CHANGED,
+                "工程结构已变化（节点增删或色标数量）：确认令牌已失效，请刷新基线后重新准备。",
+                details={"structure_changed": verdict["structure_changed"]},
+            )
+        return verdict
 
     def _normalise_mode(self, mode: Any) -> str:
         if mode is None:
@@ -255,6 +324,8 @@ class CommitService:
         target_path: Path,
         backup_path: Path | None,
         warnings: list[str],
+        surface_bound: bool = False,
+        structure_hash: str | None = None,
     ) -> CommitTicket:
         now = time.monotonic()
         ticket = CommitTicket(
@@ -270,6 +341,8 @@ class CommitService:
             ).isoformat(timespec="seconds"),
             backup_path=str(backup_path) if backup_path is not None else None,
             warnings=list(warnings),
+            surface_bound=surface_bound,
+            structure_hash=structure_hash,
         )
         self._tickets[ticket.token] = ticket
         self._trim()
@@ -285,7 +358,14 @@ class CommitService:
             self._tickets.pop(oldest, None)
 
     def consume(
-        self, *, token: Any, mode: Any, draft: Any, target_path: Any = None
+        self,
+        *,
+        token: Any,
+        mode: Any,
+        draft: Any,
+        target_path: Any = None,
+        surface_draft: Any = None,
+        structure_hash: Any = None,
     ) -> CommitTicket:
         """校验并**消费**令牌（一次性：校验通过即刻作废，防止重复落盘）。"""
         if not isinstance(token, str) or not token:
@@ -330,8 +410,29 @@ class CommitService:
                 details={"expected": ticket.target_path, "received": supplied_target},
             )
 
+        # v4：结构指纹 + 参数面草稿都必须与准备阶段完全一致。
+        if ticket.surface_bound:
+            self._require_structure_match(
+                ticket.structure_hash if structure_hash is None else structure_hash
+            )
+            current_surface: dict[str, Any] | None = param_values(
+                self._surface().plan(surface_draft or {})
+            )
+        elif surface_draft:
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_MISMATCH,
+                "准备阶段未绑定参数面草稿，提交时却带了 surface_draft。请重新准备。",
+            )
+        else:
+            current_surface = None
+
         coerced = validate_draft(draft, baseline)
-        if not hmac.compare_digest(draft_fingerprint(coerced), ticket.draft_hash):
+        expected_hash = (
+            draft_fingerprint(coerced)
+            if current_surface is None
+            else draft_fingerprint({"l0": coerced, "surface": current_surface})
+        )
+        if not hmac.compare_digest(expected_hash, ticket.draft_hash):
             raise errors.ToonTunerError(
                 errors.COMMIT_TOKEN_MISMATCH,
                 "草稿与准备阶段不一致（令牌绑定了完整草稿，不允许中途改动）。",
@@ -355,8 +456,10 @@ class CommitService:
             return ""
 
     # -- 失败处理 ---------------------------------------------------------
-    async def _rollback_to_baseline(self) -> dict[str, Any]:
-        """把 Blender 恢复到提交前的基线取值，并**回读校验**。
+    async def _rollback_to_baseline(
+        self, surface_ops: list[Any] | None = None
+    ) -> dict[str, Any]:
+        """把 Blender 恢复到提交前的基线取值，并**回读校验**（L0 与 Cel 两部分分开报）。
 
         只在失败路径调用：草稿已经写进场景，不恢复的话界面显示的参数与 Blender 里的
         实际取值就会脱节。恢复之后必须回读 —— 否则「已恢复」只是一句没有依据的自述。
@@ -364,7 +467,22 @@ class CommitService:
         ``code`` 为 ``ROLLBACK_FAILED`` 表示「尝试过但没能确认恢复」，调用方必须把它
         明确报给用户，而不是含糊地说一句「已回滚」。
         """
-        rollback: dict[str, Any] = {
+        l0 = await self._restore_l0()
+        cel = await self._restore_cel(surface_ops)
+        verified = bool(l0["verified"]) and bool(cel["verified"])
+        return {
+            "attempted": bool(l0["attempted"] or cel["attempted"]),
+            "verified": verified,
+            "mismatches": list(l0["mismatches"]) + list(cel["mismatches"]),
+            "code": None if verified else errors.ROLLBACK_FAILED,
+            "error": l0.get("error") or cel.get("error"),
+            "reason": l0.get("reason") or cel.get("reason"),
+            "l0": l0,
+            "cel": cel,
+        }
+
+    async def _restore_l0(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
             "attempted": False,
             "verified": False,
             "mismatches": [],
@@ -372,36 +490,83 @@ class CommitService:
             "error": None,
             "reason": None,
         }
-
         if self._preview.baseline is None:
-            rollback["code"] = errors.ROLLBACK_FAILED
-            rollback["reason"] = "基线已丢失，无法恢复到提交前的状态。"
-            rollback["error"] = {
+            out["code"] = errors.ROLLBACK_FAILED
+            out["reason"] = "基线已丢失，无法恢复到提交前的状态。"
+            out["error"] = {
                 "code": errors.NO_BASELINE,
                 "message": "基线已丢失，无法恢复到提交前的状态。",
             }
-            return rollback
+            return out
 
-        rollback["attempted"] = True
+        out["attempted"] = True
         try:
             outcome = await self._preview.restore_baseline()
         except errors.ToonTunerError as exc:
-            rollback["code"] = errors.ROLLBACK_FAILED
-            rollback["error"] = exc.to_payload()["error"]
-            return rollback
+            out["code"] = errors.ROLLBACK_FAILED
+            out["error"] = exc.to_payload()["error"]
+            return out
         except Exception as exc:  # noqa: BLE001 - 回滚自身不得再抛，否则会盖掉原始失败原因
-            rollback["code"] = errors.ROLLBACK_FAILED
-            rollback["error"] = {
+            out["code"] = errors.ROLLBACK_FAILED
+            out["error"] = {
                 "code": errors.INTERNAL_ERROR,
                 "message": f"{type(exc).__name__}: {exc}",
             }
-            return rollback
+            return out
 
-        rollback["verified"] = bool(outcome.get("verified"))
-        rollback["mismatches"] = list(outcome.get("mismatches") or [])
-        if not rollback["verified"]:
-            rollback["code"] = errors.ROLLBACK_FAILED
-        return rollback
+        out["verified"] = bool(outcome.get("verified"))
+        out["mismatches"] = list(outcome.get("mismatches") or [])
+        if not out["verified"]:
+            out["code"] = errors.ROLLBACK_FAILED
+        return out
+
+    async def _restore_cel(self, surface_ops: list[Any] | None) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "attempted": False,
+            "verified": False,
+            "mismatches": [],
+            "code": None,
+            "error": None,
+            "reason": None,
+        }
+        if not surface_ops:
+            # 「无事可做」不等于「没恢复成」：整体 verified 取两者的与，
+            # 这里若留 False，一次纯 L0 保存的回滚就会被误报成失败。
+            out["verified"] = True
+            out["applicable"] = False
+            out["reason"] = "本次保存没有 Cel 写入，无需恢复。"
+            return out
+        out["attempted"] = True
+        try:
+            payload = await self._call(
+                self._binder.apply_surface_ops, self._surface().baseline_ops()
+            )
+        except errors.ToonTunerError as exc:
+            out["code"] = errors.ROLLBACK_FAILED
+            out["error"] = exc.to_payload()["error"]
+            return out
+        except Exception as exc:  # noqa: BLE001 - 同上
+            out["code"] = errors.ROLLBACK_FAILED
+            out["error"] = {
+                "code": errors.INTERNAL_ERROR,
+                "message": f"{type(exc).__name__}: {exc}",
+            }
+            return out
+
+        baseline = self._surface().baseline
+        if baseline is None:  # pragma: no cover - 上面 baseline_ops 已隐含存在
+            out["code"] = errors.ROLLBACK_FAILED
+            out["error"] = {
+                "code": errors.NO_BASELINE,
+                "message": "v4 基线已丢失，无法恢复 Cel 取值。",
+            }
+            return out
+        verified, mismatches = verify_ops(baseline.baseline_ops, payload.get("values") or {})
+        out["verified"] = verified
+        out["mismatches"] = mismatches
+        if not verified:
+            out["code"] = errors.ROLLBACK_FAILED
+        return out
 
     @staticmethod
     def _rollback_suffix(rollback: dict[str, Any]) -> str:
@@ -424,6 +589,7 @@ class CommitService:
         steps: list[str],
         notes: list[dict[str, Any]] | None = None,
         scene_touched: bool = True,
+        surface_ops: list[Any] | None = None,
     ) -> errors.ToonTunerError:
         """构造失败响应：尝试回滚（仅当草稿确实写进过场景），并把四态 + 回滚结果带上。
 
@@ -431,7 +597,7 @@ class CommitService:
         这样「一定会抛」在调用点可见，也便于把内层错误的 details 合并进来。
         """
         if scene_touched:
-            rollback = await self._rollback_to_baseline()
+            rollback = await self._rollback_to_baseline(surface_ops)
             suffix = self._rollback_suffix(rollback)
         else:
             rollback = {
@@ -441,6 +607,22 @@ class CommitService:
                 "code": None,
                 "error": None,
                 "reason": "尚未写入场景，无需回滚。",
+                "l0": {
+                    "attempted": False,
+                    "verified": False,
+                    "mismatches": [],
+                    "code": None,
+                    "error": None,
+                    "reason": "尚未写入场景，无需回滚。",
+                },
+                "cel": {
+                    "attempted": False,
+                    "verified": False,
+                    "mismatches": [],
+                    "code": None,
+                    "error": None,
+                    "reason": "尚未写入场景，无需回滚。",
+                },
             }
             suffix = "（尚未写入场景，无需回滚。）"
 
@@ -452,16 +634,37 @@ class CommitService:
 
     # -- 提交 -------------------------------------------------------------
     async def commit(
-        self, *, token: Any, mode: Any, draft: Any, target_path: Any = None
+        self,
+        *,
+        token: Any,
+        mode: Any,
+        draft: Any,
+        target_path: Any = None,
+        surface_draft: Any = None,
+        structure_hash: Any = None,
     ) -> dict[str, Any]:
         """消费令牌并执行保存。任一步失败都**不保存**，并回完整的四态状态块。"""
-        ticket = self.consume(token=token, mode=mode, draft=draft, target_path=target_path)
+        ticket = self.consume(
+            token=token,
+            mode=mode,
+            draft=draft,
+            target_path=target_path,
+            surface_draft=surface_draft,
+            structure_hash=structure_hash,
+        )
 
         baseline = self._require_baseline()
         coerced = validate_draft(draft, baseline)
         expected, notes = session_module.normalize_values(
             {**baseline.values, **coerced}, baseline.look_map
         )
+        # v4：票据绑定的参数面草稿在这里重新编译成计划（与 prepare 用的是同一份基线，
+        # 因此结果与 prepare 阶段逐字节一致；不一致会在 consume 里就被判篡改）。
+        surface_ops: list[Any] | None = (
+            self._surface().plan(surface_draft or {}) if ticket.surface_bound else None
+        )
+        if surface_ops is not None and not surface_ops:
+            surface_ops = None
         target = Path(ticket.target_path)
         # ★ 必须用**票据里已确认的那条**备份路径，不重新计算：
         #   跨过时间边界（哪怕只差 1 秒）算出来的名字就不同，备份就会落到
@@ -490,6 +693,9 @@ class CommitService:
             "target_path": ticket.target_path,
             "mode": ticket.mode,
             "draft_preserved": True,
+            "applied_surface": {},
+            "surface_readback_verified": False,
+            "surface_mismatches": [],
         }
         steps: list[str] = []
 
@@ -533,6 +739,28 @@ class CommitService:
                     "草稿写入后回读不一致，已中止保存（磁盘上的工程文件未被写入）。",
                 )
 
+            if surface_ops:
+                # v4 结构闸门：在写 Cel 之前用只读探针实测一次。本地指纹对账证明不了
+                # 「工程这一刻的结构没变」，而结构一变写下去就是错的。
+                steps.append("复核 v4 结构")
+                await self._assert_surface_fresh()
+
+                steps.append("应用 Cel 草稿")
+                applied_surface = await self._call(
+                    self._binder.apply_surface_ops, surface_ops
+                )
+                sur_verified, sur_mismatches = verify_ops(
+                    surface_ops, applied_surface.get("values") or {}
+                )
+                status["applied_surface"] = param_values(surface_ops)
+                status["surface_readback_verified"] = sur_verified
+                status["surface_mismatches"] = sur_mismatches
+                if not sur_verified:
+                    raise errors.ToonTunerError(
+                        errors.APPLY_VERIFY_FAILED,
+                        "Cel 草稿写入后回读不一致，已中止保存（磁盘上的工程文件未被写入）。",
+                    )
+
             if backup_path is not None:
                 steps.append("生成备份")
                 created = await self._call(project_ops.make_backup, target, backup_path)
@@ -545,7 +773,12 @@ class CommitService:
             save_payload = await self._call(self._binder.save_project, str(target), ticket.mode)
         except errors.ToonTunerError as exc:
             abort = await self._abort(
-                exc.code, exc.message, status=status, steps=steps, notes=notes
+                exc.code,
+                exc.message,
+                status=status,
+                steps=steps,
+                notes=notes,
+                surface_ops=surface_ops,
             )
             # 保留内层细节（例如 target_name / failure_type / stage），但不覆盖
             # 我们刚写好的 status / steps / normalized。
@@ -567,6 +800,7 @@ class CommitService:
                 status=status,
                 steps=steps,
                 notes=notes,
+                surface_ops=surface_ops,
             )
 
         status["saved"] = True
@@ -577,6 +811,22 @@ class CommitService:
             "code": None,
             "error": None,
             "reason": "保存成功，未触发回滚。",
+            "l0": {
+                "attempted": False,
+                "verified": False,
+                "mismatches": [],
+                "code": None,
+                "error": None,
+                "reason": "保存成功，未触发回滚。",
+            },
+            "cel": {
+                "attempted": False,
+                "verified": False,
+                "mismatches": [],
+                "code": None,
+                "error": None,
+                "reason": "保存成功，未触发回滚。",
+            },
         }
         steps.append("刷新基线")
 

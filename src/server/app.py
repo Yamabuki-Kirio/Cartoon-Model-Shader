@@ -19,6 +19,11 @@
 * ``POST /api/presets``            校验并保存当前完整草稿为预设
 * ``POST /api/session/commit/prepare`` 校验基线/草稿/模式/目标路径，签发一次性确认令牌
 * ``POST /api/session/commit``     消费令牌 → 应用完整草稿 → 回读校验 → 备份 → 保存工程
+* ``GET  /api/diagnostics/describe`` 只读拓扑探测（脱敏）
+* ``GET  /api/v4/surface/schema``  v4 递归 schema（Cel 竖切）
+* ``GET  /api/v4/session/baseline`` v4 基线（身份 + 结构指纹 + 基线值）
+* ``POST /api/v4/preview``         v4 预览：L0 + Cel 编进同一任务，只渲染一次
+* ``GET  /api/v4/jobs/{id}``       v4 任务状态（与 ``/api/jobs/{id}`` 同一份存储）
 
 安全边界：
 * 只监听 127.0.0.1（见 config 回环校验）。
@@ -56,6 +61,7 @@ from . import (
     presets as presets_module,
     scene_probe,
     security,
+    surface,
     surface_probe,
 )
 from .binder import BlenderBinder, preview_dir, preview_png_name
@@ -83,10 +89,12 @@ from .models import (
     PreviewSubmitResponse,
     RestoreResponse,
     SceneResponse,
+    V4PreviewRequest,
 )
 from .presets import PresetStore
 from .redact import redact
 from .session import PreviewService, preview_url_for, validate_draft
+from .surface_service import SurfaceService
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
@@ -99,6 +107,37 @@ def _now_iso() -> str:
 
 def _error_detail(exc: errors.ToonTunerError) -> dict[str, Any]:
     return exc.to_payload()["error"]
+
+
+def _split_v4_draft(
+    draft: dict[str, Any], surface_service: SurfaceService
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """把 v4 草稿按**基线 schema 里的 id 集合**拆成 L0 与 Cel 两部分。
+
+    判定依据是 id 集合而不是字符串前缀：Cel 的 id 来自探测结果（组名是工程里的事实），
+    前缀规则无法假装覆盖它，也会在将来新增参数族时悄悄失准。
+    两边都不认识的 id 一律拒绝 —— 不静默丢弃用户提交的参数。
+    """
+    baseline = surface_service.baseline
+    surface_ids = set(surface.flatten(baseline.nodes)) if baseline is not None else set()
+
+    l0_draft: dict[str, Any] = {}
+    surface_draft: dict[str, Any] = {}
+    unknown: list[str] = []
+    for param_id, value in (draft or {}).items():
+        if param_id in surface_ids:
+            surface_draft[param_id] = value
+        elif param_id in params_module.BY_ID:
+            l0_draft[param_id] = value
+        else:
+            unknown.append(param_id)
+    if unknown:
+        raise errors.ToonTunerError(
+            errors.PARAM_INVALID,
+            "存在不在当前 v4 schema 内的参数：" + str(sorted(unknown)),
+            details={"unknown": sorted(unknown), "known_surface": sorted(surface_ids)[:24]},
+        )
+    return l0_draft, surface_draft
 
 
 class BlenderGateway:
@@ -181,7 +220,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     cfg = config or load_config()
     gateway = BlenderGateway(cfg)
     binder = BlenderBinder(cfg.blender_mcp)
-    preview = PreviewService(binder)
+    surface_service = SurfaceService()
+    preview = PreviewService(binder, surface_service)
     #: 所有写接口的统一闸门；令牌只在进程启动时生成一次。
     guard = security.SessionGuard()
     presets = PresetStore(cfg.presets_dir or presets_module.default_preset_dir())
@@ -209,6 +249,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     app.state.session_token = guard.token
     app.state.presets = presets
     app.state.commit = commit
+    app.state.surface = surface_service
 
     # 写接口统一的依赖：缺失/错误令牌一律 401 拒绝。
     require_token = [Depends(security.require_session_token)]
@@ -472,6 +513,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             draft=body.draft,
             target_path=body.target_path,
             confirm=body.confirm,
+            surface_draft=body.surface_draft,
+            structure_hash=body.structure_hash,
         )
 
     @app.post(
@@ -491,6 +534,8 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             mode=body.mode,
             draft=body.draft,
             target_path=body.target_path,
+            surface_draft=body.surface_draft,
+            structure_hash=body.structure_hash,
         )
 
     # -- 诊断（只读，不需要令牌）------------------------------------------
@@ -509,6 +554,71 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         return {"ok": True, **surface_probe.describe_groups(
             surface_probe.redact_describe(payload)
         )}
+
+    # -- v4 参数面（Cel 竖切）---------------------------------------------
+    @app.get("/api/v4/surface/schema", tags=["v4"])
+    async def v4_surface_schema() -> dict[str, Any]:
+        """v4 递归 schema：每个节点都带 supported / editable / active / readonly_reason。
+
+        色带是**单一复合节点**（``kind: ramp``，内含 ``elements`` 与 ``interpolation``），
+        刻意不展开成 2N 个独立 id —— ColorRamp 是单个 datablock，整体写入才原子。
+        只读接口，因此按既有规则不校验会话令牌。
+        """
+        return {"ok": True, **surface_service.schema_public()}
+
+    @app.get("/api/v4/session/baseline", tags=["v4"])
+    async def v4_session_baseline() -> dict[str, Any]:
+        """v4 基线：身份记录 + 结构指纹 + 基线值 + 降级清单。
+
+        建立基线仍走 ``POST /api/session/baseline``（它会顺带采集这里的 v4 状态）；
+        本接口只读取当前 v4 基线。只读接口，不校验令牌。
+        """
+        payload = surface_service.public()
+        if not payload.get("available"):
+            raise errors.ToonTunerError(
+                errors.NO_BASELINE,
+                "尚未建立 v4 参数面基线。请先调用 POST /api/session/baseline。",
+                details={"probe_error": payload.get("error")},
+            )
+        return {"ok": True, **payload}
+
+    @app.post(
+        "/api/v4/preview",
+        response_model=PreviewSubmitResponse,
+        tags=["v4"],
+        dependencies=require_token,
+    )
+    async def v4_preview(body: V4PreviewRequest) -> dict[str, Any]:
+        """提交 v4 预览：L0 与 Cel 编进**同一个任务**，因此只渲染一次、一起回滚。
+
+        提交阶段只做「客户端自己能发现的错」：草稿越界、色标数量变化、
+        客户端持有的结构指纹过期。真正的身份 / 结构闸门在任务里、**任何写入之前**再跑一遍。
+        """
+        options = framing_module.validate_options(
+            body.framing.model_dump() if body.framing is not None else None
+        )
+        l0_draft, surface_draft = _split_v4_draft(body.draft, surface_service)
+        job = await preview.submit_surface(
+            l0_draft=l0_draft,
+            surface_draft=surface_draft,
+            framing_options=options,
+            expected_structure_hash=body.expected_structure_hash,
+        )
+        return {
+            "ok": True,
+            "job_id": job.job_id,
+            "seq": job.seq,
+            "status": job.status,
+            "framing": framing_module.describe_options(dict(job.framing)),
+        }
+
+    @app.get("/api/v4/jobs/{job_id}", response_model=JobResponse, tags=["v4"])
+    async def v4_read_job(job_id: str) -> dict[str, Any]:
+        """v4 任务状态。与 ``/api/jobs/{id}`` 共用同一份任务存储（排队与取代机制同一套）。"""
+        job = preview.get_job(job_id)
+        if job is None:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        return job.to_public()
 
     # -- 静态页面 ---------------------------------------------------------
     index_file = WEB_DIR / "index.html"

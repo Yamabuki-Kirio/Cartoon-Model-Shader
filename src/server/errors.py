@@ -58,6 +58,8 @@ NOT_EDITABLE = "NOT_EDITABLE"
 ASSET_UNKNOWN = "ASSET_UNKNOWN"
 PRESET_INCOMPATIBLE = "PRESET_INCOMPATIBLE"
 FRONTEND_NOT_BUILT = "FRONTEND_NOT_BUILT"
+#: v4 通用执行器在 Blender 侧写入失败（该次写入已被执行器自己回滚）。
+SURFACE_APPLY_FAILED = "SURFACE_APPLY_FAILED"
 
 #: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，
 #: 便于调用方直接读到 ``parameter`` / ``value`` / ``depends_on`` / ``allowed``。
@@ -263,6 +265,12 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         False,
         "前端尚未构建，无法提供页面。请在 web/ 目录执行 npm ci 与 npm run build 后重试"
         "（开发时可用 Vite dev server 并把 /api 代理到本服务）。",
+    ),
+    SURFACE_APPLY_FAILED: (
+        502,
+        True,
+        "参数写入 Blender 失败（本次写入已被自动回滚，工程里的取值未改变）。"
+        "请确认对应对象仍然存在后重试。",
     ),
 }
 
