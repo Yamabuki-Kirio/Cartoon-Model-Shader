@@ -225,3 +225,53 @@ def records_from_describe(describe: dict[str, Any]) -> dict[str, ObjectRecord]:
         )
         records[record.key] = record
     return records
+
+
+def value_snapshot(describe: dict[str, Any]) -> dict[str, Any]:
+    """值层快照：受管对象的**普通取值**，扁平成「可比较、可展示」的键。
+
+    刻意**不含**节点增删与色标数量 —— 那两个属结构层（``STRUCTURAL_FIELDS``）。
+    扁平键形如 ``NODE_GROUP:AI_Compositor/Cel_Skin.ramp[0].position``：
+
+    * 数值可以按容差比较（``compare`` 的 ``_close``），不会把浮点噪声报成外部改动；
+    * 差异项能直接展示成「哪个对象的哪个值被谁改了」，不需要前端再解析嵌套结构。
+
+    外部改动（用户在 Blender 里拖了色标）**只报告、不作废草稿**：否则工具会变得
+    完全不可用 —— 见本模块开头的三层设计说明。
+    """
+    out: dict[str, Any] = {}
+    source = str(describe.get("compositor_group") or "")
+    for group in describe.get("groups") or []:
+        if not isinstance(group, dict) or not group.get("exists"):
+            continue
+        name = str(group.get("name") or "")
+        if not name:
+            continue
+        key = ObjectIdentity(object_type="NODE_GROUP", name=name, source=source).key()
+        for node in group.get("nodes") or []:
+            if not isinstance(node, dict):
+                continue
+            node_name = str(node.get("name") or "")
+            out[f"{key}.node[{node_name}].mute"] = bool(node.get("mute"))
+            ramp = node.get("color_ramp")
+            if isinstance(ramp, dict):
+                out[f"{key}.ramp.interpolation"] = ramp.get("interpolation")
+                for index, element in enumerate(ramp.get("elements") or []):
+                    if not isinstance(element, dict):
+                        continue
+                    out[f"{key}.ramp[{index}].position"] = element.get("position")
+                    color = element.get("color")
+                    if isinstance(color, (list, tuple)):
+                        for channel, component in enumerate(color):
+                            out[f"{key}.ramp[{index}].color.{channel}"] = component
+            for socket in node.get("inputs") or []:
+                if not isinstance(socket, dict) or socket.get("linked"):
+                    continue
+                prefix = f"{key}.node[{node_name}].input[{socket.get('name')}]"
+                value = socket.get("value")
+                if isinstance(value, (list, tuple)):
+                    for channel, component in enumerate(value):
+                        out[f"{prefix}.{channel}"] = component
+                else:
+                    out[prefix] = value
+    return out

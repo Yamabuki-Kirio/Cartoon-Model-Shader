@@ -76,9 +76,11 @@ MMD 刚入门，渲染水平很低，见谅。只用于自用。
 ```
 Cartoon-Model-Shader/
 ├── docs/                            设计与需求文档
+├── docs/                            设计与需求文档
 │   ├── 需求文档.md
 │   ├── 技术设计.md
-│   ├── 接口文档.md                    全部接口的唯一权威（含令牌与保存流程）
+│   ├── 技术方案_v4.md                 v4 参数面技术方案（含 §8.4 提交 3A 落地记录）
+│   ├── 接口文档.md                    全部接口的唯一权威（含令牌、保存流程、v4 过渡接口）
 │   ├── 安全检查.md
 │   └── AI交付_第一步实施方案.md        MVP-01 任务书
 ├── reference/                       参考数据（参数面 schema 等）
@@ -103,6 +105,15 @@ Cartoon-Model-Shader/
 │   │   ├── presets.py               预设存储（原子写入；文件名由服务端派生）
 │   │   ├── project_ops.py           工程读/写固定模板 + 同目录时间戳备份
 │   │   ├── commit.py                应用到工程：确认令牌 / 回读校验 / 备份 / 保存
+│   │   ├── surface_probe.py         只读拓扑探针（脱敏；v4 的探测原料）
+│   │   ├── surface_service.py       v4 参数面状态：身份 + 结构指纹 + schema + 基线值
+│   │   ├── surface/                 v4 参数面（纯函数式）
+│   │   │   ├── binding.py           结构化 binding + 字段白名单（注入防线）
+│   │   │   ├── identity.py          身份/结构/值三层指纹与比对
+│   │   │   ├── schema.py            递归节点模型
+│   │   │   ├── cel.py               Cel 色阶适配器（能力驱动，探不到即降级）
+│   │   │   ├── draft.py             完整草稿校验（唯一入口）
+│   │   │   └── executor.py          由固定模板生成写入/回读代码（原子、可回滚）
 │   │   ├── models.py                API 模型
 │   │   ├── errors.py                稳定错误码
 │   │   └── redact.py                诊断脱敏
@@ -117,6 +128,10 @@ Cartoon-Model-Shader/
 │   ├── test_presets.py              预设：名称校验/更新/越界/依赖枚举/路径穿越/原子写入失败
 │   ├── test_commit.py               保存：目标校验/确认令牌/备份/回读/失败不落盘
 │   ├── test_security_token.py       写接口令牌矩阵 + 不可注入契约
+│   ├── test_surface_probe.py        只读拓扑探针：脱敏 + 结构签名
+│   ├── test_surface_identity.py     三层指纹：身份/结构/值
+│   ├── test_surface_cel.py          Cel 适配器 + 通用执行器（整体写入/回滚）
+│   ├── test_v4_surface_api.py       v4 竖切端到端：基线/预览/失效/失败恢复/保存绑定
 │   └── browser_check.mjs            真实浏览器验收（本机 Chrome/Edge + CDP）
 ├── .github/workflows/test.yml       Windows CI：3.11 + 3.12 矩阵，只跑 pytest，不上传产物
 ├── config.example.json
@@ -400,6 +415,18 @@ CI（`.github/workflows/test.yml`）在 **windows-latest** 上用 **Python 3.11 
   覆盖前生成同目录时间戳备份且内容为覆盖前版本、**备份失败则拒绝覆盖**；
   回读不一致 → 不保存且列出不一致项、保存失败 → 保留草稿并回报四态状态；
   路径里的引号只是普通字符（`repr` 量化），请求塞代码 / 额外字段一律 422。
+- v4 参数面相关（`tests/test_surface_probe.py` / `test_surface_identity.py` /
+  `test_surface_cel.py` / `test_v4_surface_api.py`）：
+  只读探针输出脱敏（路径键整体丢弃）；结构签名对**值**不敏感、对**色标数量与节点增删**敏感；
+  能力驱动降级（探不到色带 / 命中 0 或 >1 个 Emission 插座 / 假 socket 名不得变成生产硬编码）；
+  色带**整体写入**与整体回滚（数量不符、单项越界 ⇒ 整份不写）；
+  基线含 Cel schema + 身份 + 结构指纹、探不到组时安全降级但基线仍成功；
+  混合 L0 + Cel 草稿**只渲染一次**；
+  身份缺失 / 结构变化在**任何写入之前**失败且 `restore.attempted = false`；
+  值层外部改动只报告不作废；新任务取代旧任务；失败任务不覆盖最后一张成功预览；
+  写入 / 回读 / 渲染 / 恢复各阶段失败注入后 L0 与 Cel 两条基线都恢复并**分别报告**；
+  保存令牌绑定参数面草稿与结构指纹（篡改 ⇒ `COMMIT_TOKEN_MISMATCH` 且不落盘，
+  旧客户端不传这两个字段时行为完全不变）。
 
 ### 真实浏览器验收
 
@@ -447,6 +474,16 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 | DELETE | `/api/presets/{id}` | 删除预设 |
 | POST | `/api/session/commit/prepare` | 校验基线/草稿/保存模式/目标路径，返回一次性短效确认令牌 + 目标绝对路径 + 预计备份路径 + 告警 |
 | POST | `/api/session/commit` | 入参 `{"token", "mode", "draft", "target_path"}`：消费令牌 → 应用完整草稿 → 回读校验 → 备份 → 保存工程 |
+| GET | `/api/diagnostics/describe` | 只读拓扑导出（受管节点组 / ColorRamp 结构 / 对象与材质清单），**已脱敏**；用于校准 Cel 的真实 socket 名 |
+| GET | `/api/v4/surface/schema` | v4 递归 schema（`toon-surface/2`）：Cel 色带等参数树，每个节点带 `supported`/`editable`/`active`/`readonly_reason` |
+| GET | `/api/v4/session/baseline` | v4 基线：身份记录 + 结构指纹 + 基线值 + 降级清单（建立基线仍走 `POST /api/session/baseline`） |
+| POST | `/api/v4/preview` | v4 预览：L0 与 Cel 编进**同一个任务**，只渲染一次；可带 `expected_structure_hash` |
+| GET | `/api/v4/jobs/{job_id}` | v4 任务状态（与 `/api/jobs/{job_id}` 共用同一份存储） |
+
+> 上表最后四行是 **v4 过渡接口**（Cel 竖切）。旧页面继续用前面的接口，行为一行不改；
+> `POST /api/session/baseline` 的响应里多了一个可选 `surface` 字段。
+> `POST /api/session/commit/prepare` / `commit` 各自新增**可选**的 `surface_draft` 与
+> `structure_hash`：都不传时行为与旧客户端完全一致。详见 [`docs/接口文档.md`](docs/接口文档.md) §6。
 
 > **令牌**：除 `GET` 之外的**所有写接口**都必须带请求头 `X-Toon-Tuner-Token`。
 > 令牌在进程启动时随机生成，只通过 `GET /` 的页面响应注入前端，**不写入静态文件、不写日志**；
@@ -515,8 +552,16 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 - [ ] **MVP-03 其余批次**：预设界面入口、A/B 对比、预览质量档位的实际应用、会话恢复
 - [ ] 保存预设 / 应用到工程（**须在「恢复基线」通过重复测试后才开始**）
 - [x] **保存预设 / 应用到工程（自动测试完成；真实 Blender 验收待办）** —— 原子写入的本地预设 + 一次性确认令牌 → 应用完整草稿 → 回读逐项校验 → 同目录时间戳备份 → 保存工程（默认另存为；覆盖路径必须二次确认）
+- [x] **v4 提交 1：只读拓扑探针与技术方案** —— `GET /api/diagnostics/describe`（脱敏）+ `docs/技术方案_v4.md`
+- [x] **v4 提交 2：递归 schema、三层身份、Cel 适配器、通用执行器** —— `src/server/surface/`
+- [x] **v4 提交 3A：Cel 后端完整竖切（自动测试完成；真实 Blender 验收待办）** —— 基线采集只读拓扑 → `GET /api/v4/surface/schema` → `POST /api/v4/preview`（L0 + Cel 同一任务、只渲染一次、失败即恢复两条基线并分别报告）→ 身份/结构闸门写入前判定 → 保存令牌绑定参数面草稿与结构指纹
+- [ ] **v4 提交 3B：Vite/Preact 工作台与 Cel 编辑器**（`/next`，旧页面保持 `/`）
+- [ ] **v4 提交 4：完整参数族（世界/描边/渲染质量/灯光/相机/材质）与 L0–L3 调度**
+- [ ] **v4 提交 5：预设 v1→v2 迁移、撤销/重做、新 UI 切换并下线旧页面**
+- [ ] **校准 Cel 的真实 socket 名**（在有 Blender 的机器上跑 `GET /api/diagnostics/describe` 回传；
+      在此之前 Emission 强度保持 `editable: false` / `readonly_reason: "unconfirmed_capability"`）
 - [ ] **真实 Blender 验收保存流程**（人工步骤：另存为到新文件、覆盖当前工程、确认备份可打开、故意让保存失败并确认草稿保留）
-- [ ] Cel 色阶编辑器（7 组，L1）
+- [ ] **真实 Blender 验收 v4 竖切**（人工步骤：连续预览不累积污染、恢复基线逐项一致、保存重开后参数图一致）
 - [ ] 严格材质匹配与手工归类（L2）
 - [ ] A/B 对比、差异热力图、背景切换
 - [ ] 正式渲染与运行清单

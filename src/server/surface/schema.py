@@ -47,6 +47,10 @@ REASON_ROLLBACK_UNAVAILABLE = "rollback_unavailable"
 REASON_KEYFRAMED_OR_CONSTRAINED = "keyframed_or_constrained"
 REASON_REFERENCE_ONLY = "reference_only"
 REASON_STRUCTURAL = "structural"
+#: 探到了，但**真实 Blender 的插座名尚未确认**，因此不敢写。
+#: 用在 Emission 强度这类「候选名 + 结构验证」命中、但还没拿到真机拓扑的能力上：
+#: 探测结果照实报告（``supported: true``），写入一律拒绝。
+REASON_UNCONFIRMED_CAPABILITY = "unconfirmed_capability"
 
 
 @dataclass

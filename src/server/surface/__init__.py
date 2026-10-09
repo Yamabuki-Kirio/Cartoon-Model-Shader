@@ -32,7 +32,10 @@ from .executor import (
     build_readback_code,
     extract_json,
     normalise_ramp_elements,
+    param_values,
+    plan_values,
     sort_ops,
+    verify_ops,
 )
 from .identity import (
     VERDICT_IDENTITY_MISSING,
@@ -46,6 +49,7 @@ from .identity import (
     records_from_describe,
     structure_hash,
     value_fingerprint,
+    value_snapshot,
 )
 from .schema import (
     COSTS,
@@ -62,6 +66,7 @@ from .schema import (
     REASON_REFERENCE_ONLY,
     REASON_ROLLBACK_UNAVAILABLE,
     REASON_STRUCTURAL,
+    REASON_UNCONFIRMED_CAPABILITY,
     SCHEMA_VERSION,
     ColorNode,
     EnumNode,
@@ -106,6 +111,7 @@ __all__ = [
     "REASON_REFERENCE_ONLY",
     "REASON_ROLLBACK_UNAVAILABLE",
     "REASON_STRUCTURAL",
+    "REASON_UNCONFIRMED_CAPABILITY",
     "RampElement",
     "RampNode",
     "SCHEMA_VERSION",
@@ -130,11 +136,15 @@ __all__ = [
     "is_readonly",
     "max_cost",
     "normalise_ramp_elements",
+    "param_values",
+    "plan_values",
     "public_tree",
     "records_from_describe",
     "sort_ops",
     "structure_hash",
     "validate_draft",
     "value_fingerprint",
+    "value_snapshot",
+    "verify_ops",
     "walk",
 ]

@@ -553,3 +553,63 @@ def extract_json(captured_stdout: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise errors.BlenderUnexpectedResponse("执行器输出的结构不是对象。")
     return parsed
+
+
+# -- 回读校验 --------------------------------------------------------------
+
+#: 浮点比较容差。写入与回读之间只有 Blender 的属性往返，不会有累积误差。
+VERIFY_TOLERANCE = 1e-6
+
+
+def plan_values(ops: Iterable[PlanOp]) -> dict[str, Any]:
+    """计划的值映射：``binding.key() -> value``。
+
+    键与 ``build_apply_code`` / ``build_readback_code`` 输出的 ``values`` 完全一致，
+    因此校验就是一次同键比对，不需要再做任何形状转换。
+    """
+    return {op.binding.key(): op.value for op in ops}
+
+
+def param_values(ops: Iterable[PlanOp]) -> dict[str, Any]:
+    """计划的参数映射：``param_id -> value``（供响应里展示「实际生效了什么」）。"""
+    return {op.param_id: op.value for op in ops}
+
+
+def verify_ops(
+    ops: Iterable[PlanOp], readback: dict[str, Any], *, tolerance: float = VERIFY_TOLERANCE
+) -> tuple[bool, list[dict[str, Any]]]:
+    """逐项比对「计划要写的值」与「Blender 回读的值」。
+
+    复合值（色带元素表）走递归比较：位置按容差、颜色分量按容差、字符串精确相等。
+    不一致项带上 ``binding`` / ``param_id`` / 期望值 / 实得值，便于前端直接展示。
+    """
+    items = list(ops)
+    mismatches: list[dict[str, Any]] = []
+    for op in items:
+        key = op.binding.key()
+        if not _close(op.value, readback.get(key), tolerance=tolerance):
+            mismatches.append(
+                {
+                    "id": op.param_id,
+                    "binding": key,
+                    "expected": op.value,
+                    "actual": readback.get(key),
+                }
+            )
+    return (not mismatches), mismatches
+
+
+def _close(left: Any, right: Any, *, tolerance: float) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left is right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return abs(float(left) - float(right)) <= tolerance
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        if len(left) != len(right):
+            return False
+        return all(_close(a, b, tolerance=tolerance) for a, b in zip(left, right))
+    if isinstance(left, dict) and isinstance(right, dict):
+        if set(left) != set(right):
+            return False
+        return all(_close(left[key], right[key], tolerance=tolerance) for key in left)
+    return left == right

@@ -23,7 +23,7 @@ import math
 from typing import Any
 
 from .. import errors
-from .binding import assert_no_client_path, is_asset_binding
+from .binding import Binding, assert_no_client_path, is_asset_binding
 from .executor import PlanOp, normalise_ramp_elements
 from .schema import (
     COST_L1,
@@ -84,7 +84,7 @@ def validate_draft(
         if isinstance(node, GroupNode):
             continue  # 分组自身不是可写参数
         if node.binding is None:
-            # 只读展示节点（如 managed_mode）：草稿里出现即拒绝
+            # 只读展示节点（如 managed_mode / 未确认能力的 Emission）：草稿里出现即拒绝
             if param_id in draft:
                 raise _fail(
                     errors.NOT_EDITABLE,
@@ -95,7 +95,10 @@ def validate_draft(
             continue
 
         if param_id not in draft:
-            # 未出现在草稿里：若基线也没有值，就跳过（不伪造）
+            # 未出现在草稿里：这是**完整草稿**（基线 + 草稿）的常规情形，不是错误。
+            # 基线都拿不到的节点（探测失败 / 降级只读）直接跳过 —— 不伪造、也不报错。
+            if not node.supported or not node.editable:
+                continue
             if merged.get(param_id) is None:
                 continue
         _assert_writable(node, param_id)
@@ -104,17 +107,54 @@ def validate_draft(
         if node.binding is not None and is_asset_binding(node.binding):
             # asset 参数：只接受服务端生成的资源 id，路径类输入在这里就被挡下
             assert_no_client_path(raw)
-        value = _coerce(node, raw, param_id)
-        ops.append(
+        ops.extend(_ops_for(node, raw, param_id, index))
+    return ops
+
+
+def _ops_for(node: Node, raw: Any, param_id: str, index: dict[str, Node]) -> list[PlanOp]:
+    """单个参数 id 可能编译成**多条**写入操作。
+
+    目前只有色带：``elements`` 与 ``interpolation`` 是同一个 datablock 的两个字段，
+    必须落在同一个计划里一起写（原子、一起回滚）。客户端提交的是复合值
+    ``{"elements": [...], "interpolation": "CONSTANT"}``，这里把它拆成两条操作，
+    但对外的参数 id 仍是同一个 —— 色带的整体性不因拆分而丢失。
+    """
+    depends = _dependencies(node, index)
+
+    if isinstance(node, RampNode):
+        elements, interpolation = _coerce_ramp(node, raw, param_id)
+        out = [
             PlanOp(
                 node.binding,
-                value,
+                elements,
                 cost=node.cost or COST_L1,
                 param_id=param_id,
-                depends_on=_dependencies(node, index),
+                depends_on=depends,
+            )
+        ]
+        target = interpolation if interpolation is not None else node.interpolation_baseline
+        if target is None:
+            target = node.interpolation
+        out.append(
+            PlanOp(
+                Binding(node.binding.object_type, node.binding.object_id, "interpolation"),
+                str(target),
+                cost=node.cost or COST_L1,
+                param_id=f"{param_id}.interpolation",
             )
         )
-    return ops
+        return out
+
+    value = _coerce(node, raw, param_id)
+    return [
+        PlanOp(
+            node.binding,
+            value,
+            cost=node.cost or COST_L1,
+            param_id=param_id,
+            depends_on=depends,
+        )
+    ]
 
 
 def _dependencies(node: Node, index: dict[str, Node]) -> list[str]:
@@ -224,11 +264,21 @@ def _coerce_vector(node: VectorNode, raw: Any, param_id: str) -> list[float]:
     return _coerce_color(raw, param_id, components=len(node.axes))
 
 
-def _coerce_ramp(node: RampNode, raw: Any, param_id: str) -> list[dict[str, Any]]:
-    """复合色带：**整体校验**（长度、逐项位置与颜色），任一不合法即整份拒绝。"""
+def _coerce_ramp(
+    node: RampNode, raw: Any, param_id: str
+) -> tuple[list[dict[str, Any]], str | None]:
+    """复合色带：**整体校验**（长度、逐项位置与颜色、插值枚举），任一不合法即整份拒绝。
+
+    接受两种形态：
+
+    * ``{"elements": [...], "interpolation": "CONSTANT"}`` —— 规范形态；
+    * ``[...]`` —— 只给色标，插值沿用基线（兼容简写）。
+    """
+    interpolation: Any = None
     if isinstance(raw, dict):
-        # 兼容 {"elements": [...]} 形式：只取 elements，interpolation 是独立参数
+        interpolation = raw.get("interpolation")
         raw = raw.get("elements")
+
     elements = normalise_ramp_elements(raw)
     if node.element_count_baseline is not None and len(elements) != node.element_count_baseline:
         # 决策 3：数量变化属结构改动，本执行器不做结构改写
@@ -241,15 +291,37 @@ def _coerce_ramp(node: RampNode, raw: Any, param_id: str) -> list[dict[str, Any]
             received=len(elements),
             baseline=node.element_count_baseline,
         )
-    return elements
+
+    if interpolation is None:
+        return elements, None
+    if not isinstance(interpolation, str):
+        raise _fail(
+            errors.PARAM_INVALID, f"{param_id} 的插值必须是字符串。", parameter=param_id
+        )
+    allowed = [option["value"] for option in node.interpolation_options]
+    if allowed and interpolation not in allowed:
+        raise _fail(
+            errors.PARAM_INVALID,
+            f"{param_id} 的插值 {interpolation!r} 不在允许取值内：{allowed}",
+            parameter=param_id,
+            allowed=allowed,
+        )
+    return elements, interpolation
 
 
 def baseline_values(nodes: list[Node]) -> dict[str, Any]:
-    """从 schema 节点提取基线值（供调用方构造完整草稿）。"""
+    """从 schema 节点提取基线值（供调用方构造完整草稿）。
+
+    探测失败 / 降级只读的节点**不进基线值**：它们没有可信的当前取值，
+    放进去只会让「完整草稿」里多出一条来历不明的写入。
+    """
     out: dict[str, Any] = {}
     for node in flatten(nodes).values():
+        if not (node.supported and node.editable):
+            continue
         if isinstance(node, RampNode):
-            out[node.id] = node.element_values()
+            if node.elements:
+                out[node.id] = node.element_values()
         elif isinstance(node, EnumNode):
             out[node.id] = node.baseline
         elif isinstance(node, ColorNode):

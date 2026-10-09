@@ -206,11 +206,30 @@ def test_multiple_ramps_are_ambiguous_and_degrade() -> None:
 
 
 def test_emission_socket_detected_with_candidate_and_structure() -> None:
+    """探到了就照实报告（``supported: true``），但**在真实拓扑确认前一律只读**。
+
+    这里刻意区分「探到」与「可写」：候选名 + 结构验证只能证明「像」Emission 强度，
+    不能证明它就是。真实 socket 名由真机 ``/api/diagnostics/describe`` 输出校准。
+    """
     nodes = build_nodes(emission_socket="Strength", emission_node_type="EMISSION")
     node = find(nodes, "cel.Cel_Skin.emission_strength")
     assert node.supported is True
-    assert node.editable is True
     assert node.value == pytest.approx(1.5)
+    assert node.editable is False
+    assert node.readonly_reason == schemamod.REASON_UNCONFIRMED_CAPABILITY
+
+
+def test_emission_has_no_writable_binding() -> None:
+    """只读能力**不得带可写 binding** —— 否则「只读」只是一句文案。
+
+    提交 2 里这里曾绑定到 ``NODE_GROUP.mute``（构造上白名单通过、语义完全错误）：
+    探测到 Emission 强度后写下去会去 mute 整个节点。这条用例钉住这个回归。
+    """
+    node = find(build_nodes(emission_socket="Strength"), "cel.Cel_Skin.emission_strength")
+    assert node.binding is None
+    with pytest.raises(errors.ToonTunerError) as excinfo:
+        surface.validate_draft({"cel.Cel_Skin.emission_strength": 2.0}, build_nodes())
+    assert excinfo.value.code == errors.NOT_EDITABLE
 
 
 def test_emission_accepts_alternative_candidate_name() -> None:
@@ -346,9 +365,11 @@ def test_draft_rejects_write_to_readonly_display_node() -> None:
 # -- 执行器：整体写入 ------------------------------------------------------
 
 
-def fake_with_cel(elements: int = 3, *, name: str = "Cel_Skin") -> FakeBpy:
+def fake_with_cel(
+    elements: int = 3, *, name: str = "Cel_Skin", interpolation: str = "LINEAR"
+) -> FakeBpy:
     fake = FakeBpy()
-    fake.add_cel_group(name, element_count=elements)
+    fake.add_cel_group(name, element_count=elements, interpolation=interpolation)
     return fake
 
 
@@ -568,6 +589,92 @@ def test_executor_orders_by_cost_layer() -> None:
 def test_max_cost_reports_highest_layer() -> None:
     nodes = build_nodes()
     assert surface.max_cost(nodes) in schemamod.COSTS
+
+
+def test_group_cost_follows_children_not_always_l3() -> None:
+    """分组层级 = 子树最高层级。
+
+    整组恒标 L3 会让 ``max_cost()`` 永远返回 L3，调度器就会把「调一个色标」当成
+    结构性操作。色标**数量**才是结构信息，它已由 ``element_count`` 单独声明为只读。
+    """
+    nodes = build_nodes()
+    assert nodes[0].cost == schemamod.COST_L1
+    assert surface.max_cost(nodes) == schemamod.COST_L1
+
+
+# -- 草稿：降级节点与复合色带 ----------------------------------------------
+
+
+def test_degraded_nodes_stay_out_of_baseline_and_full_draft() -> None:
+    """降级节点不进基线值，也不会因为「不在草稿里」而被当成错误。
+
+    完整草稿 = 基线 + 草稿。若降级节点的空基线被塞进完整草稿，每次预览都会
+    在服务端自己抛 ``UNSUPPORTED_PARAM`` —— 一个探不到的组会让整台工具不可用。
+    """
+    nodes = build_nodes(exists=False)
+    assert surface.baseline_values(nodes) == {}
+    assert surface.validate_draft({}, nodes) == []
+
+
+def test_ramp_draft_compiles_interpolation_as_second_op() -> None:
+    nodes = build_nodes(elements=3)
+    draft = {"cel.Cel_Skin.ramp": {"elements": _elements(3), "interpolation": "EASE"}}
+    ops = surface.validate_draft(draft, nodes)
+    by_param = {op.param_id: op for op in ops}
+    assert set(by_param) == {"cel.Cel_Skin.ramp", "cel.Cel_Skin.ramp.interpolation"}
+    interp = by_param["cel.Cel_Skin.ramp.interpolation"]
+    assert interp.value == "EASE"
+    assert interp.binding.field == "interpolation"
+    # 两条操作指向同一个色带 datablock（整体写入、整体回滚）
+    assert interp.binding.object_id == by_param["cel.Cel_Skin.ramp"].binding.object_id
+
+
+def test_ramp_draft_without_interpolation_keeps_baseline() -> None:
+    nodes = build_nodes(elements=3, interpolation="CONSTANT")
+    ops = surface.validate_draft({"cel.Cel_Skin.ramp": _elements(3)}, nodes)
+    interp = [op for op in ops if op.param_id.endswith(".interpolation")][0]
+    assert interp.value == "CONSTANT"
+
+
+def test_ramp_draft_rejects_unknown_interpolation() -> None:
+    nodes = build_nodes(elements=3)
+    with pytest.raises(errors.ToonTunerError) as excinfo:
+        surface.validate_draft(
+            {"cel.Cel_Skin.ramp": {"elements": _elements(3), "interpolation": "NOT_A_MODE"}},
+            nodes,
+        )
+    assert excinfo.value.code == errors.PARAM_INVALID
+
+
+def test_executor_writes_ramp_and_interpolation_in_one_plan() -> None:
+    fake = fake_with_cel(3, interpolation="LINEAR")
+    nodes = build_nodes(elements=3, interpolation="CONSTANT")
+    ops = surface.validate_draft(
+        {"cel.Cel_Skin.ramp": {"elements": _elements(3), "interpolation": "CONSTANT"}}, nodes
+    )
+    payload = run_apply(ops, fake)
+    assert payload["applied"] is True, payload.get("failure")
+    ramp = fake.node_groups["Cel_Skin"].nodes.get("ColorRamp").color_ramp
+    assert ramp.interpolation == "CONSTANT"
+    ok, mismatches = execmod.verify_ops(ops, payload["values"])
+    assert ok, mismatches
+
+
+def test_verify_ops_detects_readback_drift() -> None:
+    fake = fake_with_cel(3)
+    nodes = build_nodes(elements=3)
+    ops = surface.validate_draft({"cel.Cel_Skin.ramp": _elements(3)}, nodes)
+    payload = run_apply(ops, fake)
+    values = dict(payload["values"])
+
+    key = ops[0].binding.key()
+    drifted = [dict(item) for item in values[key]]
+    drifted[0] = {"position": 0.99, "color": [0.0, 0.0, 0.0, 1.0]}
+    values[key] = drifted
+
+    ok, mismatches = execmod.verify_ops([ops[0]], values)
+    assert ok is False
+    assert mismatches and mismatches[0]["id"] == "cel.Cel_Skin.ramp"
 
 
 def test_extract_json_rejects_garbage() -> None:
