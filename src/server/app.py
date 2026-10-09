@@ -15,6 +15,13 @@
 * ``POST /api/preview``            提交草稿 + 取景方式，产出预览任务
 * ``GET  /api/jobs/{id}``          任务状态
 * ``GET  /api/preview/{id}``       预览图（HTTP 端点，不暴露本机路径）
+* ``GET  /api/presets``            本地预设列表 + 运行设置白名单
+* ``GET  /api/presets/{id}``       读取单个预设
+* ``POST /api/presets``            新建预设
+* ``PUT  /api/presets/{id}``       覆盖保存预设（身份与创建时间保留）
+* ``POST /api/presets/{id}/rename``      重命名（身份不变）
+* ``POST /api/presets/{id}/duplicate``   复制为新预设
+* ``DELETE /api/presets/{id}``     删除预设
 
 安全边界：
 * 只监听 127.0.0.1（见 config 回环校验）。
@@ -22,6 +29,8 @@
 * 自动取景只用**临时预览相机**，绝不改动用户相机；渲染后必定恢复 ``scene.camera``。
 * look 是依赖 ``view_transform`` 的枚举：后端在**下发脚本前**完成依赖校验，
   非法组合返回稳定错误 ``INVALID_DEPENDENT_ENUM``，不退化成 ``BLENDER_SCRIPT_ERROR``。
+* 预设存在 ``%LOCALAPPDATA%`` 下（不进仓库），写入前扫描并**拒绝**任何本机路径、
+  模型/贴图路径与凭据；接口只回可展示位置，不回本机绝对路径。
 """
 
 from __future__ import annotations
@@ -38,7 +47,15 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import SERVICE_NAME, __version__, errors, framing as framing_module, params as params_module, scene_probe
+from . import (
+    SERVICE_NAME,
+    __version__,
+    errors,
+    framing as framing_module,
+    params as params_module,
+    presets as presets_module,
+    scene_probe,
+)
 from .binder import BlenderBinder, preview_dir, preview_png_name
 from .blender_mcp import BlenderMCPClient
 from .config import AppConfig, ConfigError, load_config
@@ -52,11 +69,18 @@ from .models import (
     HealthResponse,
     JobResponse,
     ParamSchemaResponse,
+    PresetDeleteResponse,
+    PresetDetailResponse,
+    PresetDuplicateRequest,
+    PresetListResponse,
+    PresetRenameRequest,
+    PresetSaveRequest,
     PreviewSubmitRequest,
     PreviewSubmitResponse,
     RestoreResponse,
     SceneResponse,
 )
+from .presets import PresetStore
 from .redact import redact
 from .session import PreviewService, preview_url_for
 
@@ -149,11 +173,19 @@ class BlenderGateway:
         return await self.status()
 
 
-def create_app(config: AppConfig | None = None) -> FastAPI:
+def _preset_public(preset: dict[str, Any]) -> dict[str, Any]:
+    """预设的对外形状：摘要 + 逐参数明细（字段名与存储格式一致）。"""
+    return {**presets_module.summary_of(preset), "parameters": dict(preset.get("parameters") or {})}
+
+
+def create_app(
+    config: AppConfig | None = None, *, preset_store: PresetStore | None = None
+) -> FastAPI:
     cfg = config or load_config()
     gateway = BlenderGateway(cfg)
     binder = BlenderBinder(cfg.blender_mcp)
     preview = PreviewService(binder)
+    store = preset_store or PresetStore()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -172,6 +204,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     app.state.config = cfg
     app.state.gateway = gateway
     app.state.preview = preview
+    app.state.presets = store
 
     # -- 全局异常处理：把内部异常统一成稳定错误码 -------------------------
     @app.exception_handler(errors.ToonTunerError)
@@ -357,6 +390,84 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 errors.PREVIEW_FAILED, "预览图文件已不存在，请重新提交预览。"
             )
         return FileResponse(path, media_type="image/png", filename=path.name)
+
+    # -- MVP-03：本地预设 -------------------------------------------------
+    @app.get("/api/presets", response_model=PresetListResponse, tags=["presets"])
+    async def list_presets() -> dict[str, Any]:
+        """列出本地预设。
+
+        预设存放在用户目录（``%LOCALAPPDATA%\\CartoonModelShader\\presets``），
+        **不进仓库**，也不把浏览器 ``localStorage`` 当唯一存储。
+        读不动的文件不会被静默忽略，而是进 ``skipped`` 并附错误码与原因。
+        """
+        payload = await asyncio.to_thread(store.list)
+        return {"ok": True, **payload}
+
+    @app.get(
+        "/api/presets/{preset_id}",
+        response_model=PresetDetailResponse,
+        responses={404: {"model": ErrorResponse}},
+        tags=["presets"],
+    )
+    async def read_preset(preset_id: str) -> dict[str, Any]:
+        preset = await asyncio.to_thread(store.get, preset_id)
+        return {"ok": True, "preset": _preset_public(preset)}
+
+    @app.post(
+        "/api/presets",
+        response_model=PresetDetailResponse,
+        status_code=201,
+        responses={400: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+        tags=["presets"],
+    )
+    async def create_preset(body: PresetSaveRequest) -> dict[str, Any]:
+        preset = await asyncio.to_thread(store.save, body.model_dump(by_alias=True))
+        return {"ok": True, "preset": _preset_public(preset)}
+
+    @app.put(
+        "/api/presets/{preset_id}",
+        response_model=PresetDetailResponse,
+        responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+        tags=["presets"],
+    )
+    async def update_preset(preset_id: str, body: PresetSaveRequest) -> dict[str, Any]:
+        """覆盖保存：``preset_id`` 与 ``created_at`` 由服务端保留，客户端改不动。"""
+        preset = await asyncio.to_thread(
+            store.save, body.model_dump(by_alias=True), preset_id=preset_id
+        )
+        return {"ok": True, "preset": _preset_public(preset)}
+
+    @app.post(
+        "/api/presets/{preset_id}/rename",
+        response_model=PresetDetailResponse,
+        responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+        tags=["presets"],
+    )
+    async def rename_preset(preset_id: str, body: PresetRenameRequest) -> dict[str, Any]:
+        """重命名：**身份不变**，前端已有的引用不会失效。"""
+        preset = await asyncio.to_thread(store.rename, preset_id, body.name)
+        return {"ok": True, "preset": _preset_public(preset)}
+
+    @app.post(
+        "/api/presets/{preset_id}/duplicate",
+        response_model=PresetDetailResponse,
+        status_code=201,
+        responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+        tags=["presets"],
+    )
+    async def duplicate_preset(preset_id: str, body: PresetDuplicateRequest) -> dict[str, Any]:
+        preset = await asyncio.to_thread(store.duplicate, preset_id, body.name)
+        return {"ok": True, "preset": _preset_public(preset)}
+
+    @app.delete(
+        "/api/presets/{preset_id}",
+        response_model=PresetDeleteResponse,
+        responses={404: {"model": ErrorResponse}},
+        tags=["presets"],
+    )
+    async def delete_preset(preset_id: str) -> dict[str, Any]:
+        deleted = await asyncio.to_thread(store.delete, preset_id)
+        return {"ok": True, "deleted": deleted}
 
     # -- 静态页面 ---------------------------------------------------------
     index_file = WEB_DIR / "index.html"

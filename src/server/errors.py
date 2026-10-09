@@ -27,6 +27,13 @@ INVALID_DEPENDENT_ENUM = "INVALID_DEPENDENT_ENUM"
 FRAMING_STALE = "FRAMING_STALE"
 FRAMING_UNAVAILABLE = "FRAMING_UNAVAILABLE"
 
+# MVP-03 预设
+PRESET_NOT_FOUND = "PRESET_NOT_FOUND"
+PRESET_INVALID = "PRESET_INVALID"
+PRESET_SCHEMA_UNSUPPORTED = "PRESET_SCHEMA_UNSUPPORTED"
+PRESET_NAME_CONFLICT = "PRESET_NAME_CONFLICT"
+PRESET_STORAGE_ERROR = "PRESET_STORAGE_ERROR"
+
 #: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，
 #: 便于调用方直接读到 ``parameter`` / ``value`` / ``depends_on`` / ``allowed``。
 _FLATTEN_DETAILS_CODES = frozenset({INVALID_DEPENDENT_ENUM})
@@ -103,6 +110,33 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         409,
         True,
         "无法自动取景：请确认场景里有可见的角色网格（已排除刚体代理与描边壳）以及一台活动相机。",
+    ),
+    PRESET_NOT_FOUND: (
+        404,
+        False,
+        "预设不存在或已被删除。请刷新预设列表后重试。",
+    ),
+    PRESET_INVALID: (
+        400,
+        False,
+        "预设内容不合法：可能含未知参数、越界取值，或包含禁止保存的本机路径/凭据。"
+        "请检查该预设后重试。",
+    ),
+    PRESET_SCHEMA_UNSUPPORTED: (
+        400,
+        False,
+        "预设的 schema 版本不被支持。为避免静默改变取值，这里不会自动迁移；"
+        "请用对应版本的工具打开后另存为新预设。",
+    ),
+    PRESET_NAME_CONFLICT: (
+        409,
+        False,
+        "已存在同名预设（名称不区分大小写）。请换一个名字，或先重命名原有预设。",
+    ),
+    PRESET_STORAGE_ERROR: (
+        500,
+        True,
+        "预设目录读写失败。请确认本地磁盘可写、目录未被其它程序占用，然后重试。",
     ),
 }
 
