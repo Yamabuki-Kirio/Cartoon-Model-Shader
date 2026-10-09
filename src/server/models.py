@@ -94,8 +94,11 @@ class ParamSpecModel(BaseModel):
     minimum: float | None = None
     maximum: float | None = None
     step: float | None = None
-    options: list[str] | None = None
+    #: 枚举项一律 ``{"value": <Blender 真实 identifier>, "label": <显示文本>}``
+    options: list[dict[str, str]] | None = None
     options_dynamic: bool | None = None
+    #: 本参数合法取值所依赖的参数 id（例：color.look 依赖 color.view_transform）
+    depends_on: str | None = None
 
 
 class ParamGroup(BaseModel):
@@ -123,10 +126,12 @@ class BaselineResponse(BaseModel):
     blender: str
     glare_present: bool
     values: dict[str, Any]
-    options: dict[str, list[str]] = Field(default_factory=dict)
+    options: dict[str, list[Any]] = Field(default_factory=dict)
     render: dict[str, Any] = Field(default_factory=dict)
     #: 建立基线时锁定的取景快照（帧 / 相机 / transform / lens / shift / 角色包围盒）
     framing: dict[str, Any] = Field(default_factory=dict)
+    #: ``view_transform`` -> ``[{value, label}]``：Blender 真实接受的 look 档位
+    look_map: dict[str, list[dict[str, str]]] = Field(default_factory=dict)
     preview_resolution: list[int] = Field(default_factory=list)
     job_id: str | None = None
     job_status: str | None = None
@@ -139,6 +144,30 @@ class RestoreResponse(BaseModel):
     verified: bool
     mismatches: list[dict[str, Any]] = Field(default_factory=list)
     readback: dict[str, Any]
+    #: 恢复过程中发生的依赖迁移（例：look 因视图变换变化而被规范化）
+    normalized: list[dict[str, Any]] = Field(default_factory=list)
+
+
+# -- 依赖枚举（view_transform -> look） -------------------------------------
+
+
+class ColorLookOption(BaseModel):
+    value: str
+    label: str
+
+
+class ColorLooksResponse(BaseModel):
+    """``/api/color/looks``：某个视图变换下 Blender **真正接受**的 look 档位。"""
+
+    ok: Literal[True] = True
+    protocol: str = "toon-tuner-color-looks/1"
+    source: str = "baseline"
+    current_view_transform: str | None = None
+    view_transform: str | None = None
+    options: list[ColorLookOption] = Field(default_factory=list)
+    look_map: dict[str, list[ColorLookOption]] = Field(default_factory=dict)
+    probe: dict[str, Any] | None = None
+    restored: dict[str, Any] | None = None
 
 
 # -- 取景（framing） --------------------------------------------------------

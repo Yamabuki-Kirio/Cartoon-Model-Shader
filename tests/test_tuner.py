@@ -66,9 +66,15 @@ def test_set_code_cannot_inject_code_through_values() -> None:
     code = build_set_code({"color.view_transform": evil})
     # 关卡一：evil 只以 repr 字面量形式出现在生成的代码里，注入语句不构成独立代码行
     assert "os.system('echo pwned')" not in code.replace(repr(evil), "")
-    # 关卡二：真实执行后只是把整串赋给了字符串属性，未执行任何注入语句
+    # 关卡二：真实执行后整串只是一个**字符串字面量**，没有执行任何注入语句。
+    # 桩现在像 Blender 一样校验枚举，因此整串被当作一个非法值拒绝 ——
+    # 既没注入成功，也没留下半应用状态。
     payload = extract_marker(run_generated_code(code, fake), JSON_MARKER)
-    assert payload["view"]["view_transform"] == evil
+    assert payload["applied"] is False
+    assert payload["failure"]["kind"] == "write_failed"
+    assert payload["failure"]["stage"] == "view_transform"
+    assert payload["restore_ok"] is True
+    assert fake.view_settings.view_transform == payload["snapshot"]["view_transform"]
 
 
 def test_render_code_writes_png_and_restores_resolution(tmp_path) -> None:
@@ -139,8 +145,10 @@ def test_session_baseline_preview_and_rollback() -> None:
             try:
                 baseline = await service.capture_baseline()
                 assert baseline["values"]["color.exposure"] == 0.0
-                # 桩环境没有 OCIO，候选项应回退到 params 的静态列表
-                assert "AgX" in baseline["options"]["view.view_transform"]
+                # 枚举项一律是 {value, label}：写进 Blender 的只能是 value
+                view_options = baseline["options"]["view.view_transform"]
+                assert any(opt["value"] == "AgX" for opt in view_options)
+                assert all(set(opt) == {"value", "label"} for opt in view_options)
 
                 job = await service.submit({"color.exposure": 1.5})
                 finished = await _wait(service, job.job_id)()
@@ -331,5 +339,10 @@ def test_glow_enum_params_stay_strings() -> None:
 def test_missing_glare_node_reports_clear_error() -> None:
     fake = FakeBpy()
     fake.node_groups.pop("AI_Compositor")
-    with pytest.raises(RuntimeError, match="Autocel_Glow"):
-        run_generated_code(build_set_code({"glow.threshold": 1.0}), fake)
+    payload = extract_marker(run_generated_code(build_set_code({"glow.threshold": 1.0}), fake), JSON_MARKER)
+    assert payload["applied"] is False
+    assert payload["failure"]["kind"] == "write_failed"
+    assert payload["failure"]["stage"] == "others"
+    assert "Autocel_Glow" in payload["failure"]["message"]
+    # 原子性：辉光写失败也不留半应用状态
+    assert payload["restore_ok"] is True

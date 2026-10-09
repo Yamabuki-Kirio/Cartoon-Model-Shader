@@ -24,7 +24,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import errors, framing as framing_module, params
+from . import color_looks, errors, framing as framing_module, params
 from .binder import PREVIEW_FALLBACK_RESOLUTION, BlenderBinder, preview_resolution_for
 
 #: 保留的历史任务上限（防止长时间运行内存无界增长）
@@ -87,14 +87,22 @@ class Baseline:
     blender: str
     glare_present: bool
     values: dict[str, Any]
-    options: dict[str, list[str]]
+    options: dict[str, list[Any]]
     render: dict[str, Any]
     #: 建立基线时的取景快照（帧 / 相机 / transform / lens / shift / 角色包围盒）
     framing: dict[str, Any] = field(default_factory=dict)
+    #: ``view_transform`` -> ``[{value, label}]``：Blender 真实接受的 look 档位。
+    #: look 是**依赖枚举**，不查这张表就写值必然踩 enum not found。
+    look_map: dict[str, list[dict[str, str]]] = field(default_factory=dict)
 
     @property
     def preview_resolution(self) -> tuple[int, int, int]:
         return preview_resolution_for(self.render)
+
+    @property
+    def view_transform(self) -> str | None:
+        value = self.values.get("color.view_transform")
+        return str(value) if value is not None else None
 
 
 @dataclass
@@ -107,6 +115,8 @@ class Job:
     requested: dict[str, Any]
     effective: dict[str, Any]
     framing: dict[str, Any] = field(default_factory=dict)
+    #: 调用方**原样**提交的草稿（未经规范化），用于 run/preset 的 configured_value
+    raw_requested: dict[str, Any] = field(default_factory=dict)
     superseded: bool = False
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
@@ -146,29 +156,54 @@ def values_from_read(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _options_from_read(payload: dict[str, Any]) -> dict[str, list[str]]:
+def _options_from_read(
+    payload: dict[str, Any],
+    look_map: dict[str, list[dict[str, str]]] | None = None,
+    view_transform: str | None = None,
+) -> dict[str, list[Any]]:
+    """把只读回读里的动态枚举候选整理成 ``binding -> [{value,label}]``。
+
+    ``view.look`` 不取只读回读（那里没有它），而是取**按当前视图探测出的能力表**：
+    OCIO 的全局 ``getLookNames()`` 会给出当前视图并不接受的名字，不能用。
+    """
     raw = payload.get("view_options") or {}
-    options: dict[str, list[str]] = {}
+    options: dict[str, list[Any]] = {}
     for spec in params.ALL_PARAMS:
         if not spec.options_dynamic:
             continue
+        if spec.binding == "view.look":
+            mapped = list((look_map or {}).get(view_transform or "") or [])
+            options[spec.binding] = mapped or [
+                {"value": value, "label": value} for value in spec.options
+            ]
+            continue
         values = raw.get(spec.binding) or []
-        options[spec.binding] = [str(v) for v in values] if values else list(spec.options)
+        options[spec.binding] = (
+            [{"value": str(v), "label": str(v)} for v in values]
+            if values
+            else [{"value": str(v), "label": str(v)} for v in spec.options]
+        )
     return options
 
 
 def baseline_from_payload(
-    payload: dict[str, Any], framing_snapshot: dict[str, Any] | None = None
+    payload: dict[str, Any],
+    framing_snapshot: dict[str, Any] | None = None,
+    look_map: dict[str, list[dict[str, str]]] | None = None,
 ) -> Baseline:
+    values = values_from_read(payload)
+    view_transform = values.get("color.view_transform")
+    view_transform = str(view_transform) if view_transform is not None else None
     return Baseline(
         baseline_id=uuid.uuid4().hex[:12],
         captured_at=_now_iso(),
         blender=str(payload.get("blender", "")),
         glare_present=bool(payload.get("glare_present")),
-        values=values_from_read(payload),
-        options=_options_from_read(payload),
+        values=values,
+        options=_options_from_read(payload, look_map, view_transform),
         render=payload.get("render") or {},
         framing=framing_snapshot or {},
+        look_map=dict(look_map or {}),
     )
 
 
@@ -216,25 +251,37 @@ class PreviewService:
             "blender": b.blender,
             "glare_present": b.glare_present,
             "values": dict(b.values),
-            "options": {k: list(v) for k, v in b.options.items()},
+            "options": {k: _deep_copy(v) for k, v in b.options.items()},
             "render": dict(b.render),
             "framing": _deep_copy(b.framing),
+            "look_map": _deep_copy(b.look_map),
             "preview_resolution": list(b.preview_resolution),
         }
 
     async def capture_baseline(self) -> dict[str, Any]:
-        """采集内存基线：曝光/辉光现值 + 非破坏性的取景快照。
+        """采集内存基线：曝光/辉光现值 + 取景快照 + look 依赖枚举能力表。
 
-        取景快照包含 ``frame_current`` / ``scene.camera`` / 相机 transform /
-        ``lens`` / ``shift_x`` / ``shift_y`` / 角色世界变换与包围盒。之后任何一次
-        预览提交都会与它比对，帧或相机被外部改动即判为失效。
+        * 取景快照包含 ``frame_current`` / ``scene.camera`` / 相机 transform /
+          ``lens`` / ``shift_x`` / ``shift_y`` / 角色世界变换与包围盒。
+        * look 能力表是 **``view_transform`` -> 合法 look 档位** 的完整映射，
+          由只读探针一次扫出（Blender 侧在 ``finally`` 恢复原状态）。
+          有了它，前端切换视图变换时无需再问 Blender，后端也能在**下发脚本前**
+          就判定 look 是否合法。
         """
-        payload = await self._call(self._binder.read_exposure)
-        context = await self._call(self._binder.read_framing)
-        baseline = baseline_from_payload(payload, framing_module.baseline_snapshot(context))
+        baseline = await self._capture()
         async with self._state_lock:
             self._baseline = baseline
         return self.baseline_public() or {}
+
+    async def _capture(self) -> Baseline:
+        payload = await self._call(self._binder.read_exposure)
+        context = await self._call(self._binder.read_framing)
+        capability = await self._call(self._binder.read_look_capability)
+        return baseline_from_payload(
+            payload,
+            framing_module.baseline_snapshot(context),
+            capability.get("looks") or {},
+        )
 
     async def read_framing_context(self) -> dict[str, Any]:
         """读取当前取景上下文，并附带与基线的比对结论。"""
@@ -259,9 +306,72 @@ class PreviewService:
         async with self._state_lock:
             if self._baseline is not None:
                 return self._baseline
-        payload = await self._call(self._binder.read_exposure)
-        context = await self._call(self._binder.read_framing)
-        return baseline_from_payload(payload, framing_module.baseline_snapshot(context))
+        return await self._capture()
+
+    async def read_look_capability(
+        self, view_transform: str | None = None, identifier: str | None = None
+    ) -> dict[str, Any]:
+        """look 能力查询。
+
+        * 基线里已有完整映射时直接返回（**零 Blender 调用**）；
+        * 指定了 ``view_transform`` 且映射里没有它（或要校验某个 ``identifier``），
+          才跑单视图只读探针 —— 探针在 ``finally`` 恢复原状态。
+        """
+        baseline = self._baseline
+        look_map: dict[str, list[dict[str, str]]] = dict(baseline.look_map) if baseline is not None else {}
+        current = baseline.view_transform if baseline is not None else None
+        probed: dict[str, Any] | None = None
+
+        if view_transform and (identifier is not None or view_transform not in look_map):
+            probed = await self._call(self._binder.probe_look_for, view_transform, identifier)
+            capability = color_looks.describe_capability(probed)
+            if capability["options"]:
+                look_map[view_transform] = capability["options"]
+
+        target = view_transform or current
+        return {
+            "source": "probe" if probed is not None else ("baseline" if baseline is not None else "empty"),
+            "current_view_transform": current,
+            "view_transform": target,
+            "options": list(look_map.get(target or "") or []),
+            "probe": (probed or {}).get("probe"),
+            "restored": (probed or {}).get("restored"),
+            "look_map": look_map,
+        }
+
+    async def refresh_look_capability(self) -> dict[str, Any]:
+        """重新扫描 look 能力表（用户换了 OCIO 配置时用），并回写进基线。
+
+        只改**能力表**，不碰工程里的任何取值。
+        """
+        capability = await self._call(self._binder.read_look_capability)
+        look_map = capability.get("looks") or {}
+        async with self._state_lock:
+            if self._baseline is not None and look_map:
+                self._baseline.look_map = dict(look_map)
+                current = self._baseline.view_transform or ""
+                mapped = list(look_map.get(current) or [])
+                if mapped:
+                    self._baseline.options["view.look"] = mapped
+        return await self.read_look_capability()
+
+    async def restore_baseline(self) -> dict[str, Any]:
+        baseline = await self._ensure_baseline()
+        async with self._state_lock:
+            self._baseline = baseline
+        # 恢复基线也要走**同一套映射逻辑**，不能盲目回写旧字符串：
+        # 若 OCIO 配置或视图变换已变，旧 look 可能不再合法。
+        values, notes = _normalize_values(baseline.values, baseline.look_map)
+        readback = await self._call(self._binder.apply_values, values)
+        verified, mismatches = _verify(baseline.values, readback)
+        return {
+            "ok": True,
+            "baseline_id": baseline.baseline_id,
+            "verified": verified,
+            "mismatches": mismatches,
+            "readback": values_from_read(readback),
+            "normalized": notes,
+        }
 
     async def _assert_framing_fresh(self) -> None:
         """提交前的取景闸门：帧 / 相机被外部改动时拒绝预览。
@@ -282,20 +392,6 @@ class PreviewService:
                 details={"reasons": verdict["reasons"], "warnings": verdict["warnings"]},
             )
 
-    async def restore_baseline(self) -> dict[str, Any]:
-        baseline = await self._ensure_baseline()
-        async with self._state_lock:
-            self._baseline = baseline
-        readback = await self._call(self._binder.apply_values, dict(baseline.values))
-        verified, mismatches = _verify(baseline.values, readback)
-        return {
-            "ok": True,
-            "baseline_id": baseline.baseline_id,
-            "verified": verified,
-            "mismatches": mismatches,
-            "readback": values_from_read(readback),
-        }
-
     # -- 任务 ------------------------------------------------------------
     async def submit(
         self, draft: dict[str, Any], framing_options: dict[str, Any] | None = None
@@ -314,8 +410,9 @@ class PreviewService:
             if baseline is None:  # pragma: no cover - 与上面同锁，仅防御
                 raise errors.ToonTunerError(errors.NO_BASELINE, "尚未建立内存基线，无法预览。")
             coerced = _validate_draft(draft, baseline)
-            effective = dict(baseline.values)
-            effective.update(coerced)
+            effective, notes = _normalize_values(
+                {**baseline.values, **coerced}, baseline.look_map
+            )
 
             self._seq += 1
             now = _now_iso()
@@ -328,7 +425,10 @@ class PreviewService:
                 requested=coerced,
                 effective=effective,
                 framing=dict(options),
+                raw_requested=dict(draft),
             )
+            for note in notes:
+                job.steps.append(f"依赖迁移：{note['parameter']} {note['from']!r} -> {note['to']!r}")
             self._jobs[job.job_id] = job
             for other in (self._pending, self._current):
                 if other is None or other.status not in (JOB_QUEUED, JOB_RUNNING):
@@ -389,7 +489,9 @@ class PreviewService:
                 self._baseline = baseline
 
             job.steps.append("恢复基线")
-            await self._call(self._binder.apply_values, dict(baseline.values))
+            # 恢复也走同一套依赖映射（不能盲目回写旧字符串）
+            restore_values, _ = _normalize_values(dict(baseline.values), baseline.look_map)
+            await self._call(self._binder.apply_values, restore_values)
             if self._is_superseded(job):
                 return self._finish(job, JOB_SUPERSEDED, note="恢复基线后被取代")
 
@@ -414,7 +516,8 @@ class PreviewService:
                 return self._finish(job, JOB_SUPERSEDED, note="渲染完成后被取代")
 
             job.steps.append("恢复基线并校验")
-            readback = await self._call(self._binder.apply_values, dict(baseline.values))
+            final_values, _ = _normalize_values(dict(baseline.values), baseline.look_map)
+            readback = await self._call(self._binder.apply_values, final_values)
             verified, mismatches = _verify(baseline.values, readback)
 
             result = {
@@ -426,6 +529,9 @@ class PreviewService:
                 "baseline_id": baseline.baseline_id,
                 "restore_verified": verified,
                 "restore_mismatches": mismatches,
+                # configured / effective / display_label 分开保存（需求 9）
+                "parameters": _parameter_records(baseline, job, applied),
+                "view_transform": baseline.view_transform,
                 "framing": _render_framing_summary(render, job.framing),
             }
             self._finish(job, JOB_DONE, result=result)
@@ -471,7 +577,28 @@ def _validate_draft(draft: Any, baseline: Baseline) -> dict[str, Any]:
             coerced[param_id] = _coerce_enum(spec, raw, baseline)
         else:  # pragma: no cover - 白名单只有两种类型
             raise errors.ToonTunerError(errors.PARAM_INVALID, f"{param_id} 类型未知。")
+
+    _assert_dependent_enums(coerced, baseline)
     return coerced
+
+
+def _assert_dependent_enums(coerced: dict[str, Any], baseline: Baseline) -> None:
+    """依赖枚举校验：**在调用 Blender 之前**完成（需求 6）。
+
+    ``color.look`` 的合法集合由 ``color.view_transform`` 决定，所以要用**本次草稿
+    生效后**的视图变换去查能力表。查不上任何等价项时抛稳定错误
+    ``INVALID_DEPENDENT_ENUM``，绝不落成通用的 ``BLENDER_SCRIPT_ERROR``。
+    """
+    for spec in params.ALL_PARAMS:
+        if not spec.depends_on or spec.id not in coerced:
+            continue
+        parent_value = coerced.get(spec.depends_on, baseline.values.get(spec.depends_on))
+        if spec.id == "color.look":
+            outcome = color_looks.validate_look(
+                coerced[spec.id], parent_value, baseline.look_map
+            )
+            # 规范化后的值才是真正要写进 Blender 的 value（label 永不直写）
+            coerced[spec.id] = outcome["value"]
 
 
 def _coerce_float(spec: params.ParamSpec, raw: Any) -> float:
@@ -494,12 +621,96 @@ def _coerce_float(spec: params.ParamSpec, raw: Any) -> float:
 def _coerce_enum(spec: params.ParamSpec, raw: Any, baseline: Baseline) -> str:
     if not isinstance(raw, str):
         raise errors.ToonTunerError(errors.PARAM_INVALID, f"{spec.id} 必须是字符串。")
+    if spec.depends_on:
+        # 依赖枚举（look）：合法集合由依赖参数决定，静态候选列表说了不算，
+        # 统一交给 color_looks.validate_look 在依赖校验阶段判。
+        return raw
     allowed = baseline.options.get(spec.binding) or list(spec.options)
-    if allowed and raw not in allowed:
-        raise errors.ToonTunerError(
-            errors.PARAM_INVALID, f"{spec.id} = {raw!r} 不在允许取值内：{allowed}"
-        )
+    if allowed:
+        values = [opt["value"] if isinstance(opt, dict) else str(opt) for opt in allowed]
+        if raw not in values:
+            raise errors.ToonTunerError(
+                errors.PARAM_INVALID, f"{spec.id} = {raw!r} 不在允许取值内：{values}"
+            )
     return raw
+
+
+def _normalize_values(
+    values: dict[str, Any], look_map: dict[str, list[dict[str, str]]] | None
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """按依赖映射把一组取值规范成「可直接写入 Blender」的形式（需求 8）。
+
+    look 依赖 ``view_transform``，所以恢复基线、应用草稿都必须走同一套规则，
+    **不能盲目回写旧字符串**。
+    """
+    out = dict(values)
+    notes: list[dict[str, Any]] = []
+    if "color.look" not in out:
+        return out, notes
+    view_transform = out.get("color.view_transform")
+    outcome = color_looks.resolve_look(out["color.look"], view_transform, look_map)
+    if outcome["ok"]:
+        if outcome["migrated"]:
+            notes.append(
+                {
+                    "parameter": "color.look",
+                    "from": out["color.look"],
+                    "to": outcome["value"],
+                    "reason": outcome["reason"],
+                    "view_transform": view_transform,
+                }
+            )
+        out["color.look"] = outcome["value"]
+        return out, notes
+    allowed = outcome.get("allowed") or []
+    fallback = color_looks.NONE_LOOK if color_looks.NONE_LOOK in allowed else (allowed[0] if allowed else None)
+    notes.append(
+        {
+            "parameter": "color.look",
+            "from": out["color.look"],
+            "to": fallback,
+            "reason": outcome["reason"],
+            "view_transform": view_transform,
+            "warning": f"look 取值在视图 {view_transform!r} 下无等价项，已回退到 {fallback!r}。",
+        }
+    )
+    out["color.look"] = fallback
+    return out, notes
+
+
+def _display_label(spec: params.ParamSpec, value: Any, look_map: dict[str, list[dict[str, str]]] | None,
+                   view_transform: Any) -> Any:
+    if spec.binding == "view.look" and isinstance(value, str):
+        return color_looks.look_label(
+            str(view_transform) if view_transform is not None else None, value
+        )
+    if isinstance(value, str):
+        return value
+    return value
+
+
+def _parameter_records(baseline: Baseline, job: Job, readback: dict[str, Any]) -> dict[str, Any]:
+    """run/preset 记录：``configured_value`` / ``effective_value`` / ``display_label`` 分开保存（需求 9）。
+
+    * ``configured_value`` —— 调用方**原样**提交的值（可能是旧预设里的显示标签）；
+    * ``effective_value``  —— 实际写进 Blender 的值（一定是真实 identifier）；
+    * ``display_label``    —— 界面上该显示成什么。
+    """
+    actual = values_from_read(readback)
+    records: dict[str, Any] = {}
+    for spec in params.ALL_PARAMS:
+        if spec.id in job.raw_requested:
+            configured = job.raw_requested[spec.id]
+        else:
+            configured = baseline.values.get(spec.id)
+        effective_value = actual.get(spec.id, job.effective.get(spec.id))
+        records[spec.id] = {
+            "configured_value": configured,
+            "effective_value": effective_value,
+            "display_label": _display_label(spec, effective_value, baseline.look_map, baseline.view_transform),
+            "migrated": configured != effective_value,
+        }
+    return records
 
 
 def _verify(expected: dict[str, Any], readback: dict[str, Any]) -> tuple[bool, list[dict[str, Any]]]:

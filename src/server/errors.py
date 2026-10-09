@@ -21,9 +21,15 @@ PARAM_INVALID = "PARAM_INVALID"
 NO_BASELINE = "NO_BASELINE"
 JOB_NOT_FOUND = "JOB_NOT_FOUND"
 PREVIEW_FAILED = "PREVIEW_FAILED"
+# 依赖枚举（view_transform → look）
+INVALID_DEPENDENT_ENUM = "INVALID_DEPENDENT_ENUM"
 # 取景（framing）
 FRAMING_STALE = "FRAMING_STALE"
 FRAMING_UNAVAILABLE = "FRAMING_UNAVAILABLE"
+
+#: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，
+#: 便于调用方直接读到 ``parameter`` / ``value`` / ``depends_on`` / ``allowed``。
+_FLATTEN_DETAILS_CODES = frozenset({INVALID_DEPENDENT_ENUM})
 
 # 错误码 -> (HTTP 状态码, 是否可重试, 面向用户的下一步建议)
 _ERROR_META: dict[str, tuple[int, bool, str]] = {
@@ -82,6 +88,12 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         True,
         "预览渲染失败。请确认 Blender 场景中存在相机与合成器节点组，然后重试。",
     ),
+    INVALID_DEPENDENT_ENUM: (
+        400,
+        False,
+        "该取值在当前「视图变换」下不合法（视图变换决定了 Look 的可选档位）。"
+        "请换一个 Look，或先把「视图变换」调回原来的取值。",
+    ),
     FRAMING_STALE: (
         409,
         True,
@@ -126,6 +138,11 @@ class ToonTunerError(Exception):
         }
         if self.details:
             error["details"] = self.details
+            # 依赖枚举类错误要求调用方能直接读到 parameter/value/depends_on/allowed，
+            # 因此额外平铺到 error 顶层（需求 6 的稳定错误形状）。
+            if self.code in _FLATTEN_DETAILS_CODES:
+                for key, value in self.details.items():
+                    error.setdefault(key, value)
         return {"ok": False, "error": error}
 
 

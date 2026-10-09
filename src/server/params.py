@@ -38,10 +38,18 @@ class ParamSpec:
     step: float | None = None
     options: tuple[str, ...] = ()
     options_dynamic: bool = False  # 可选值需从 Blender 实时读取
+    #: 本参数的合法取值**依赖**另一个参数（例：look 依赖 view_transform）。
+    #: 有依赖时必须走依赖枚举校验，不能只比对静态候选列表。
+    depends_on: str | None = None
     unit: str = ""
     note: str = ""
 
-    def to_public(self, options: list[str] | None = None) -> dict[str, Any]:
+    def to_public(self, options: list[Any] | None = None) -> dict[str, Any]:
+        """输出给前端的 schema。
+
+        枚举项一律是 ``{"value": <Blender 真实 identifier>, "label": <显示文本>}``：
+        **写进 Blender 的只能是 value**（需求 1）。静态枚举的 label 与 value 相同。
+        """
         payload: dict[str, Any] = {
             "id": self.id,
             "group": self.group,
@@ -56,9 +64,21 @@ class ParamSpec:
             payload["maximum"] = self.maximum
             payload["step"] = self.step
         else:
-            payload["options"] = list(options if options is not None else self.options)
+            raw = list(options) if options is not None else list(self.options)
+            payload["options"] = [_as_option(item) for item in raw]
             payload["options_dynamic"] = self.options_dynamic
+            payload["depends_on"] = self.depends_on
         return payload
+
+
+def _as_option(item: Any) -> dict[str, str]:
+    """把候选值统一成 ``{value, label}``。"""
+    if isinstance(item, dict):
+        value = str(item.get("value"))
+        label = item.get("label")
+        return {"value": value, "label": str(label) if label is not None else value}
+    text = str(item)
+    return {"value": text, "label": text}
 
 
 GROUP_EXPOSURE = "曝光"
@@ -118,18 +138,16 @@ EXPOSURE_PARAMS: tuple[ParamSpec, ...] = (
         target="scene.view_settings.look",
         binding="view.look",
         options_dynamic=True,
-        # 回退值（正常情况下由 OCIO 配置实时给出）
-        options=(
-            "None",
-            "AgX - Very High Contrast",
-            "AgX - High Contrast",
-            "AgX - Medium High Contrast",
-            "AgX - Base Contrast",
-            "AgX - Medium Low Contrast",
-            "AgX - Low Contrast",
-            "AgX - Very Low Contrast",
+        #: look 是**依赖 view_transform 的枚举**：同一个字符串在 AgX 下合法，
+        #: 换到 Standard 就会直接抛 enum not found。候选一律由 color_looks 的
+        #: 能力探针按当前视图给出，这里只留一个**任何视图都合法**的兜底值。
+        depends_on="color.view_transform",
+        options=("None",),
+        note=(
+            "对比度档位；降低会让二分色阶变柔，升高会让硬边更硬。"
+            "可选档位随「视图变换」变化 —— 切换视图变换后列表会立即刷新，"
+            "旧档位若有等价项会自动迁移，否则回退 None。"
         ),
-        note="对比度档位；降低会让二分色阶变柔，升高会让硬边更硬。",
     ),
 )
 
@@ -220,7 +238,7 @@ def get(param_id: str) -> ParamSpec | None:
     return BY_ID.get(param_id)
 
 
-def public_schema(options_by_binding: dict[str, list[str]] | None = None) -> dict[str, Any]:
+def public_schema(options_by_binding: dict[str, list[Any]] | None = None) -> dict[str, Any]:
     """给前端的 schema：按组聚合，附带动态枚举值的当前候选项。"""
     options_by_binding = options_by_binding or {}
     groups: dict[str, list[dict[str, Any]]] = {}

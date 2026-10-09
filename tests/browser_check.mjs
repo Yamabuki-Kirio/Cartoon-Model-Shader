@@ -14,6 +14,15 @@
  *   7. 当前相机预览 vs 临时自动取景的标识
  *   8. 「重新取景」后角色完整入画，且**用户原相机一个字段都没变**
  *   9. 用户切帧后：自动预览停止、出现「请刷新基线」，刷新后恢复
+ *  10. 依赖枚举：Look 下拉框的 value 取自 Blender 真实 identifier、
+ *      显示文本取自 label（逐项与后端能力表比对）
+ *  11. 切换视图变换后 Look 列表立即刷新，旧值按规范化名称迁移
+ *      （"AgX - High Contrast" ⇄ "High Contrast"），迁移后给出说明文案
+ *  12. 切换视图后完整草稿可正常预览，不再出现 BLENDER_SCRIPT_ERROR；
+ *      任务记录里 effective_value 是真实 identifier，且 display_label 独立保存
+ *  13. 快速连续切换视图变换后，Look 列表对应**最后一次**选择（旧结果不覆盖）
+ *  14. 非法 Look/视图组合返回 INVALID_DEPENDENT_ENUM（不退化成脚本错误），
+ *      且前端把「哪个参数 / 依赖谁 / 允许什么」摊开显示
  *
  * 用法：
  *   node tests/browser_check.mjs [baseUrl] [screenshotDir]
@@ -534,10 +543,14 @@ async function main() {
       const tick = () => {
         const box = document.getElementById("framing-stale");
         const img = document.getElementById("preview-img");
+        const text = document.getElementById("preview-status").textContent || "";
+        /* 必须等到「可开始调参」：刷新基线是异步的，captureBaseline 末尾还会
+           applyValuesToControls(基线值)。提前返回会让后一步的断言读到正在被重置的界面。 */
         const shown = box && box.classList.contains("hidden") &&
-          img && !img.classList.contains("hidden") && img.naturalWidth > 0;
-        if (shown) return resolve({ ok: true, status: document.getElementById("preview-status").textContent });
-        if (Date.now() - t0 > 120000) return resolve({ ok: false, status: document.getElementById("preview-status").textContent });
+          img && !img.classList.contains("hidden") && img.naturalWidth > 0 &&
+          text.includes("可开始调参");
+        if (shown) return resolve({ ok: true, status: text });
+        if (Date.now() - t0 > 120000) return resolve({ ok: false, status: text });
         setTimeout(tick, 150);
       };
       tick();
@@ -549,6 +562,290 @@ async function main() {
       JSON.stringify(camFinal.world) === JSON.stringify(camBefore.world) &&
       camFinal.lens === camBefore.lens &&
       JSON.stringify(camFinal.shift) === JSON.stringify(camBefore.shift), camFinal.camera);
+
+    // ================= 依赖枚举：view_transform ↔ look =====================
+    // 回归用：视图变换决定 Look 的合法档位。切换后候选必须**立即**刷新、旧值按
+    // 规范化名称迁移；写进 Blender 的只能是 value（真实 identifier）。
+    // 旧 bug：切换视图后仍提交 "AgX - High Contrast" → BLENDER_SCRIPT_ERROR。
+
+    const readLookPanel = `(() => {
+      const vt = document.getElementById("ctl-color.view_transform");
+      const look = document.getElementById("ctl-color.look");
+      if (!vt || !look) return { ok: false, reason: "未找到视图变换或 Look 控件" };
+      const control = look.closest(".control");
+      const note = control ? control.querySelector(".control-look-note") : null;
+      return {
+        ok: true,
+        viewTransform: vt.value,
+        viewOptions: Array.from(vt.options).map((o) => o.value),
+        lookValue: look.value,
+        lookText: look.selectedOptions.length ? look.selectedOptions[0].textContent : "",
+        options: Array.from(look.options).map((o) => ({ value: o.value, text: o.textContent })),
+        note: note ? note.textContent : "",
+        status: (document.getElementById("preview-status") || {}).textContent || "",
+        jobId: (String(document.getElementById("preview-img").src).match(/[?&]v=([^&]+)/) || [])[1] || null,
+      };
+    })()`;
+
+    const fetchJsonAs = (url) => evaluate(`fetch(${JSON.stringify(url)}).then((r) => r.json())`);
+    const currentJobId = async () => (await evaluate(readLookPanel)).jobId;
+
+    const setViewTransform = (value) =>
+      evaluate(`(() => {
+        const vt = document.getElementById("ctl-color.view_transform");
+        if (!vt) return { ok: false, reason: "未找到视图变换下拉框" };
+        vt.value = ${JSON.stringify(value)};
+        vt.dispatchEvent(new Event("change", { bubbles: true }));
+        return { ok: vt.value === ${JSON.stringify(value)}, value: vt.value };
+      })()`);
+
+    const setLookValue = (value) =>
+      evaluate(`(() => {
+        const look = document.getElementById("ctl-color.look");
+        if (!look) return { ok: false, reason: "未找到 Look 下拉框" };
+        look.value = ${JSON.stringify(value)};
+        look.dispatchEvent(new Event("change", { bubbles: true }));
+        return { ok: look.value === ${JSON.stringify(value)}, value: look.value };
+      })()`);
+
+    const waitLookList = (predicate) => `new Promise((resolve) => {
+      const read = () => {
+        const vt = document.getElementById("ctl-color.view_transform");
+        const look = document.getElementById("ctl-color.look");
+        return {
+          viewTransform: vt ? vt.value : null,
+          lookValue: look ? look.value : null,
+          options: look ? Array.from(look.options).map((o) => ({ value: o.value, text: o.textContent })) : [],
+        };
+      };
+      const t0 = Date.now();
+      const tick = () => {
+        const snap = read();
+        if (${predicate}) return resolve(Object.assign({ ok: true }, snap));
+        if (Date.now() - t0 > 30000) return resolve(Object.assign({ ok: false }, read()));
+        setTimeout(tick, 100);
+      };
+      tick();
+    })`;
+
+    const waitNewPreview = (prevJobId) => `new Promise((resolve) => {
+      const img = document.getElementById("preview-img");
+      const status = document.getElementById("preview-status");
+      const t0 = Date.now();
+      const tick = () => {
+        const text = status.textContent || "";
+        const id = (String(img.src).match(/[?&]v=([^&]+)/) || [])[1] || null;
+        const shown = img && !img.classList.contains("hidden") && img.naturalWidth > 0;
+        if (text.includes("INVALID_DEPENDENT_ENUM")) {
+          return resolve({ ok: false, mode: "invalid", jobId: id, status: text });
+        }
+        if (shown && id && id !== ${JSON.stringify(prevJobId)} && text.includes("预览完成")) {
+          return resolve({ ok: true, mode: "done", jobId: id, status: text });
+        }
+        if (Date.now() - t0 > 120000) return resolve({ ok: false, mode: "timeout", jobId: id, status: text });
+        setTimeout(tick, 150);
+      };
+      tick();
+    })`;
+
+    const panelBefore = await evaluate(readLookPanel);
+    const originalViewTransform = panelBefore.ok ? panelBefore.viewTransform : null;
+    record(
+      "找到视图变换与 Look 下拉框",
+      !!panelBefore.ok,
+      panelBefore.ok
+        ? `view=${panelBefore.viewTransform} look=${panelBefore.lookValue}`
+        : panelBefore.reason
+    );
+
+    // 「前端 option.value 与显示文本分离」：value 必须逐项等于后端能力表里的
+    // Blender 真实 identifier，显示文本必须逐项等于 label。
+    // （Blender 5.2.1 下两者恰好同形，但来源必须各自独立。）
+    const apiLooks = await fetchJsonAs("/api/color/looks");
+    const sameList =
+      panelBefore.ok &&
+      panelBefore.options.length === (apiLooks.options || []).length &&
+      panelBefore.options.every((opt, i) => {
+        const ref = (apiLooks.options || [])[i];
+        return ref && opt.value === ref.value && opt.text === ref.label;
+      });
+    record(
+      "Look 下拉框：value 取 Blender 真实 identifier，显示文本取 label",
+      sameList,
+      `DOM=${JSON.stringify(panelBefore.options.slice(0, 3))} API=${JSON.stringify((apiLooks.options || []).slice(0, 3))}`
+    );
+
+    // ---- 显式切到 AgX，把回归起点固定下来（族前缀档位才暴露旧 bug）----
+    const hasAgX = panelBefore.ok && (panelBefore.viewOptions || []).includes("AgX");
+    await setViewTransform("AgX");
+    const agxReady = await evaluate(
+      waitLookList(`snap.viewTransform === "AgX" && snap.options.some((o) => o.value.startsWith("AgX - "))`)
+    );
+    record(
+      "AgX 可用且档位带族前缀（旧 bug 的复现前提）",
+      hasAgX && !!agxReady.ok,
+      agxReady.options ? agxReady.options.slice(1, 4).map((o) => o.value).join("、") : String(agxReady)
+    );
+
+    if (agxReady.ok) {
+      // 直接以「带族前缀的真实 identifier」为起点提交一次完整草稿 ——
+      // 这正是旧实现会炸成 BLENDER_SCRIPT_ERROR 的那一步。
+      await setLookValue("AgX - High Contrast");
+      const beforeDirect = await currentJobId();
+      const direct = await evaluate(waitNewPreview(beforeDirect));
+      record(
+        "AgX + 「AgX - High Contrast」完整草稿预览成功",
+        !!direct.ok && direct.jobId !== beforeDirect,
+        direct.status
+      );
+
+      // ---- AgX → Standard：Look 列表必须立即刷新，旧值按规范化名称迁移 ----
+      const beforeStd = await currentJobId();
+      const panelAgx = await evaluate(readLookPanel);
+      record(
+        "切换前 Look 取值为 AgX - High Contrast（迁移起点正确）",
+        panelAgx.lookValue === "AgX - High Contrast",
+        `look=${panelAgx.lookValue} note=${JSON.stringify(panelAgx.note)}`
+      );
+      await setViewTransform("Standard");
+      const standardList = await evaluate(
+        waitLookList(`snap.viewTransform === "Standard" && snap.options.length > 0 &&
+          !snap.options.some((o) => o.value.startsWith("AgX - "))`)
+      );
+      const stdApi = await fetchJsonAs("/api/color/looks?view_transform=Standard");
+      record(
+        "切到 Standard 后 Look 列表立即刷新（AgX 专属档位已移除）",
+        !!standardList.ok &&
+          standardList.options.length === (stdApi.options || []).length &&
+          standardList.options.every((opt, i) => opt.value === (stdApi.options || [])[i].value),
+        `${standardList.options.length} 项 / ${standardList.options.slice(1, 4).map((o) => o.value).join("、")}`
+      );
+      record(
+        "旧 Look 按规范化名称迁移（AgX - High Contrast → High Contrast）",
+        standardList.lookValue === "High Contrast",
+        `look=${standardList.lookValue}`
+      );
+      const panelStd = await evaluate(readLookPanel);
+      record(
+        "迁移后给出明确说明文案",
+        panelStd.note.includes("迁移") && panelStd.note.includes("High Contrast"),
+        panelStd.note || "(无说明)"
+      );
+
+      // ---- Standard → AgX：迁移回族前缀 identifier，并再次出预览 ----
+      await setViewTransform("AgX");
+      const agxList = await evaluate(
+        waitLookList(`snap.viewTransform === "AgX" && snap.lookValue === "AgX - High Contrast"`)
+      );
+      record(
+        "切回 AgX 后迁移回 AgX - High Contrast",
+        !!agxList.ok && agxList.lookValue === "AgX - High Contrast",
+        `look=${agxList.lookValue}`
+      );
+
+      const afterSwitch = await evaluate(waitNewPreview(beforeStd));
+      await shot("09-look-after-view-switch");
+      record(
+        "切换视图变换后的完整草稿可正常预览（不再 BLENDER_SCRIPT_ERROR）",
+        !!afterSwitch.ok && !String(afterSwitch.status).includes("BLENDER_SCRIPT_ERROR"),
+        afterSwitch.status
+      );
+
+      if (afterSwitch.jobId && afterSwitch.jobId !== beforeStd) {
+        const job = await fetchJsonAs("/api/jobs/" + afterSwitch.jobId);
+        const rec = (((job || {}).result || {}).parameters || {})["color.look"] || {};
+        record(
+          "任务记录里 effective_value 是 Blender 真实 identifier",
+          rec.effective_value === "AgX - High Contrast",
+          `configured=${JSON.stringify(rec.configured_value)} effective=${JSON.stringify(rec.effective_value)} label=${JSON.stringify(rec.display_label)}`
+        );
+        record(
+          "任务记录同时保留 display_label（与 value 分开保存）",
+          Object.prototype.hasOwnProperty.call(rec, "display_label") &&
+            Object.prototype.hasOwnProperty.call(rec, "configured_value"),
+          JSON.stringify(rec)
+        );
+      }
+    }
+
+    // ---- 快速连续切换：不等待刷新，旧候选/旧状态不得覆盖最后一次选择 ----
+    const rapidFinal = await evaluate(`(() => {
+      const vt = document.getElementById("ctl-color.view_transform");
+      if (!vt) return null;
+      const available = new Set(Array.from(vt.options).map((o) => o.value));
+      const wanted = ["Standard", "Filmic Log", "AgX", "Standard"].filter((v) => available.has(v));
+      if (wanted[wanted.length - 1] !== "Standard") wanted.push("Standard");
+      wanted.forEach((v) => {
+        vt.value = v;
+        vt.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      return { sent: wanted, value: vt.value };
+    })()`);
+    const raced = await evaluate(
+      waitLookList(`snap.viewTransform === "Standard" && snap.options.length > 0 &&
+        !snap.options.some((o) => o.value.startsWith("AgX - "))`)
+    );
+    record(
+      "快速连续切换视图后，Look 列表对应最后一次选择（未被旧结果覆盖）",
+      !!raced.ok && raced.viewTransform === "Standard" && raced.lookValue === "High Contrast",
+      `发序列=${JSON.stringify(rapidFinal && rapidFinal.sent)} 落点=${raced.viewTransform}/look=${raced.lookValue}`
+    );
+
+    // ---- 非法组合：前端必须展示依赖详情，而不是笼统的脚本错误 ----
+    await evaluate(`(() => {
+      const look = document.getElementById("ctl-color.look");
+      if (!look) return false;
+      const bad = document.createElement("option");
+      bad.value = "AgX - Punchy";   // Standard 下不合法
+      bad.textContent = "AgX - Punchy";
+      look.appendChild(bad);
+      look.value = "AgX - Punchy";
+      look.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    })()`);
+    const invalid = await evaluate(`new Promise((resolve) => {
+      const status = document.getElementById("preview-status");
+      const t0 = Date.now();
+      const tick = () => {
+        const text = status.textContent || "";
+        if (text.includes("INVALID_DEPENDENT_ENUM")) return resolve({ ok: true, text });
+        if (Date.now() - t0 > 90000) return resolve({ ok: false, text });
+        setTimeout(tick, 150);
+      };
+      tick();
+    })`);
+    await shot("10-invalid-dependent-enum");
+    record(
+      "非法 Look/视图组合报 INVALID_DEPENDENT_ENUM（不是 BLENDER_SCRIPT_ERROR）",
+      !!invalid.ok,
+      invalid.text
+    );
+    record(
+      "错误提示摊开了依赖关系与可选值",
+      invalid.text.includes("color.look") && invalid.text.includes("color.view_transform") &&
+        invalid.text.includes("High Contrast"),
+      invalid.text.slice(0, 200)
+    );
+
+    // ---- 收尾：丢掉临时塞进去的非法项，把视图变换还原成进入验收前的取值 ----
+    await evaluate(`(() => {
+      const look = document.getElementById("ctl-color.look");
+      if (!look) return false;
+      look.value = "High Contrast";
+      return look.value === "High Contrast";
+    })()`);
+    if (originalViewTransform && originalViewTransform !== "Standard") {
+      await setViewTransform(originalViewTransform);
+    }
+    const restoredPanel = await evaluate(
+      waitLookList(`snap.viewTransform === ${JSON.stringify(originalViewTransform)} && snap.options.length > 0`)
+    );
+    await shot("11-view-transform-restored");
+    record(
+      "验收结束把视图变换还原为进入前的取值",
+      !!restoredPanel.ok && restoredPanel.viewTransform === originalViewTransform,
+      `${originalViewTransform} → ${restoredPanel.viewTransform}（look=${restoredPanel.lookValue}）`
+    );
   } finally {
     // 把用户工程里被临时切走的当前帧放回去（切帧只用于验证「基线失效」）
     if (originalFrame !== null) {

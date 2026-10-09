@@ -8,8 +8,10 @@
 * ``POST /api/blender/reconnect``  重置连接状态并立即重新检测
 * ``GET  /api/framing/context``    当前帧 / 相机 / 相机动画 / 角色是否完整入画
 * ``GET  /api/params/schema``      L0 参数表
+* ``GET  /api/color/looks``        某视图下 Blender 真正接受的 look 档位（依赖枚举）
+* ``POST /api/color/looks/refresh`` 重新扫描 look 能力表
 * ``POST /api/session/baseline``   采集内存基线（含取景快照）+ 首张预览
-* ``POST /api/session/restore``    回滚到基线
+* ``POST /api/session/restore``    回滚到基线（走同一套依赖映射）
 * ``POST /api/preview``            提交草稿 + 取景方式，产出预览任务
 * ``GET  /api/jobs/{id}``          任务状态
 * ``GET  /api/preview/{id}``       预览图（HTTP 端点，不暴露本机路径）
@@ -18,6 +20,8 @@
 * 只监听 127.0.0.1（见 config 回环校验）。
 * 不提供任何接受任意 Python 的接口；Blender 侧代码只能来自内置模板。
 * 自动取景只用**临时预览相机**，绝不改动用户相机；渲染后必定恢复 ``scene.camera``。
+* look 是依赖 ``view_transform`` 的枚举：后端在**下发脚本前**完成依赖校验，
+  非法组合返回稳定错误 ``INVALID_DEPENDENT_ENUM``，不退化成 ``BLENDER_SCRIPT_ERROR``。
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from .models import (
     BaselineRequest,
     BaselineResponse,
     BlenderStatusResponse,
+    ColorLooksResponse,
     ErrorResponse,
     FramingContextResponse,
     HealthResponse,
@@ -282,6 +287,35 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 ],
             },
         }
+
+    @app.get(
+        "/api/color/looks",
+        response_model=ColorLooksResponse,
+        responses={502: {"model": ErrorResponse}, 503: {"model": ErrorResponse}, 504: {"model": ErrorResponse}},
+        tags=["color"],
+    )
+    async def color_looks(
+        view_transform: str | None = None, identifier: str | None = None
+    ) -> dict[str, Any]:
+        """某个视图变换下 Blender **真正接受**的 look 档位。
+
+        look 是依赖枚举：``getLookNames()`` 是 OCIO 全局名单，不是当前视图的合法集合。
+        这里返回的是 ``{view_transform: [{value, label}]}`` 能力表；建立基线时已一次扫出，
+        因此前端切换视图变换时通常是**零 Blender 调用**的。
+        """
+        payload = await preview.read_look_capability(view_transform, identifier)
+        return {"ok": True, **payload}
+
+    @app.post(
+        "/api/color/looks/refresh",
+        response_model=ColorLooksResponse,
+        responses={502: {"model": ErrorResponse}, 503: {"model": ErrorResponse}, 504: {"model": ErrorResponse}},
+        tags=["color"],
+    )
+    async def color_looks_refresh() -> dict[str, Any]:
+        """重新扫描 look 能力表（换了 OCIO 配置时用）。只改能力表，不动工程取值。"""
+        payload = await preview.refresh_look_capability()
+        return {"ok": True, **payload}
 
     @app.post("/api/session/restore", response_model=RestoreResponse, tags=["session"])
     async def restore_baseline() -> dict[str, Any]:

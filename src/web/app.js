@@ -117,6 +117,17 @@
   var framingStaleDetail = "";
   var framingContext = null;
 
+  // -- 依赖枚举状态（view_transform -> look）----------------------------
+  /* look 的合法档位随「视图变换」变化，候选一律来自 Blender 能力表。
+     旧实现直接拿 OCIO 全局名单当候选，把 "AgX - High Contrast" 写进了只接受
+     通用档位的视图，炸成 enum not found。 */
+  var LOOK_PARAM_ID = "color.look";
+  var VIEW_TRANSFORM_PARAM_ID = "color.view_transform";
+  var lookMap = {};
+  /* 每次视图变换变化都自增；能力请求回来时比对，**旧候选请求不得覆盖新列表**。 */
+  var lookRequestToken = 0;
+  var lookMapLoading = false;
+
   function setText(node, value, fallback) {
     if (!node) {
       return;
@@ -596,7 +607,22 @@
 
   function showTunerError(error) {
     var detail = error || {};
-    setPreviewStatus("(" + (detail.code || "ERROR") + ") " + (detail.message || "预览失败"), "err");
+    var suffix = "";
+    if (detail.code === "INVALID_DEPENDENT_ENUM") {
+      /* 依赖枚举错误：把「哪个参数 / 什么值 / 依赖谁 / 允许什么」直接摊开，
+         而不是笼统地报一句失败。 */
+      var depends = detail.depends_on || {};
+      var parent = Object.keys(depends)[0];
+      var allowed = (detail.allowed || []).join("、");
+      suffix =
+        "　（" + (detail.parameter || "参数") + " = " + JSON.stringify(detail.value) +
+        "，在 " + (parent || "依赖参数") + " = " + JSON.stringify(parent ? depends[parent] : "") +
+        " 下不合法；可选：" + allowed + "）";
+    }
+    setPreviewStatus(
+      "(" + (detail.code || "ERROR") + ") " + (detail.message || "预览失败") + suffix,
+      "err"
+    );
     tuner.jobRaw.textContent = JSON.stringify(detail, null, 2);
   }
 
@@ -630,6 +656,34 @@
     });
   }
 
+  /* 枚举项可能是旧格式（纯字符串）或新格式（{value,label}）。
+     写进 Blender 的**永远**是 value；label 只用来显示。 */
+  function optionValue(option) {
+    if (option && typeof option === "object") {
+      return String(option.value);
+    }
+    return String(option);
+  }
+
+  function optionLabel(option) {
+    if (option && typeof option === "object" && option.label !== undefined && option.label !== null) {
+      return String(option.label);
+    }
+    return optionValue(option);
+  }
+
+  function setSelectOptions(select, options) {
+    var previous = select.value;
+    select.textContent = "";
+    (options || []).forEach(function (option) {
+      var opt = document.createElement("option");
+      opt.value = optionValue(option);
+      opt.textContent = optionLabel(option);
+      select.appendChild(opt);
+    });
+    return previous;
+  }
+
   function buildControl(spec) {
     var wrap = document.createElement("div");
     wrap.className = "control";
@@ -654,12 +708,7 @@
       input.step = String(spec.step || 0.01);
     } else {
       input = document.createElement("select");
-      (spec.options || []).forEach(function (option) {
-        var opt = document.createElement("option");
-        opt.value = option;
-        opt.textContent = option;
-        input.appendChild(opt);
-      });
+      setSelectOptions(input, spec.options);
     }
     input.id = "ctl-" + spec.id;
     input.dataset.paramId = spec.id;
@@ -669,6 +718,8 @@
     meta.className = "control-meta";
     if (spec.type === "float") {
       meta.textContent = "范围 [" + spec.minimum + ", " + spec.maximum + "] · " + spec.target;
+    } else if (spec.depends_on) {
+      meta.textContent = spec.target + " · 可选档位由 Blender 按「" + spec.depends_on + "」实时给出";
     } else {
       meta.textContent = spec.options_dynamic ? spec.target + " · 候选取自 Blender 实时配置" : spec.target;
     }
@@ -706,6 +757,12 @@
         updateReadout(entry);
         entry.input.addEventListener(entry.spec.type === "float" ? "input" : "change", function () {
           updateReadout(entry);
+          if (entry.spec.id === VIEW_TRANSFORM_PARAM_ID) {
+            /* 视图变换决定 Look 的合法档位：先刷新 Look 列表并迁移旧值，
+               再触发预览 —— 绝不能把已经不合法或还是旧标签的值发给 Blender。 */
+            onViewTransformChange();
+            return;
+          }
           schedulePreview();
         });
         tuner.controls.appendChild(entry.element);
@@ -715,6 +772,166 @@
     hint.className = "control-note";
     hint.textContent = "提示：预览使用的分辨率低于正式导出；参数改动只影响预览，不会写入工程。";
     tuner.controls.appendChild(hint);
+  }
+
+  // -- 依赖枚举联动（view_transform -> look）-----------------------------
+
+  function lookOptionsFor(viewTransform) {
+    var options = viewTransform ? lookMap[viewTransform] : null;
+    return options && options.length ? options : null;
+  }
+
+  /* 把任意形状的旧 look 迁移到目标视图。
+     等价项按「真实 identifier → 显示标签 → 族前缀短名 → 反向短名」顺序找；
+     都没有就回退 None。 */
+  function normalizeLook(raw, viewTransform) {
+    var options = lookOptionsFor(viewTransform);
+    if (!options) {
+      return null;
+    }
+    function firstMatch(predicate) {
+      for (var i = 0; i < options.length; i += 1) {
+        if (predicate(optionValue(options[i]), optionLabel(options[i]))) {
+          return options[i];
+        }
+      }
+      return null;
+    }
+    function suffixOf(text) {
+      var at = text.indexOf(" - ");
+      return at >= 0 ? text.slice(at + 3) : null;
+    }
+    function fallbackOption() {
+      return (
+        firstMatch(function (value) {
+          return value === "None";
+        }) || options[0]
+      );
+    }
+
+    if (raw === null || raw === undefined || String(raw).trim() === "") {
+      var none = fallbackOption();
+      return { value: optionValue(none), label: optionLabel(none), migrated: false, empty: true };
+    }
+
+    var text = String(raw);
+    var short = suffixOf(text);
+    var hit =
+      firstMatch(function (value) {
+        return value === text;
+      }) ||
+      firstMatch(function (value, label) {
+        return label === text;
+      }) ||
+      (short
+        ? firstMatch(function (value) {
+            return value === short;
+          })
+        : null) ||
+      firstMatch(function (value) {
+        return suffixOf(value) === text;
+      });
+
+    if (hit) {
+      return {
+        value: optionValue(hit),
+        label: optionLabel(hit),
+        migrated: optionValue(hit) !== text
+      };
+    }
+    var fb = fallbackOption();
+    return { value: optionValue(fb), label: optionLabel(fb), migrated: true, fallback: true };
+  }
+
+  /* 用给定能力表重刷 Look 下拉框，并按规范化规则迁移当前值。
+     返回 true 表示列表已就绪（调用方才可以安全地提交草稿）。 */
+  function refreshLookOptions(viewTransform) {
+    var entry = controlsById[LOOK_PARAM_ID];
+    var options = lookOptionsFor(viewTransform);
+    if (!entry || !options) {
+      return false;
+    }
+    var previous = entry.input.value;
+    setSelectOptions(entry.input, options);
+    var normalized = normalizeLook(previous, viewTransform);
+    if (normalized && normalized.value) {
+      entry.input.value = normalized.value;
+      if (normalized.migrated && !normalized.empty) {
+        setLookNote(
+          normalized.fallback
+            ? "「" + previous + "」在「" + viewTransform + "」下没有对应档位，已回退为「" + normalized.label + "」。"
+            : "Look 已随「" + viewTransform + "」迁移为「" + normalized.label + "」。"
+        );
+      } else {
+        setLookNote("");
+      }
+    }
+    return true;
+  }
+
+  function setLookNote(text) {
+    var entry = controlsById[LOOK_PARAM_ID];
+    if (!entry) {
+      return;
+    }
+    var note = entry.element.querySelector(".control-look-note");
+    if (!text) {
+      if (note) {
+        note.remove();
+      }
+      return;
+    }
+    if (!note) {
+      note = document.createElement("p");
+      note.className = "control-note control-look-note";
+      entry.element.appendChild(note);
+    }
+    note.textContent = text;
+  }
+
+  /* 能力表里没有这个视图时，才去问 Blender（通常是零调用）。
+     代次守卫：快速连点视图变换时，**旧候选请求不得覆盖新列表**。 */
+  async function loadLookOptions(viewTransform) {
+    var token = ++lookRequestToken;
+    var result = await request(
+      "/api/color/looks?view_transform=" + encodeURIComponent(viewTransform)
+    );
+    if (token !== lookRequestToken) {
+      return false;
+    }
+    if (!result.body || !result.body.ok) {
+      return false;
+    }
+    applyLookMap(result.body.look_map);
+    return true;
+  }
+
+  function applyLookMap(map) {
+    if (!map) {
+      return;
+    }
+    lookMap = map;
+  }
+
+  async function onViewTransformChange() {
+    var entry = controlsById[VIEW_TRANSFORM_PARAM_ID];
+    var viewTransform = entry ? entry.input.value : null;
+    if (!refreshLookOptions(viewTransform)) {
+      // 本地能力表没有这个视图：先拿到列表再继续，期间不提交任何草稿
+      setLookNote("正在向 Blender 确认「" + viewTransform + "」下可用的 Look…");
+      await loadLookOptions(viewTransform);
+      refreshLookOptions(viewTransform);
+    }
+    if (framingStale || !baselineValues) {
+      return;
+    }
+    schedulePreview();
+  }
+
+  function collectLookMapFromBaseline(body) {
+    if (body && body.look_map) {
+      applyLookMap(body.look_map);
+    }
   }
 
   async function loadSchema() {
@@ -745,6 +962,16 @@
     if (!values) {
       return;
     }
+    /* 先按「视图变换」刷新 Look 候选，再落值 —— 否则可能把一个当前视图
+       并不接受的 look 塞进下拉框，并顺着草稿发给 Blender。 */
+    if (values[VIEW_TRANSFORM_PARAM_ID] !== undefined) {
+      var vtEntry = controlsById[VIEW_TRANSFORM_PARAM_ID];
+      if (vtEntry) {
+        vtEntry.input.value = String(values[VIEW_TRANSFORM_PARAM_ID]);
+      }
+      refreshLookOptions(String(values[VIEW_TRANSFORM_PARAM_ID]));
+    }
+
     Object.keys(controlsById).forEach(function (paramId) {
       var entry = controlsById[paramId];
       if (!(paramId in values)) {
@@ -753,14 +980,23 @@
       var value = values[paramId];
       if (entry.spec.type === "float") {
         entry.input.value = String(value);
-      } else if (entry.spec.options && entry.spec.options.indexOf(value) === -1) {
-        var opt = document.createElement("option");
-        opt.value = value;
-        opt.textContent = value;
-        entry.input.appendChild(opt);
-        entry.input.value = value;
       } else {
-        entry.input.value = value;
+        var exists = false;
+        for (var i = 0; i < entry.input.options.length; i += 1) {
+          if (entry.input.options[i].value === String(value)) {
+            exists = true;
+            break;
+          }
+        }
+        if (!exists) {
+          // 候选表里还没有这个值（例如能力表尚未加载）：补一项，但**保留原样**，
+          // 让后端去判定它是否合法，绝不在这里伪造 label。
+          var opt = document.createElement("option");
+          opt.value = String(value);
+          opt.textContent = String(value);
+          entry.input.appendChild(opt);
+        }
+        entry.input.value = String(value);
       }
       updateReadout(entry);
     });
@@ -803,6 +1039,9 @@
       return false;
     }
     baselineValues = result.body.values || {};
+    /* 先把 look 能力表装进来，再落值：否则 applyValuesToControls 会在
+       Look 下拉框里看到一个当前视图并不接受的旧档位。 */
+    collectLookMapFromBaseline(result.body);
     tuner.baselineInfo.textContent =
       "基线 " + result.body.baseline_id + " · " + formatTime(result.body.captured_at) +
       " · Blender " + (result.body.blender || "?") +

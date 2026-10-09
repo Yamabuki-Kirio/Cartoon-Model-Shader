@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from . import blender_ops, errors, framing
+from . import blender_ops, color_looks, errors, framing
 from .blender_mcp import BlenderMCPClient
 from .config import BlenderMCPConfig
 
@@ -83,12 +83,67 @@ class BlenderBinder:
         captured = self._client().execute_code(framing.build_context_code())
         return framing.normalize_context(framing.parse_context(captured))
 
+    def read_look_capability(self) -> dict[str, Any]:
+        """一次性扫出每个 ``view_transform`` 对应的合法 look（建立基线时调用）。
+
+        只读语义：Blender 侧在 ``finally`` 中恢复原 ``view_transform`` / ``look``。
+        """
+        captured = self._client().execute_code(color_looks.build_sweep_code())
+        payload = color_looks.parse_payload(captured)
+        restored = payload.get("restored") or {}
+        if not restored.get("ok", False):
+            raise errors.ToonTunerError(
+                errors.BLENDER_SCRIPT_ERROR,
+                "look 能力探测未能恢复原 view_transform / look。",
+                details={
+                    "original": payload.get("original"),
+                    "restored": restored,
+                },
+            )
+        return {
+            "looks": color_looks.normalize_look_map(payload.get("looks")),
+            "raw": payload.get("looks") or {},
+            "sources": payload.get("sources") or {},
+            "failed": payload.get("failed") or {},
+            "view_transforms": payload.get("view_transforms") or [],
+            "original": payload.get("original") or {},
+        }
+
+    def probe_look_for(
+        self, view_transform: str, identifier: str | None = None
+    ) -> dict[str, Any]:
+        """探测单个 ``view_transform`` 的合法 look（需求 2 的独立只读探针）。"""
+        captured = self._client().execute_code(
+            color_looks.build_probe_code(view_transform, identifier)
+        )
+        return color_looks.parse_payload(captured)
+
     # -- 写入 -----------------------------------------------------------
     def apply_values(self, values: dict[str, Any]) -> dict[str, Any]:
+        """原子应用一组取值。
+
+        Blender 侧失败时**不会**抛异常，而是返回结构化 ``failure``；
+        这里把它翻译成稳定错误码（``invalid_dependent_enum`` 绝不会退化成
+        通用的 ``BLENDER_SCRIPT_ERROR``）。
+        """
         if not values:
             return {}
         captured = self._client().execute_code(blender_ops.build_set_code(values))
-        return blender_ops.extract_json(captured)
+        payload = blender_ops.extract_json(captured)
+        if payload.get("applied") is False:
+            error = blender_ops.failure_to_error(payload.get("failure"))
+            if error is not None:
+                if payload.get("restored_to"):
+                    error.details.setdefault("restored_to", payload["restored_to"])
+                if payload.get("restore_ok") is not None:
+                    error.details.setdefault("restore_ok", payload["restore_ok"])
+                raise error
+            raise errors.ToonTunerError(
+                errors.BLENDER_SCRIPT_ERROR,
+                "应用草稿失败，且 Blender 未给出可识别的失败原因。",
+                details={"blender_payload": payload},
+            )
+        return payload
 
     # -- 渲染 -----------------------------------------------------------
     def render_preview(

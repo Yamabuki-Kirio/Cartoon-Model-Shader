@@ -173,12 +173,172 @@ DEFAULT_GLARE_INPUTS: dict[str, Any] = {
 # =============================================================================
 
 
+#: Blender 为非族前缀视图提供的通用对比度档位（与 src/server/color_looks 一致）
+GENERIC_LOOKS: tuple[str, ...] = (
+    "Very High Contrast",
+    "High Contrast",
+    "Medium High Contrast",
+    "Medium Contrast",
+    "Medium Low Contrast",
+    "Low Contrast",
+    "Very Low Contrast",
+)
+
+#: 复刻 Blender 5.2.1 的真实能力表：**同一字符串在不同视图下合法性不同**。
+#: 这正是 look 报 enum not found 的根源，桩必须照抄，否则测试形同虚设。
+LOOK_CAPABILITY: dict[str, list[str]] = {
+    "Standard": ["None", *GENERIC_LOOKS],
+    "Filmic": ["None", *GENERIC_LOOKS],
+    "Filmic Log": ["None", *GENERIC_LOOKS],
+    "Raw": ["None", *GENERIC_LOOKS],
+    "Khronos PBR Neutral": ["None", *GENERIC_LOOKS],
+    "AgX": [
+        "None",
+        "AgX - Punchy",
+        "AgX - Greyscale",
+        "AgX - Very High Contrast",
+        "AgX - High Contrast",
+        "AgX - Medium High Contrast",
+        "AgX - Base Contrast",
+        "AgX - Medium Low Contrast",
+        "AgX - Low Contrast",
+        "AgX - Very Low Contrast",
+    ],
+    "False Color": [
+        "None",
+        "False Color - Punchy",
+        "False Color - Greyscale",
+        "False Color - Very High Contrast",
+        "False Color - High Contrast",
+        "False Color - Medium High Contrast",
+        "False Color - Base Contrast",
+        "False Color - Medium Low Contrast",
+        "False Color - Low Contrast",
+        "False Color - Very Low Contrast",
+    ],
+    "ACES 1.3": ["None", "ACES 1.3 - Reference Gamut Compression"],
+    "ACES 2.0": ["None", "ACES 2.0 - Reference Gamut Compression"],
+}
+
+#: 「只提供通用 contrast identifier」的另一种 Blender 口味：
+#: AgX 也只认通用档位。用于验证「label 由前端组合、value 保持 identifier」的迁移路径。
+LEGACY_LOOK_CAPABILITY: dict[str, list[str]] = {
+    **LOOK_CAPABILITY,
+    "AgX": ["None", *GENERIC_LOOKS],
+}
+
+
+def _allowed_looks_for(view_transform: str, capability: dict[str, list[str]] | None = None) -> list[str]:
+    table = capability if capability is not None else LOOK_CAPABILITY
+    return list(table.get(view_transform, ["None"]))
+
+
+def _look_slot(identifier: str) -> str:
+    """取「对比度档位」本身，丢掉族前缀（``"AgX - High Contrast"`` -> ``"High Contrast"``）。"""
+    if " - " in identifier:
+        return identifier.split(" - ", 1)[1]
+    return identifier
+
+
+#: 默认初始 look：Blender 5.2.1 的 AgX 下真实合法。
+_DEFAULT_LOOK = "AgX - High Contrast"
+
+
+def _initial_look(capability: dict[str, list[str]]) -> str:
+    """挑一个在 ``AgX`` 下**真的合法**的初始 look。
+
+    ``LEGACY_LOOK_CAPABILITY`` 模拟的是「AgX 只认通用档位」的老版本，那里
+    ``"AgX - High Contrast"`` 本身就是非法状态 —— 真实 Blender 不可能停在这种状态，
+    桩也不该（否则探针的 ``finally`` 恢复会失败，测出来的是桩的毛病而非产品逻辑）。
+    """
+    allowed = list(capability.get("AgX") or ["None"])
+    if _DEFAULT_LOOK in allowed:
+        return _DEFAULT_LOOK
+    slot = _look_slot(_DEFAULT_LOOK)
+    for candidate in allowed:
+        if _look_slot(candidate) == slot:
+            return candidate
+    return "None"
+
+
+def _enum_error(attribute: str, value: Any, allowed: list[str]) -> TypeError:
+    """复刻 Blender 的枚举报错格式 —— color_looks 正是从这段文本里解析允许列表。"""
+    rendered = ", ".join(repr(item) for item in allowed)
+    return TypeError(
+        f'bpy_struct: item.attr = val: enum "{value}" not found in ({rendered})'
+    )
+
+
 class FakeViewSettings:
-    def __init__(self) -> None:
-        self.view_transform = "AgX"
-        self.look = "AgX - High Contrast"
+    """带**真实枚举约束**的 view_settings。
+
+    ``look`` 的合法集合随 ``view_transform`` 变化；写入非法值会抛与 Blender 同格式的
+    ``TypeError``。切换视图变换时会像 Blender 一样**按档位跨视图映射** look
+    （实测：AgX 的 ``"AgX - High Contrast"`` 切到 Standard 后变成 ``"High Contrast"``，
+    切回 AgX 又变回来）。
+    """
+
+    def __init__(self, capability: dict[str, list[str]] | None = None) -> None:
+        self._capability = capability if capability is not None else LOOK_CAPABILITY
+        self._view_transform = "AgX"
+        # 初始 look 必须与能力表自洽，否则「探针 finally 恢复原值」这条断言测的是桩的毛病
+        self._look = _initial_look(self._capability)
         self.exposure = 0.0
         self.gamma = 1.0
+        #: 测试注入：写入等于该值的 look 时抛 RuntimeError（模拟 Blender 侧写入失败）
+        self.fail_on_look: str | None = None
+        #: 测试注入：``"enum"``（默认，复刻 Blender 报错格式，可被解析）
+        #: 或 ``"bare"``（不可解析的报错，逼迫调用方走逐个赋值探测兜底）
+        self.enum_error_style = "enum"
+        #: 写入轨迹，供断言「label 没有被直接写进去」
+        self.write_log: list[tuple[str, Any]] = []
+
+    def _reject(self, attribute: str, value: Any, allowed: list[str]) -> TypeError:
+        if self.enum_error_style == "bare":
+            return TypeError(f"{attribute} 不支持取值 {value!r}")
+        return _enum_error(attribute, value, allowed)
+
+    # -- view_transform ---------------------------------------------------
+    @property
+    def view_transform(self) -> str:
+        return self._view_transform
+
+    @view_transform.setter
+    def view_transform(self, value: Any) -> None:
+        text = str(value)
+        if text not in self._capability:
+            raise self._reject("view_transform", value, list(self._capability))
+        if text == self._view_transform:
+            return
+        self._view_transform = text
+        self.write_log.append(("view_transform", text))
+        # 像 Blender 一样按档位映射 look；找不到对应档位就落到 None
+        if self._look not in self.allowed_looks:
+            slot = _look_slot(self._look)
+            mapped = next(
+                (c for c in self.allowed_looks if _look_slot(c) == slot),
+                "None",
+            )
+            self._look = mapped
+
+    # -- look -------------------------------------------------------------
+    @property
+    def allowed_looks(self) -> list[str]:
+        return _allowed_looks_for(self._view_transform, self._capability)
+
+    @property
+    def look(self) -> str:
+        return self._look
+
+    @look.setter
+    def look(self, value: Any) -> None:
+        text = str(value)
+        if self.fail_on_look is not None and text == self.fail_on_look:
+            raise RuntimeError(f"注入的 look 写入失败：{text}")
+        if text not in self.allowed_looks:
+            raise self._reject("look", value, self.allowed_looks)
+        self._look = text
+        self.write_log.append(("look", text))
 
 
 class FakeImageSettings:
@@ -518,8 +678,12 @@ class FakeCollection:
 
 
 class FakeScene:
-    def __init__(self, bpy: "FakeBpy | None" = None) -> None:
-        self.view_settings = FakeViewSettings()
+    def __init__(
+        self,
+        bpy: "FakeBpy | None" = None,
+        capability: dict[str, list[str]] | None = None,
+    ) -> None:
+        self.view_settings = FakeViewSettings(capability)
         self.render = FakeRender()
         self.display_settings = FakeDisplaySettings()
         self.frame_current = 1
@@ -623,7 +787,7 @@ class _Context:
 class FakeBpy:
     """可执行的 `bpy` 替身。"""
 
-    def __init__(self) -> None:
+    def __init__(self, capability: dict[str, list[str]] | None = None) -> None:
         glare = FakeNode("Autocel_Glow", "GLARE", dict(DEFAULT_GLARE_INPUTS))
         self.node_groups: dict[str, FakeNodeGroup] = {
             "AI_Compositor": FakeNodeGroup(
@@ -635,7 +799,9 @@ class FakeBpy:
                 ],
             )
         }
-        self._scene = FakeScene(self)
+        #: 是否让 PyOpenColorIO 可用（关闭时只能退回 RNA，用于验证降级路径）
+        self.ocio_available = True
+        self._scene = FakeScene(self, capability)
         self.context = _Context(self)
         self.app = _App()
         self.data = _Data(self)
@@ -645,6 +811,10 @@ class FakeBpy:
         self.last_render_camera: str | None = None
         self.render_scene_camera_history: list[str | None] = []
         self.build_default_scene()
+
+    @property
+    def view_settings(self) -> FakeViewSettings:
+        return self.context.scene.view_settings
 
     # -- 默认场景（量级参照真实工程）--------------------------------------
     def build_default_scene(self) -> None:
@@ -785,6 +955,46 @@ def _character_bbox(offset: float = 0.0) -> tuple[tuple[float, float, float], tu
 # =============================================================================
 
 
+class _FakeOCIOConfig:
+    """只实现生成的代码真正用到的两个方法。"""
+
+    def __init__(self, views: list[str], looks: list[str]) -> None:
+        self._views = list(views)
+        self._looks = list(looks)
+
+    def getViews(self, display: Any = None) -> list[str]:
+        return list(self._views)
+
+    def getLookNames(self) -> list[str]:
+        return list(self._looks)
+
+
+class _FakeOCIO:
+    def __init__(self, views: list[str], looks: list[str]) -> None:
+        self._config = _FakeOCIOConfig(views, looks)
+
+    def GetCurrentConfig(self) -> _FakeOCIOConfig:
+        return self._config
+
+
+def _ocio_view_names() -> list[str]:
+    return list(LOOK_CAPABILITY.keys())
+
+
+def _ocio_look_names() -> list[str]:
+    """OCIO 的**全局** look 名单 —— 刻意是各视图合法集合的超集。
+
+    真实 Blender 就是这样：``getLookNames()`` 会返回大量当前视图并不接受的名字。
+    旧实现直接拿它当候选，于是写出了 ``enum not found``。
+    """
+    out: list[str] = []
+    for names in LOOK_CAPABILITY.values():
+        for name in names:
+            if name != "None" and name not in out:
+                out.append(name)
+    return out
+
+
 @contextlib.contextmanager
 def installed(fake: FakeBpy) -> Iterator[FakeBpy]:
     """临时把桩注册为 ``bpy`` 模块，使 ``import bpy`` 命中它。"""
@@ -800,8 +1010,14 @@ def installed(fake: FakeBpy) -> Iterator[FakeBpy]:
     )
     previous = sys.modules.get("bpy")
     sys.modules["bpy"] = module
-    # PyOpenColorIO 必须不可用，以走「静态回退」分支
-    previous_ocio = sys.modules.pop("PyOpenColorIO", None)
+    previous_ocio = sys.modules.get("PyOpenColorIO")
+    if fake.ocio_available:
+        ocio = types.ModuleType("PyOpenColorIO")
+        ocio.GetCurrentConfig = _FakeOCIO(_ocio_view_names(), _ocio_look_names()).GetCurrentConfig  # type: ignore[attr-defined]
+        sys.modules["PyOpenColorIO"] = ocio
+    else:
+        # 模拟「OCIO 不可用」：视图列表只能退回 RNA（真实环境下 RNA 只给 NONE）
+        sys.modules.pop("PyOpenColorIO", None)
     try:
         yield fake
     finally:
@@ -811,6 +1027,8 @@ def installed(fake: FakeBpy) -> Iterator[FakeBpy]:
             sys.modules.pop("bpy", None)
         if previous_ocio is not None:
             sys.modules["PyOpenColorIO"] = previous_ocio
+        else:
+            sys.modules.pop("PyOpenColorIO", None)
 
 
 def run_generated_code(code: str, fake: FakeBpy) -> str:

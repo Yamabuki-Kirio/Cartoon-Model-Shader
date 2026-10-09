@@ -87,6 +87,7 @@ Cartoon-Model-Shader/
 │   │   ├── scene_probe.py           只读场景探针模板 + 解析
 │   │   ├── params.py                L0 参数白名单（类型/范围/绑定）
 │   │   ├── framing.py               预览取景：只读构图诊断 + 临时预览相机 + 基线失效比对
+│   │   ├── color_looks.py           依赖枚举：view_transform → 合法 look 的探测/迁移/校验
 │   │   ├── blender_ops.py           由白名单生成只读/写入/渲染代码
 │   │   ├── binder.py                高层绑定：读基线 / 写草稿 / 渲染预览
 │   │   ├── session.py               内存基线 + 任务队列（旧任务自动作废）
@@ -97,6 +98,7 @@ Cartoon-Model-Shader/
 ├── tests/                           假 MCP + 假 bpy 桩 + pytest 用例
 │   ├── fake_bpy.py                  可执行 bpy 桩（复刻 view_frame 等真实行为）
 │   ├── test_framing.py              取景/构图/临时相机/基线失效用例
+│   ├── test_color_looks.py          依赖枚举：能力探测/value-label/写入顺序/原子化/迁移用例
 │   └── browser_check.mjs            真实浏览器验收（本机 Chrome/Edge + CDP）
 ├── config.example.json
 ├── requirements.txt
@@ -135,6 +137,8 @@ uvicorn src.server.app:app --host 127.0.0.1 --port 8765
 
 **MVP-02 补充 · 预览取景**：顶部取景栏 + 四种取景方式 + 临时预览相机自动取景 + 基线失效保护（详见下文「预览取景（构图）」）。
 
+**MVP-02 修正 · 依赖枚举联动**：`视图变换` 与 `Look` 不再当独立参数 —— 切换视图变换会立即刷新 Look 候选、按规范化名称迁移旧值，后端在下发脚本前完成依赖校验（详见下文「依赖枚举（视图变换 → Look）」）。
+
 **本阶段只输出临时预览 PNG**：不保存工程、不覆盖 `.blend`、不做正式渲染、不导入模型。
 
 ### 调参流程
@@ -149,6 +153,8 @@ uvicorn src.server.app:app --host 127.0.0.1 --port 8765
 5. 「恢复基线」可随时手动回滚到基线并重新显示基线预览图；「控件复位」把面板恢复成基线取值。
 6. 页面顶部取景栏确认人物**完整入画**；若显示「否（已出画）」，把「预览取景方式」切到
    `auto_full_body`（自动全身）或点「重新取景」。切帧/动相机后若出现失效横幅，点「建立 / 刷新基线」即可恢复。
+7. 切换「视图变换」时，**Look 下拉框会立即刷新**成该视图真正接受的档位；旧档位若有等价项会自动迁移
+   （`AgX - High Contrast` ⇄ `High Contrast`），没有等价项则回退 `None`，并在控件下方说明原因。
 
 > 预览图一律经 `/api/preview/{job_id}` 这个 HTTP 端点提供 —— 落盘目录在系统临时目录
 > （`%TEMP%/toon-tuner-previews`），那是本机路径，**绝不直接交给浏览器当 `img.src`**。
@@ -184,6 +190,32 @@ uvicorn src.server.app:app --host 127.0.0.1 --port 8765
 **不会**把新构图当成参数效果端上来。点「建立 / 刷新基线」即可重新锁定并恢复自动预览。
 角色自身漂移与相机动画本身只产生**软告警**，不阻断预览。
 
+### 依赖枚举（视图变换 → Look）
+
+**为什么要做**：`Look` **不是独立参数**，它的合法取值由 `视图变换` 决定。旧实现把 OCIO 的**全局** look 名单
+（`getLookNames()`）当成候选，于是把 AgX 专属档位写进了只接受通用档位的视图，预览直接报
+`BLENDER_SCRIPT_ERROR`。另一个看似可用的来源 `bl_rna.properties['look'].enum_items` 在无 UI 上下文里
+只返回 `NONE`（Blender 5.2.1 实测 `items_count == 1`），同样不可用。
+
+现在按下面的方式工作：
+
+1. **建立基线时一次性扫出全量能力表** —— 对每个 `view_transform` 探出它真正接受的 look 集合。
+   合法性不是我猜的：写一个必然非法的哨兵值，让 Blender 自己报出
+   `enum "X" not found in ('None', 'High Contrast', ...)`，再从这段**报错文本**里解析出权威允许列表。
+   探针全程只读，`finally` 恢复原 `view_transform` / `look`；恢复失败就直接报错，绝不当作成功。
+2. **value 与 label 分离** —— 下拉框每一项是 `{"value", "label"}`。`value` 是 Blender 真实 identifier，
+   **只有它会被写进 Blender**；`label` 只用于显示（族前缀视图下形如 `AgX - High Contrast`）。
+3. **前端联动** —— 切换视图变换立即刷新 Look 列表并按规范化名称迁移旧值；**刷新成功前不提交任何草稿**，
+   所以不会出现「拿着旧档位去试」的中间态。快速连续切换时用代次守卫丢弃过期响应，旧结果不会覆盖新列表。
+4. **后端在下发脚本前校验依赖** —— 非法组合返回稳定错误 `INVALID_DEPENDENT_ENUM`（含
+   `parameter` / `value` / `depends_on` / `allowed`），**不会**退化成笼统的 `BLENDER_SCRIPT_ERROR`，
+   也不会白跑一次 Blender。
+5. **写入顺序固定且原子** —— `view_transform` → 复核 `allowed_looks` → `look` → `exposure` → `gamma` → 其他。
+   任一阶段失败就整体回滚到本次应用前的四值，不留「视图变了、Look 没变」的半应用状态；恢复基线走同一套映射，
+   不盲写旧字符串。
+6. **记录三类值** —— 任务结果里每个参数都记 `configured_value`（你配置的）/ `effective_value`（真正写进 Blender 的）/
+   `display_label`（界面显示标签），旧预设里的老名字加载时自动迁移。
+
 ### 配置
 
 复制 `config.example.json` 为 `config.local.json`（已被 `.gitignore` 排除）按需覆盖 host / port / 超时。
@@ -207,6 +239,12 @@ pytest
   渲染后分辨率必还原、字符串属性不被 `list()` 拆解等；
 - 基线相关：建立基线即产出首张预览、`preview_url` 可直接取到 PNG、URL 不含本机路径、
   旧任务不得携带结果、渲染失败时基线保留但任务落 `failed`；
+- 依赖枚举相关（`tests/test_color_looks.py`）：能力扫描按视图给出**真正接受**的集合并完整恢复状态、
+  RNA 报错不可解析时退化到赋值探测、无 OCIO 时不崩、单视图探针的合法性判定、
+  `identifier` 省略时不误探字符串 `"None"`、value/label 分离且 **label 不会被写进 Blender**、
+  归一化的四种等价匹配与回退、写入阶段顺序、写 look 失败时 `view_transform` 被回滚、
+  非法组合抛 `INVALID_DEPENDENT_ENUM`（且不产生任务、不碰 Blender）、切换视图后完整草稿可预览、
+  恢复基线逐项一致、旧预设名称迁移、前端 value/label 与代次守卫契约。
 - 取景相关（`tests/test_framing.py`）：当前相机模式不改动相机与当前帧、三种自动取景均完整入画、
   安全边距生效、模型离世界原点仍正确、排除刚体代理与描边壳、预览后恢复原 `scene.camera`、
   **渲染抛错也恢复且无临时相机残留**、切帧/换相机/移动相机/改焦距/改 shift 判为失效、
@@ -224,7 +262,12 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 取景栏四项事实、默认「当前相机预览」标识、相机动画告警文案、
 自动全身取景后角色完整入画、**原相机世界变换/焦距/shift 逐字段未变**、
 临时预览相机零残留、切帧后失效横幅 + 停止自动预览 + 禁用重新取景 + 画面不被顶替、刷新基线后自愈。
-截图默认落在系统临时目录。当前结果：**31/31 通过**。
+另有依赖枚举相关断言：Look 下拉框的 `value` 逐项等于后端能力表里的 Blender 真实 identifier、
+切换视图变换后 Look 列表立即刷新并按规范化名称迁移（`AgX - High Contrast` ⇄ `High Contrast`）、
+迁移后给出说明文案、切换视图后完整草稿可正常预览（不再 `BLENDER_SCRIPT_ERROR`）、
+任务记录里 `effective_value` 是真实 identifier 且 `display_label` 独立保存、
+快速连续切换视图后列表对应**最后一次**选择、非法组合报 `INVALID_DEPENDENT_ENUM` 且前端摊开依赖详情。
+截图默认落在系统临时目录。当前结果：**52/52 通过**。
 
 ### 接口
 
@@ -238,6 +281,8 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 | POST | `/api/session/baseline` | 读取并固化「内存基线」（含帧/相机/取景快照），**并立即用基线参数创建首张预览任务**；可传 `framing` 指定取景方式 |
 | GET | `/api/session/baseline` | 查看当前内存基线（未建立时 409） |
 | POST | `/api/session/restore` | 回滚到基线，返回逐项校验结果 |
+| GET | `/api/color/looks` | 某视图下 Blender **真正接受**的 Look 档位（`{view_transform: [{value,label}]}` 能力表）；可传 `view_transform` / `identifier` 走单视图只读探针 |
+| POST | `/api/color/looks/refresh` | 重新扫描 Look 能力表（换了 OCIO 配置时用）；只改能力表，不动工程取值 |
 | GET | `/api/framing/context` | 只读取景上下文：当前帧/相机/动画/角色是否入画/越界比例 + 基线是否失效 + 四种取景方式白名单 |
 | POST | `/api/preview` | 入参 `{"draft": {"参数id": 取值}, "framing": {"mode": ..., "margin": ...}}`，返回 `job_id`；**不接受任何代码** |
 | GET | `/api/jobs/{job_id}` | 任务状态查询（替代固定 `sleep`） |
@@ -249,14 +294,22 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 
 常用错误码：`PARAM_INVALID`（参数越界/未知字段）、`MISSING_BASELINE`（未建基线）、
 `FRAMING_STALE`（409，基线建立后帧或相机被外部改动，retryable —— 刷新基线即可恢复）、
-`FRAMING_UNAVAILABLE`（409，拿不到当前取景上下文）。
+`FRAMING_UNAVAILABLE`（409，拿不到当前取景上下文）、
+`INVALID_DEPENDENT_ENUM`（400，依赖枚举取值非法，例如 Standard 下提交 `AgX - Punchy`；返回体里带
+`parameter` / `value` / `depends_on` / `allowed`，`retryable=false`）。
 
 ### Blender 5.x 适配记录
 
 - 合成器节点树在 5.x 是 **`scene.compositing_node_group`**，不再是 `scene.node_tree`。
 - 本管线的辉光节点为 **`AI_Compositor › Autocel_Glow`**（GLARE，label「辉光」）；该组内无 Tonemapping 节点。
-- `view_transform` / `look` 的候选值无法从 `bl_rna.enum_items` 取到（非 UI 上下文只返回 `NONE`），
-  改为从 **`PyOpenColorIO` 当前配置**读取（`getViews(display)` / `getLookNames()`）。
+- `view_transform` / `look` 的候选值无法从 `bl_rna.enum_items` 取到（非 UI 上下文只返回 `NONE`）。
+  `PyOpenColorIO` 的 `getViews(display)` 可以用来枚举视图，但 **`getLookNames()` 是 OCIO 全局名单、
+  不是当前视图的合法集合**（是各视图合法集合的超集），只能当探测原料。
+  `look` 的权威允许列表改从 **Blender 自己的枚举报错文本**里解析（见「依赖枚举（视图变换 → Look）」）。
+- 实测 Blender 5.2.1：`Standard`/`Filmic`/`Filmic Log`/`Raw`/`Khronos PBR Neutral` → `None` + 通用 7 档；
+  `AgX` → `None` + `AgX - *` 9 档；`False Color` → `None` + `False Color - *` 9 档；
+  `ACES 1.3`/`ACES 2.0` → `None` + `<同名> - Reference Gamut Compression`。
+  切换 `view_transform` 时 Blender 自身会按「档位」跨视图映射 look（`AgX - High Contrast` ⇄ `High Contrast`）。
 
 ### 常见问题
 
@@ -272,6 +325,9 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 | 人物出画/只有半张脸 | 工程相机构图偏近所致。把「预览取景方式」切到 `auto_full_body` / `auto_upper_body` / `auto_headshot`，或调大「安全边距」。自动取景用临时相机，**不会改动你的相机** |
 | 出现「当前帧/相机已变化，请刷新基线」 | 你在建立基线后切了帧或动了相机（或相机带关键帧动画、帧被别的脚本改了）。点「建立 / 刷新基线」重新锁定即可；刷新前自动预览会保持停止，避免把新构图误当参数效果 |
 | 取景方式切了但画面没变 | 若已出现失效横幅，「重新取景」会被禁用（这是有意的）。先刷新基线 |
+| 切换视图变换后 Look 下拉框变了 | 这是有意的：Look 的合法档位由视图变换决定。旧档位有等价项会按名称迁移并给出说明，没有等价项则回退 `None` |
+| 预览报 `INVALID_DEPENDENT_ENUM` | 该 Look 在当前「视图变换」下不合法。提示里会列出可选档位；换一个档位，或先把视图变换调回去 |
+| 旧预设里的 Look 名字不认了 | 预设里的显示名会在加载时按当前视图迁移成真实 identifier；若确实没有等价档位会回退 `None` 并给出告警 |
 | 页面打不开 | 确认 uvicorn 已在 8765 运行 |
 
 ## 开发状态
@@ -281,6 +337,7 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 - [x] **MVP-01：只读连接闭环** —— 连接 9876 → 读当前场景 → 展示连接状态与场景摘要 → 断线重连（不改动任何 Blender 数据）
 - [x] **MVP-02：L0 曝光/辉光调参与无污染预览** —— 内存基线 → 整份草稿应用 → 单次预览渲染 → `job_id` 状态查询 → 回滚基线并校验（只出临时 PNG，不保存工程）
 - [x] **MVP-02 补充：预览取景** —— 顶部取景诊断栏（帧/相机/动画/是否入画）→ 四种取景方式 → 临时预览相机自动取景（`finally` 必定恢复原相机）→ 基线失效保护（切帧/动相机即停止自动预览）
+- [x] **MVP-02 修正：依赖枚举联动** —— 按 `view_transform` 探测 Look 合法集合 → value/label 分离 → 切换视图即刷新候选并迁移旧值 → 下发前依赖校验（`INVALID_DEPENDENT_ENUM`）→ 写入顺序固定 + 原子回滚
 - [ ] 保存预设 / 应用到工程（**须在「恢复基线」通过重复测试后才开始**）
 - [ ] Cel 色阶编辑器（7 组，L1）
 - [ ] 严格材质匹配与手工归类（L2）
