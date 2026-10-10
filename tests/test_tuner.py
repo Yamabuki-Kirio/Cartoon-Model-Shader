@@ -16,7 +16,8 @@ from src.server.binder import BlenderBinder
 from src.server.blender_ops import JSON_MARKER, build_read_code, build_set_code
 from src.server.config import BlenderMCPConfig
 from src.server.session import PreviewService
-from tests.fake_bpy import FakeBpy, FakeImage, extract_marker, run_generated_code
+from tests.fake_bpy import (FakeBpy, FakeImage, FakeNode, FakeNodeGroup,
+                            extract_marker, run_generated_code)
 from tests.fake_mcp_server import FakeMCPServer
 
 
@@ -345,4 +346,69 @@ def test_missing_glare_node_reports_clear_error() -> None:
     assert payload["failure"]["stage"] == "others"
     assert "Autocel_Glow" in payload["failure"]["message"]
     # 原子性：辉光写失败也不留半应用状态
+    assert payload["restore_ok"] is True
+
+
+# -- F3：辉光节点必须按【类型】定位，不能依赖名字 ---------------------------
+
+
+def test_glow_works_when_glare_node_has_chinese_localized_name() -> None:
+    """★ F3 回归：真实工程的辉光节点名是 Blender 的本地化默认名。
+
+    一键卡通渲染.py::setup_compositor 建完 ``CompositorNodeGlare`` **从不改名**，
+    所以中文 UI 下节点就叫「眩光」。旧实现写死 ``nodes.get("Autocel_Glow")``，
+    于是真实工程永远取不到 → 6 项辉光参数全部报「缺少辉光节点」。
+    那个名字只存在于本工具自己的测试桩里，所以长期没被真实 Blender 暴露。
+    """
+    fake = FakeBpy(glare_node_name="眩光")
+    assert fake.node_groups["AI_Compositor"].nodes.get("Autocel_Glow") is None, \
+        "前置条件：这个桩里没有 Autocel_Glow 这个名字"
+
+    payload = extract_marker(
+        run_generated_code(build_set_code({"glow.threshold": 2.5, "glow.strength": 0.4}), fake),
+        JSON_MARKER)
+
+    assert payload["applied"] is True, payload.get("failure")
+    assert payload["glare"]["Threshold"] == pytest.approx(2.5)
+    assert payload["glare"]["Strength"] == pytest.approx(0.4)
+
+
+def test_glow_works_when_glare_node_has_english_localized_name() -> None:
+    """英文 UI 下节点叫「Glare」，同样要能取到"""
+    fake = FakeBpy(glare_node_name="Glare")
+    payload = extract_marker(run_generated_code(build_read_code(), fake), JSON_MARKER)
+    assert payload["glare_present"] is True
+    assert payload["glare"]["Type"] == "Bloom"
+
+    payload = extract_marker(
+        run_generated_code(build_set_code({"glow.size": 0.25}), fake), JSON_MARKER)
+    assert payload["applied"] is True, payload.get("failure")
+    assert payload["glare"]["Size"] == pytest.approx(0.25)
+
+
+def test_glare_locator_prefers_name_then_type() -> None:
+    """定位策略必须是「名字优先、类型回退」—— 已显式命名的工程行为不能被改变"""
+    src = "\n".join(blender_ops._glare_locator_lines())
+    assert "ng.nodes.get(" in src
+    assert "bl_idname" in src
+    assert src.index("ng.nodes.get(") < src.index("bl_idname"), "名字必须在类型之前尝试"
+
+
+def test_group_without_glare_node_reports_named_error_and_rolls_back() -> None:
+    """节点组在、但里面没有 Glare 节点 → 稳定可读错误 + 完整回滚（不静默跳过）"""
+    fake = FakeBpy()
+    fake.node_groups["AI_Compositor"] = FakeNodeGroup(
+        "AI_Compositor",
+        [FakeNode("Render Layers", "R_LAYERS"),
+         FakeNode("Group Output", "GROUP_OUTPUT", {"Image": [0, 0, 0, 1]})],
+    )
+    payload = extract_marker(
+        run_generated_code(build_set_code({"glow.threshold": 1.0}), fake), JSON_MARKER)
+
+    assert payload["applied"] is False
+    assert payload["failure"]["kind"] == "write_failed"
+    assert payload["failure"]["stage"] == "others"
+    # 错误说明必须同时点出类型与期望名称，便于排查
+    assert "CompositorNodeGlare" in payload["failure"]["message"]
+    assert "Autocel_Glow" in payload["failure"]["message"]
     assert payload["restore_ok"] is True

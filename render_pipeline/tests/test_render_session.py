@@ -35,6 +35,23 @@ V31 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, V31)
 sys.path.insert(0, os.path.join(V31, "_tools"))
 
+#: 测试临时目录一律建在**系统临时目录**，不建在仓库里。
+#  以前这里写的是 ``dir=V31``：确认服务子进程刚退出时 Windows 上文件还可能被占用，
+#  ``shutil.rmtree(..., ignore_errors=True)`` 会**静默**留下残留目录
+#  （实测留下过 render_pipeline/_t_http_*，内含 fixture.pmx 与 job.json），
+#  进而把 tests/test_render_pipeline_repo_guard.py 的「仓库不得有生成物」守卫打红。
+#  运行数据不该写进仓库 —— 测试产出的临时数据同理。
+_TEST_TMP = tempfile.gettempdir()
+
+
+def _cleanup(path):
+    """Windows 上删临时目录可能撞文件占用 —— 重试几次，别静默留垃圾。"""
+    for _ in range(5):
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.exists(path):
+            return
+        time.sleep(0.2)
+
 import confirm_server as CS          # noqa: E402
 import run_contract as RC           # noqa: E402
 from render_lock import RenderLock, LockBusy   # noqa: E402
@@ -89,7 +106,7 @@ def wait_terminal(base, sid, timeout=60):
 # =====================================================================================
 class TestRenderStateMachine(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="_t_rs_", dir=V31)
+        self.tmp = tempfile.mkdtemp(prefix="_t_rs_", dir=_TEST_TMP)
         CS.STATE["models"] = {}
         CS.STATE["order"] = []
         CS.STATE["maps_dir"] = os.path.join(self.tmp, "maps")
@@ -118,7 +135,7 @@ class TestRenderStateMachine(unittest.TestCase):
     def tearDown(self):
         if CS.RENDER.get("thread"):
             CS.RENDER["thread"].join(timeout=10)
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        _cleanup(self.tmp)
 
     def _confirm(self):
         CS.STATE["models"][FP_A]["assignments"]["测试材质"] = {"group": "Cel_Cloth"}
@@ -211,7 +228,7 @@ class TestRenderStateMachine(unittest.TestCase):
 # =====================================================================================
 class TestJobValidation(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="_t_job_", dir=V31)
+        self.tmp = tempfile.mkdtemp(prefix="_t_job_", dir=_TEST_TMP)
         self.old_root = CS.ROOT
         CS.ROOT = os.path.join(self.tmp, "models")
         os.makedirs(CS.ROOT, exist_ok=True)
@@ -225,7 +242,7 @@ class TestJobValidation(unittest.TestCase):
 
     def tearDown(self):
         CS.ROOT = self.old_root
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        _cleanup(self.tmp)
 
     def _job(self, targets):
         return {"targets": targets, "out_root": os.path.join(self.tmp, "out")}
@@ -272,11 +289,11 @@ class TestJobValidation(unittest.TestCase):
 # =====================================================================================
 class TestRenderLock(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="_t_lock_", dir=V31)
+        self.tmp = tempfile.mkdtemp(prefix="_t_lock_", dir=_TEST_TMP)
         self.p = os.path.join(self.tmp, "a.render.lock")
 
     def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        _cleanup(self.tmp)
 
     def test_second_acquire_is_refused(self):
         a = RenderLock(self.p, tag="a").acquire()
@@ -312,7 +329,7 @@ class TestRenderLock(unittest.TestCase):
 # =====================================================================================
 class TestHttpSurface(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="_t_http_", dir=V31)
+        self.tmp = tempfile.mkdtemp(prefix="_t_http_", dir=_TEST_TMP)
         self.model_root = os.path.join(self.tmp, "models")
         os.makedirs(self.model_root, exist_ok=True)
         self.maps = os.path.join(self.tmp, "maps")
@@ -378,7 +395,7 @@ class TestHttpSurface(unittest.TestCase):
             self.proc.stdout.close()
         if out and os.environ.get("TEST_SHOW_SERVER_LOG"):
             sys.stderr.write(out.decode("utf-8", "replace"))
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        _cleanup(self.tmp)
 
     def test_unknown_session_id_rejected(self):
         code, _b = http("POST", self.base + "/api/session/deadbeef/render", {})

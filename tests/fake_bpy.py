@@ -1057,8 +1057,16 @@ class _Context:
 class FakeBpy:
     """可执行的 `bpy` 替身。"""
 
-    def __init__(self, capability: dict[str, list[str]] | None = None) -> None:
-        glare = FakeNode("Autocel_Glow", "GLARE", dict(DEFAULT_GLARE_INPUTS))
+    def __init__(
+        self,
+        capability: dict[str, list[str]] | None = None,
+        *,
+        glare_node_name: str = "Autocel_Glow",
+    ) -> None:
+        #: 辉光节点的名字。真实工程里它是 Blender 的**本地化默认名**
+        #: （中文 UI「眩光」/ 英文 UI「Glare」）—— 管线建完 CompositorNodeGlare
+        #: 之后从不改名。做成参数，才能回归「按类型定位而不是按名字定位」（F3）。
+        glare = FakeNode(glare_node_name, "GLARE", dict(DEFAULT_GLARE_INPUTS))
         self.node_groups: dict[str, FakeNodeGroup] = {
             "AI_Compositor": FakeNodeGroup(
                 "AI_Compositor",
@@ -1223,6 +1231,10 @@ class FakeBpy:
     def glare_node(self) -> FakeNode:
         group = self.node_groups["AI_Compositor"]
         node = group.nodes.get("Autocel_Glow")
+        if node is None:
+            # 真实工程里名字是本地化的（「眩光」/「Glare」）—— 按类型回退
+            node = next((n for n in group.nodes
+                         if getattr(n, "bl_idname", "") == "CompositorNodeGlare"), None)
         assert node is not None
         return node
 
