@@ -538,10 +538,12 @@ def write_run_manifest(out_dir, pre_existing, extra_inputs=(), extra_info=None):
             "sha256": sha256_of(p),
             "generated_this_run": fn not in pre_existing,
         })
-    inputs = [{"role": "source_blend", "path": SOURCE_BLEND,
+    inputs = [{"role": "source_blend", "path": MC.display_path(SOURCE_BLEND),
                "sha256": sha256_of(SOURCE_BLEND)}]
     for role, path in extra_inputs:
-        inputs.append({"role": role, "path": path, "sha256": sha256_of(path)})
+        # ★ 路径只做**展示层**脱敏（去掉用户目录前缀），哈希仍按真实路径算。
+        inputs.append({"role": role, "path": MC.display_path(path),
+                       "sha256": sha256_of(path)})
     manifest = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "blender_version": bpy.app.version_string,
@@ -567,10 +569,12 @@ def write_run_manifest(out_dir, pre_existing, extra_inputs=(), extra_info=None):
                 "sha256": sha256_of(RESOLVED_MAP_PATH) if RESOLVED_MAP_PATH else None,
                 "resolved_by": MAP_RESOLVED_BY,
                 "entry_count": len(MODEL_MAP or {}),
-                "maps_dir": MAPS_DIR,
+                # ★ 展示层脱敏：默认目录写成 %LOCALAPPDATA%\CartoonModelShader\model_material_maps
+                #   而不是带用户名的绝对路径 —— 清单不需要用户名。
+                "maps_dir": MC.display_path(MAPS_DIR),
                 "maps_dir_in_repo": _maps_dir_in_repo(),
             },
-            "v3_dir": V3_DIR,
+            "v3_dir": MC.display_path(V3_DIR),
         },
         "material_classification": dict(RUN_INFO.get("material_classification", {})),
         "classification_log": list(CLASSIFICATION_LOG),

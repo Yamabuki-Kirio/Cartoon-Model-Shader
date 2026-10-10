@@ -182,6 +182,50 @@ class TestRepoIsNeverWrittenByRun:
         assert "_maps_dir_in_repo()" in src
 
 
+# ------------------------------------------------------ provenance 路径脱敏
+class TestProvenancePathRedaction:
+    """清单/provenance 不得带用户名路径；默认映射目录以 %LOCALAPPDATA% 形式展示。"""
+
+    def test_default_maps_dir_is_shown_as_localappdata(self):
+        from material_classifier import default_maps_dir, display_path
+        old = os.environ.pop("TOON_MAPS_DIR", None)
+        try:
+            shown = display_path(default_maps_dir())
+        finally:
+            if old is not None:
+                os.environ["TOON_MAPS_DIR"] = old
+        assert shown.startswith("%LOCALAPPDATA%" + os.sep), shown
+        assert "CartoonModelShader" in shown, shown
+        username = (os.environ.get("USERNAME") or "").strip()
+        if username:
+            assert username.lower() not in shown.lower(), shown
+
+    def test_username_in_path_falls_back_to_basename(self):
+        from material_classifier import display_path
+        username = (os.environ.get("USERNAME") or "").strip()
+        if not username:
+            return  # 极少数无 USERNAME 的环境：本用例无意义
+        fake = os.path.join("Q:", os.sep, "srv", username, "deep", "map.json")
+        assert display_path(fake) == "map.json"
+
+    def test_unrelated_path_is_kept(self):
+        from material_classifier import display_path
+        path = os.path.join("R:", os.sep, "assets", "model", "map.json")
+        # 与用户名无关的工程盘路径原样保留（清单仍可定位到项目盘）
+        assert display_path(path) == os.path.abspath(path)
+
+    def test_none_and_empty_pass_through(self):
+        from material_classifier import display_path
+        assert display_path(None) is None
+        assert display_path("") == ""
+
+    def test_main_script_redacts_provenance_paths(self):
+        src = _text(MAIN_SCRIPT)
+        assert "MC.display_path(MAPS_DIR)" in src
+        assert "MC.display_path(V3_DIR)" in src
+        assert "MC.display_path(SOURCE_BLEND)" in src
+
+
 # ------------------------------------------------------------------ 默认目录
 class TestDefaultMapsDir:
     def test_default_is_user_data_not_repo(self):

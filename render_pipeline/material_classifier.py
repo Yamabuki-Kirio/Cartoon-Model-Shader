@@ -41,6 +41,55 @@ def default_maps_dir():
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     return os.path.join(base, "CartoonModelShader", "model_material_maps")
 
+
+#: 用户目录环境变量 -> 展示占位符。**顺序重要**：LOCALAPPDATA / APPDATA 都嵌在
+#: USERPROFILE 之下，先匹配更具体的那个，展示结果才不是 `%USERPROFILE%\AppData\Local\…`。
+_PATH_PLACEHOLDERS = (
+    ("LOCALAPPDATA", "%LOCALAPPDATA%"),
+    ("APPDATA", "%APPDATA%"),
+    ("USERPROFILE", "%USERPROFILE%"),
+)
+
+
+def display_path(path):
+    """
+    把绝对路径转成【不含用户名】的展示形式，供 run_manifest / provenance 留档。
+
+    清单是给人审计的：既不需要绝对路径，也不该把用户名带出去。
+    规则（按优先级）：
+
+      1. 落在 %LOCALAPPDATA% / %APPDATA% / %USERPROFILE% 之下 ⇒ 换成对应占位符
+         （默认侧车映射目录因此展示为 `%LOCALAPPDATA%\\CartoonModelShader\\model_material_maps`）；
+      2. 其余路径若仍出现当前用户名（例如自定义目录建在用户主目录下），
+         只保留文件名 —— 兜底，绝不放用户名出清单；
+      3. 其它情况原样返回（例如与用户名无关的项目盘素材路径）。
+
+    注意：**只在展示层脱敏**。哈希、读写、越界判定仍用真实绝对路径。
+    """
+    if path in (None, ""):
+        return path
+    text = str(path)
+    try:
+        full = os.path.abspath(text)
+    except Exception:
+        return text
+
+    norm = os.path.normcase(full)
+    for env_name, placeholder in _PATH_PLACEHOLDERS:
+        base = os.environ.get(env_name)
+        if not base:
+            continue
+        base_abs = os.path.abspath(base)
+        base_norm = os.path.normcase(base_abs)
+        if norm == base_norm or norm.startswith(base_norm + os.sep):
+            rest = full[len(base_abs):].lstrip("\\/")
+            return placeholder + (os.sep + rest if rest else "")
+
+    username = (os.environ.get("USERNAME") or "").strip()
+    if username and username.lower() in full.lower():
+        return os.path.basename(full) or full
+    return full
+
 # 规范化时要抹掉的分隔符
 _SEP_RE = re.compile(r"[\s_\-\.\+\(\)\[\]\{\}（）【】·・、,，:：/\\|]+")
 _TRAIL_NUM_RE = re.compile(r"\d+$")
