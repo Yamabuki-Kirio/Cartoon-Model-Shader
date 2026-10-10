@@ -189,9 +189,12 @@ export function CelEditor({ workspace, groupId }: { workspace: Workspace; groupI
 /**
  * Emission 强度：**只有 schema 确认 `editable: true` 时才渲染控件**。
  *
- * 当前真机拓扑未确认，后端一律给 `editable: false` +
- * `readonly_reason: "unconfirmed_capability"`，因此这里只会显示只读值 ——
- * 这不是「忘了实现」，而是刻意的：未经确认的插座名写下去就是写错对象。
+ * 真机拓扑确认后（2026-10-11，受管 Cel 组全部命中「``EMISSION`` 节点 + ``Strength``
+ * 插座且未连线」），后端给的是 `NODE_SOCKET.default_value`（object_id =
+ * 「组名/节点名/插座名」，三段都由探测结果拼出），因此这里渲染数字输入框。
+ *
+ * 仍会拿到 `editable: false` 的两种情形：插座已被上游连线（写 default_value
+ * 不生效）、或该组是参考组（回退策略）—— 那时只显示只读值。
  */
 export function EmissionRow({ workspace, node }: { workspace: Workspace; node: SurfaceNode | null }) {
   const state = useWorkspace(workspace);

@@ -644,8 +644,14 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 - [ ] **v4 提交 4：完整参数族（世界/描边/渲染质量/灯光/相机/材质）与 L0–L3 调度，L0 迁入递归 schema**
 - [ ] **v4 提交 5：预设 v1→v2 迁移、新 UI 切换到 `/` 并下线旧页面**
 - [ ] **校对 `/next` 的真实浏览器效果**（本提交只做了 Vitest 的 jsdom 断言；真机浏览器仍需人工看一眼）
-- [ ] **校准 Cel 的真实 socket 名**（在有 Blender 的机器上跑 `GET /api/diagnostics/describe` 回传；
-      在此之前 Emission 强度保持 `editable: false` / `readonly_reason: "unconfirmed_capability"`）
+- [x] **校准 Cel 的真实 socket 名** —— 真机确认（2026-10-11，Blender 5.2.1 LTS，受管 Cel 组
+      全部命中「`EMISSION` 节点（节点名本地化，如「自发光」）+ `Strength` 插座且未连线」）→
+      `cel.<group>.emission_strength` 写入 `NODE_SOCKET.default_value`
+      （`object_id` = 组名/节点名/插座名，三段来自探测结果）；插座被上游连线、或该组是
+      reference 角色时仍降级只读
+- [x] **渲染脚本侧辉光节点定位** —— 合成器 Glare 节点按 `bl_idname == "CompositorNodeGlare"`
+      定位（名字优先、类型回退）：真机上节点名随工程而变（实测 `GLOW_卡通辉光`），
+      硬编码任何名字都不可靠
 - [ ] **真实 Blender 验收保存流程**（人工步骤：另存为到新文件、覆盖当前工程、确认备份可打开、故意让保存失败并确认草稿保留）
 - [ ] **真实 Blender 验收 v4 竖切**（人工步骤：连续预览不累积污染、恢复基线逐项一致、保存重开后参数图一致）- [ ] 严格材质匹配与手工归类（L2）
 - [ ] A/B 对比、差异热力图、背景切换

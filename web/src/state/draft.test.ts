@@ -123,7 +123,7 @@ describe("复位与提交前过滤", () => {
       "cel.Cel_Skin.ramp": { elements: [], interpolation: "LINEAR" },
       // 只读展示项：不允许提交
       "cel.Cel_Skin.managed_mode": "editable",
-      // 未确认能力：不允许提交
+      // 真机已确认的 Emission 强度：**可写**，允许提交
       "cel.Cel_Skin.emission_strength": 3,
       // 参考组：不可编辑
       "cel.Sakura_Hair_Reference.ramp": { elements: [], interpolation: "LINEAR" },
@@ -131,14 +131,18 @@ describe("复位与提交前过滤", () => {
       "nope.nope": 1,
     };
     const clean = sanitizeDraft(schema, draft);
-    expect(Object.keys(clean)).toEqual(["cel.Cel_Skin.ramp"]);
+    expect(Object.keys(clean).sort()).toEqual(
+      ["cel.Cel_Skin.emission_strength", "cel.Cel_Skin.ramp"].sort()
+    );
     expect(clean["cel.Cel_Skin.ramp"]).toEqual({ elements: [], interpolation: "LINEAR" });
+    expect(clean["cel.Cel_Skin.emission_strength"]).toBe(3);
   });
 
   it("writableIdsOf 只给出可写 id", () => {
     const ids = writableIdsOf(schema.groups[0]);
     expect(ids).toContain("cel.Cel_Skin.ramp");
-    expect(ids).not.toContain("cel.Cel_Skin.emission_strength");
+    // 真机确认后 Emission 强度是可写参数
+    expect(ids).toContain("cel.Cel_Skin.emission_strength");
     expect(ids).not.toContain("cel.Cel_Skin.managed_mode");
   });
 });

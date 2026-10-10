@@ -11,6 +11,9 @@
 * Emission：用**候选插座名 + 结构验证**判定。候选命中多个、或命中的节点类型
   不是发光语义 ⇒ 判为无法唯一确定，降级只读。**不把候选名当成事实**，
   也不因为某个名字出现在某份参考脚本里就写死。
+  真机确认（2026-10-11）：受管 Cel 组全部命中「``EMISSION`` 节点 + ``Strength``
+  插座且未连线」，因此可写；插座被上游连线、或该组是 reference 角色时降级只读。
+  写入走 ``NODE_SOCKET.default_value``，节点/插座缺失即整体失败并回滚。
 * ``Sakura_Hair_Reference``：归入 ``reference`` 角色，恒为只读（决策：回退策略用）。
 
 假 ``bpy`` 的作用仅限于验证**协议与安全逻辑**，不作为真实拓扑的事实来源 ——
@@ -31,7 +34,6 @@ from .schema import (
     REASON_NOT_FOUND,
     REASON_REFERENCE_ONLY,
     REASON_STRUCTURAL,
-    REASON_UNCONFIRMED_CAPABILITY,
     SOURCE_SCENE,
     SOURCE_UNSUPPORTED,
     ScalarNode,
@@ -175,36 +177,71 @@ def build_group_node(
         )
 
     # -- 发光强度 ---------------------------------------------------------
-    # ⚠ 只读。命中与否照实报告，但**一律不写**：真实 Blender 里 Emission 强度的
-    #   插座名尚未通过真机拓扑确认（提交 3A 的既定口径），此时写入等于猜。
-    #   拿到 `/api/diagnostics/describe` 的真实输出、把候选名校准之后再开放编辑。
+    # 真机事实（2026-10-11，Blender 5.2.1 LTS，受管 Cel 组全部命中）：
+    #   node name='自发光' type='EMISSION' bl_idname='ShaderNodeEmission'
+    #   socket name='Strength' type='VALUE' linked=False value=0.5（各组不同）
+    # 因此「候选名 + 结构验证」在真机成立 ⇒ 开放写入（v4 提交 1 承诺的 L1 参数）。
+    # 两种情形仍降级只读，且**都不生成**写下去没反应的可编辑控件：
+    #   1. 插座已被上游连线（default_value 不生效）；
+    #   2. 该组是 reference 角色（回退策略，恒只读）。
     emission = _emission_sockets(group)
     if len(emission) == 1:
+        node_name = str(emission[0].get("node_name") or "")
         socket = emission[0]["socket"]
+        socket_name = str(socket.get("name") or "")
         value = socket.get("value")
-        children.append(
-            ScalarNode(
-                id=f"{_cel_prefix(name)}.emission_strength",
-                kind="float",
-                group=GROUP,
-                cost=COST_L1,
-                label=f"{name} Emission 强度",
-                value=value,
-                baseline=value,
-                effective=value,
-                minimum=0.0,
-                maximum=100.0,
-                step=0.05,
-                supported=True,
-                editable=False,
-                readonly_reason=REASON_UNCONFIRMED_CAPABILITY,
-                value_source=SOURCE_SCENE,
-                note=(
-                    "只读：已探测到候选 Emission 强度插座，但在真实 Blender 拓扑确认之前"
-                    "不写入（避免写错插座）。"
-                ),
+        if bool(socket.get("linked")):
+            children.append(
+                ScalarNode(
+                    id=f"{_cel_prefix(name)}.emission_strength",
+                    kind="float",
+                    group=GROUP,
+                    cost=COST_L1,
+                    label=f"{name} Emission 强度",
+                    value=value,
+                    baseline=value,
+                    effective=value,
+                    minimum=0.0,
+                    maximum=100.0,
+                    step=0.05,
+                    supported=True,
+                    editable=False,
+                    readonly_reason=REASON_STRUCTURAL,
+                    value_source=SOURCE_SCENE,
+                    reason=(
+                        "该节点组的 Emission 强度插座已被上游连线，"
+                        "写入 default_value 不会影响画面，因此不可编辑。"
+                    ),
+                )
             )
-        )
+        else:
+            children.append(
+                ScalarNode(
+                    id=f"{_cel_prefix(name)}.emission_strength",
+                    kind="float",
+                    group=GROUP,
+                    cost=COST_L1,
+                    label=f"{name} Emission 强度",
+                    value=value,
+                    baseline=value,
+                    effective=value,
+                    minimum=0.0,
+                    maximum=100.0,
+                    step=0.05,
+                    supported=True,
+                    editable=not readonly_by_role,
+                    readonly_reason=REASON_REFERENCE_ONLY if readonly_by_role else None,
+                    # object_id = 组名/节点名/插座名，三段都来自**探测结果**。
+                    binding=Binding(
+                        "NODE_SOCKET", f"{name}/{node_name}/{socket_name}", "default_value"
+                    ),
+                    value_source=SOURCE_SCENE,
+                    note=(
+                        f"写入 {name} 组内 {node_name} 节点的 {socket_name} 插座（default_value）。"
+                        f"节点或插座缺失、或插座已被连线时整份计划失败并回滚。"
+                    ),
+                )
+            )
     elif not emission:
         children.append(
             ScalarNode(

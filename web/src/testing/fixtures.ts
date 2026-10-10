@@ -116,7 +116,7 @@ export function readonlyEnum(id: string, value: string, reason = "structural") {
   };
 }
 
-/** 未确认能力的标量（e.g. Emission 强度）：supported 但不可写。 */
+/** 未确认能力的标量（通用只读夹具）：探到了，但真机插座名尚未确认。 */
 export function unconfirmedScalar(id: string, value: number) {
   return {
     id,
@@ -130,6 +130,44 @@ export function unconfirmedScalar(id: string, value: number) {
     readonly_reason: "unconfirmed_capability",
     value_source: "scene",
     structural: false,
+    value,
+    baseline: value,
+    effective: value,
+    minimum: 0,
+    maximum: 100,
+    step: 0.05,
+  };
+}
+
+/**
+ * Cel 组的 Emission 强度（真机已确认，可写）。
+ *
+ * 与 `unconfirmedScalar` 的差别只有 `editable` 与 `binding`：真机拓扑确认后
+ * 后端给的是 `NODE_SOCKET.default_value`（object_id = 「组名/节点名/插座名」，
+ * 三段都来自探测结果），前端据此渲染数字输入框。
+ *
+ * 需要「降级只读」的夹具时，直接在这个对象上覆盖 `editable: false` +
+ * `readonly_reason` + `binding: undefined`（模拟插座被上游连线或参考组）。
+ */
+export function emissionScalar(id: string, value: number, nodeName = "Emission") {
+  const groupName = id.split(".")[1] ?? "Cel_Skin";
+  return {
+    id,
+    kind: "float",
+    group: "cel",
+    cost: "L1",
+    label: id,
+    supported: true,
+    editable: true,
+    active: true,
+    readonly_reason: null,
+    value_source: "scene",
+    structural: false,
+    binding: {
+      object_type: "NODE_SOCKET",
+      object_id: `${groupName}/${nodeName}/Strength`,
+      field: "default_value",
+    },
     value,
     baseline: value,
     effective: value,
@@ -163,7 +201,7 @@ export function schemaPayload(options: SchemaFixtureOptions = {}) {
       groupNode("Cel_Skin", {
         children: [
           rampNode({ group: "Cel_Skin" }),
-          unconfirmedScalar("cel.Cel_Skin.emission_strength", 1.5),
+          emissionScalar("cel.Cel_Skin.emission_strength", 1.5),
           impactCount("cel.Cel_Skin.impact.material_count", 7),
           readonlyEnum("cel.Cel_Skin.managed_mode", "editable"),
         ],

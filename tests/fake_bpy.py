@@ -1123,11 +1123,18 @@ class FakeBpy:
         interpolation: str = "LINEAR",
         materials: int = 0,
         emission_strength: float | None = None,
+        emission_node_name: str = "Emission",
+        emission_socket: str = "Strength",
+        emission_linked: bool = False,
     ) -> FakeNodeGroup:
         """往 ``bpy.data.node_groups`` 里注册一个 Cel 组。
 
         刻意包含一个带 ``color_ramp`` 的 ColorRamp 节点（真实管线以它承载色阶），
         以及一个可选的 Emission 节点 —— 后者用来验证「探到才生成可编辑节点」。
+
+        真机对照（Blender 5.2.1 LTS，中文 UI 下节点名是「自发光」、插座名仍是
+        英文 ``Strength``、``linked=False``）：``emission_linked=True`` 用于复现
+        「插座被上游连线 ⇒ default_value 写了也不生效」的降级路径。
         """
         elements = []
         for index in range(max(2, int(element_count))):
@@ -1139,9 +1146,12 @@ class FakeBpy:
             FakeNode("ColorRamp", "VALTORGB", color_ramp=ramp),
         ]
         if emission_strength is not None:
-            nodes.append(
-                FakeNode("Emission", "EMISSION", {"Strength": float(emission_strength)})
-            )
+            node = FakeNode(emission_node_name, "EMISSION", {emission_socket: float(emission_strength)})
+            if emission_linked:
+                socket = node.inputs.get(emission_socket)
+                if socket is not None:
+                    socket.is_linked = True
+            nodes.append(node)
         group = FakeNodeGroup(name, nodes)
         self.node_groups[name] = group
         self.cel_material_counts[name] = int(materials)

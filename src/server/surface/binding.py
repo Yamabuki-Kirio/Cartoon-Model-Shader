@@ -85,6 +85,12 @@ BINDING_WHITELIST: dict[str, frozenset[str]] = {
     "IMAGE_SETTINGS": frozenset({"file_format", "color_mode", "color_depth"}),
     "WORLD": frozenset({"color", "use_nodes", "node.strength"}),
     "NODE_GROUP": frozenset({"mute", "topology"}),
+    #: 节点组的**输入插座**（v4 提交 1 的 ``cel.<group>.emission_strength``）。
+    #:
+    #: ``object_id`` 形如 ``Cel_Skin/自发光/Strength`` = 组名/节点名/插座名。
+    #: 三段**全部由服务端从探测结果拼出**（``cel.build_group_node``），
+    #: 客户端永远不能提交节点路径或插座名 —— 与 ``COLOR_RAMP`` 同一条防线。
+    "NODE_SOCKET": frozenset({"default_value"}),
     "COLOR_RAMP": frozenset({"elements", "interpolation", "element_count"}),
     "LIGHT": frozenset(
         {

@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render } from "@testing-library/preact";
 import { afterEach, describe, expect, it } from "vitest";
 import { CelEditor } from "./CelEditor";
 import { makeTestWorkspace, settle } from "../../testing/endpoints";
-import { groupNode, rampNode, schemaPayload } from "../../testing/fixtures";
+import { groupNode, rampNode, emissionScalar, schemaPayload } from "../../testing/fixtures";
 import { parseSchema, topGroups } from "../../schema/parse";
 
 afterEach(cleanup);
@@ -253,7 +253,7 @@ describe("Cel 编辑器", () => {
     expect(getByTestId("cel-copy-notes-cel.Cel_Skin").textContent).toContain("不可编辑");
   });
 
-  it("Emission 未经真机确认时只读显示，不渲染输入框", async () => {
+  it("schema 里没有 emission 子节点时给出「未探测到」说明", async () => {
     const { workspace } = await setup([celGroup("Cel_Skin", 3)]);
     const { getByTestId, container } = render(<CelEditor workspace={workspace} groupId="cel.Cel_Skin" />);
     // 夹具的 Cel_Skin 不含 emission 子节点
@@ -261,7 +261,7 @@ describe("Cel 编辑器", () => {
     expect(container.querySelector('input[type="number"][data-testid^="cel-emission-"]')).toBeNull();
   });
 
-  it("Emission 可编辑时才出现控件（schema 说了算）", async () => {
+  it("Emission 可编辑时才出现控件（schema 说了算，真机确认后即可写）", async () => {
     const group = celGroup("Cel_Skin", 3) as {
       children: unknown[];
     } & Record<string, unknown>;
@@ -288,6 +288,22 @@ describe("Cel 编辑器", () => {
     expect(input).toBeTruthy();
     fireEvent.input(input as HTMLInputElement, { target: { value: "3.5" } });
     expect(workspace.store.getState().draft["cel.Cel_Skin.emission_strength"]).toBe(3.5);
+  });
+
+  it("Emission 被降级只读（插座被连线 / 参考组）时只显示值，不渲染输入框", async () => {
+    const group = celGroup("Cel_Skin", 3) as {
+      children: unknown[];
+    } & Record<string, unknown>;
+    group.children.push({
+      ...emissionScalar("cel.Cel_Skin.emission_strength", 0.5),
+      editable: false,
+      readonly_reason: "structural",
+      binding: undefined,
+    });
+    const { workspace } = await setup([group]);
+    const { getByTestId, container } = render(<CelEditor workspace={workspace} groupId="cel.Cel_Skin" />);
+    expect(getByTestId("cel-emission-readonly-cel.Cel_Skin.emission_strength").textContent).toBe("0.5");
+    expect(container.querySelector('input[data-testid^="cel-emission-"]')).toBeNull();
   });
 
   it("色标数量只读展示，且提示不提供增删", async () => {

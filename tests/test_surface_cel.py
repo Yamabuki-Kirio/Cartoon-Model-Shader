@@ -34,6 +34,9 @@ def describe_one(
     interpolation: str = "CONSTANT",
     emission_socket: str | None = "Strength",
     emission_node_type: str = "EMISSION",
+    emission_node_name: str = "Emission",
+    emission_linked: bool = False,
+    emission_value: float = 1.5,
     extra_ramps: int = 0,
     role: str = "managed",
     exists: bool = True,
@@ -78,11 +81,18 @@ def describe_one(
     if emission_socket is not None:
         nodes.append(
             {
-                "name": "Emission",
+                "name": emission_node_name,
                 "type": emission_node_type,
                 "bl_idname": f"ShaderNode{emission_node_type.title()}",
                 "mute": False,
-                "inputs": [{"name": emission_socket, "type": "VALUE", "linked": False, "value": 1.5}],
+                "inputs": [
+                    {
+                        "name": emission_socket,
+                        "type": "VALUE",
+                        "linked": emission_linked,
+                        "value": emission_value,
+                    }
+                ],
                 "color_ramp": None,
             }
         )
@@ -205,31 +215,85 @@ def test_multiple_ramps_are_ambiguous_and_degrade() -> None:
 # -- 适配器：Emission 用候选 + 结构验证 ------------------------------------
 
 
-def test_emission_socket_detected_with_candidate_and_structure() -> None:
-    """探到了就照实报告（``supported: true``），但**在真实拓扑确认前一律只读**。
+def test_emission_socket_detected_and_now_writable() -> None:
+    """真机确认后开放写入：候选名 + 结构验证命中 ⇒ 生成**可写**的 Emission 强度节点。
 
-    这里刻意区分「探到」与「可写」：候选名 + 结构验证只能证明「像」Emission 强度，
-    不能证明它就是。真实 socket 名由真机 ``/api/diagnostics/describe`` 输出校准。
+    真机事实（2026-10-11，Blender 5.2.1 LTS，受管 Cel 组全部命中）：
+    ``EMISSION``（``bl_idname=ShaderNodeEmission``）+ ``Strength`` 插座且未连线。
     """
     nodes = build_nodes(emission_socket="Strength", emission_node_type="EMISSION")
     node = find(nodes, "cel.Cel_Skin.emission_strength")
     assert node.supported is True
     assert node.value == pytest.approx(1.5)
-    assert node.editable is False
-    assert node.readonly_reason == schemamod.REASON_UNCONFIRMED_CAPABILITY
+    assert node.editable is True
+    assert node.readonly_reason is None
+    assert node.binding is not None
 
 
-def test_emission_has_no_writable_binding() -> None:
-    """只读能力**不得带可写 binding** —— 否则「只读」只是一句文案。
+def test_emission_binding_targets_node_socket_not_node_mute() -> None:
+    """绑定必须落在 ``NODE_SOCKET.default_value``，且 object_id 由**探测结果**拼出。
 
     提交 2 里这里曾绑定到 ``NODE_GROUP.mute``（构造上白名单通过、语义完全错误）：
-    探测到 Emission 强度后写下去会去 mute 整个节点。这条用例钉住这个回归。
+    探测到 Emission 强度后写下去会去 mute 整个节点。这条用例钉住那个回归。
     """
     node = find(build_nodes(emission_socket="Strength"), "cel.Cel_Skin.emission_strength")
+    assert node.binding is not None
+    assert node.binding.object_type == "NODE_SOCKET"
+    assert node.binding.field == "default_value"
+    assert node.binding.object_type != "NODE_GROUP"
+    # 组名/节点名/插座名三段都来自探测描述，客户端无从提交
+    assert node.binding.object_id == "Cel_Skin/Emission/Strength"
+
+
+def test_emission_object_id_follows_real_node_name() -> None:
+    """真机节点名是「自发光」时 object_id 必须随之变化 —— 不写死任何语言的名字。"""
+    node = find(
+        build_nodes(emission_node_name="自发光", emission_socket="Strength"),
+        "cel.Cel_Skin.emission_strength",
+    )
+    assert node.binding is not None
+    assert node.binding.object_id == "Cel_Skin/自发光/Strength"
+
+
+def test_emission_draft_compiles_to_plan() -> None:
+    nodes = build_nodes(emission_socket="Strength")
+    ops = surface.validate_draft({"cel.Cel_Skin.emission_strength": 2.0}, nodes)
+    emission_ops = [op for op in ops if op.param_id == "cel.Cel_Skin.emission_strength"]
+    assert len(emission_ops) == 1
+    assert emission_ops[0].binding.object_type == "NODE_SOCKET"
+    assert emission_ops[0].cost == schemamod.COST_L1
+    assert emission_ops[0].value == pytest.approx(2.0)
+
+
+def test_emission_draft_rejects_out_of_range() -> None:
+    """值域在服务端收口：越界值在生成代码**之前**就被拒。"""
+    nodes = build_nodes(emission_socket="Strength")
+    for bad in (100.5, -0.5):
+        with pytest.raises(errors.ToonTunerError) as excinfo:
+            surface.validate_draft({"cel.Cel_Skin.emission_strength": bad}, nodes)
+        assert excinfo.value.code == errors.PARAM_INVALID
+
+
+def test_emission_linked_socket_is_readonly() -> None:
+    """插座被上游连线 ⇒ 写 default_value 不生效 ⇒ 明确降级只读，不假装可写。"""
+    nodes = build_nodes(emission_socket="Strength", emission_linked=True)
+    node = find(nodes, "cel.Cel_Skin.emission_strength")
+    assert node.supported is True
+    assert node.editable is False
+    assert node.readonly_reason == schemamod.REASON_STRUCTURAL
     assert node.binding is None
     with pytest.raises(errors.ToonTunerError) as excinfo:
-        surface.validate_draft({"cel.Cel_Skin.emission_strength": 2.0}, build_nodes())
+        surface.validate_draft({"cel.Cel_Skin.emission_strength": 2.0}, nodes)
     assert excinfo.value.code == errors.NOT_EDITABLE
+
+
+def test_emission_on_reference_group_stays_readonly() -> None:
+    """参考组（回退策略）恒只读 —— 即便同样探到了 Emission 强度。"""
+    nodes = build_nodes(role="reference", emission_socket="Strength")
+    node = find(nodes, "cel.Cel_Skin.emission_strength")
+    assert node.supported is True
+    assert node.editable is False
+    assert node.readonly_reason == schemamod.REASON_REFERENCE_ONLY
 
 
 def test_emission_accepts_alternative_candidate_name() -> None:
@@ -420,6 +484,129 @@ def test_executor_writes_interpolation_as_separate_op() -> None:
     payload = run_apply([op], fake)
     assert payload["applied"] is True
     assert fake.node_groups["Cel_Skin"].nodes.get("ColorRamp").color_ramp.interpolation == "EASE"
+
+
+# -- 执行器：Emission 强度（NODE_SOCKET.default_value）----------------------
+
+EMISSION_KEY = "NODE_SOCKET:Cel_Skin/Emission/Strength.default_value"
+
+
+def test_executor_writes_emission_strength() -> None:
+    """端到端：计划 → 假 bpy → 插座值变化，且快照记下写入前的值（恢复的原料）。"""
+    fake = FakeBpy()
+    fake.add_cel_group("Cel_Skin", element_count=3, emission_strength=0.5)
+    nodes = build_nodes(emission_socket="Strength", emission_value=0.5)
+
+    ops = surface.validate_draft({"cel.Cel_Skin.emission_strength": 1.25}, nodes)
+    payload = run_apply(ops, fake)
+
+    assert payload["applied"] is True
+    assert payload["failure"] is None
+    socket = fake.node_groups["Cel_Skin"].nodes.get("Emission").inputs.get("Strength")
+    assert socket.default_value == pytest.approx(1.25)
+    assert payload["snapshot"][EMISSION_KEY] == pytest.approx(0.5)
+    assert payload["values"][EMISSION_KEY] == pytest.approx(1.25)
+
+
+def test_executor_writes_emission_on_locally_named_node() -> None:
+    """真机节点名是中文（「自发光」）时同样可写 —— 定位靠探测结果拼接的 object_id。"""
+    fake = FakeBpy()
+    fake.add_cel_group("Cel_Skin", element_count=3, emission_strength=0.5, emission_node_name="自发光")
+    nodes = build_nodes(emission_node_name="自发光", emission_socket="Strength", emission_value=0.5)
+
+    ops = surface.validate_draft({"cel.Cel_Skin.emission_strength": 0.9}, nodes)
+    payload = run_apply(ops, fake)
+
+    assert payload["applied"] is True
+    socket = fake.node_groups["Cel_Skin"].nodes.get("自发光").inputs.get("Strength")
+    assert socket.default_value == pytest.approx(0.9)
+
+
+def test_executor_emission_socket_missing_fails_loudly() -> None:
+    """插座在写入时不存在（拓扑变了）⇒ 结构化失败，**不静默跳过**。"""
+    fake = FakeBpy()
+    fake.add_cel_group("Cel_Skin", element_count=3, emission_strength=0.5)
+    op = execmod.PlanOp(
+        surface.Binding("NODE_SOCKET", "Cel_Skin/Emission/NotThere", "default_value"),
+        2.0,
+        cost=schemamod.COST_L1,
+        param_id="cel.Cel_Skin.emission_strength",
+    )
+    payload = run_apply([op], fake)
+    assert payload["applied"] is False
+    assert payload["failure"]["kind"] == "write_failed"
+    assert "node socket not found" in payload["failure"]["message"]
+
+
+def test_executor_emission_node_missing_fails_loudly() -> None:
+    fake = FakeBpy()
+    fake.add_cel_group("Cel_Skin", element_count=3, emission_strength=0.5)
+    op = execmod.PlanOp(
+        surface.Binding("NODE_SOCKET", "Cel_Skin/GhostNode/Strength", "default_value"),
+        2.0,
+        cost=schemamod.COST_L1,
+        param_id="cel.Cel_Skin.emission_strength",
+    )
+    payload = run_apply([op], fake)
+    assert payload["applied"] is False
+    assert "node not found" in payload["failure"]["message"]
+
+
+def test_executor_emission_linked_socket_write_is_rejected() -> None:
+    """插座被连线时写入也失败（Blender 侧第二道闸门），不写入一个不生效的值。"""
+    fake = FakeBpy()
+    fake.add_cel_group("Cel_Skin", element_count=3, emission_strength=0.5, emission_linked=True)
+    op = execmod.PlanOp(
+        surface.Binding("NODE_SOCKET", "Cel_Skin/Emission/Strength", "default_value"),
+        2.0,
+        cost=schemamod.COST_L1,
+        param_id="cel.Cel_Skin.emission_strength",
+    )
+    payload = run_apply([op], fake)
+    assert payload["applied"] is False
+    assert "linked" in payload["failure"]["message"]
+
+
+def test_executor_emission_failure_restores_earlier_writes() -> None:
+    """同一份计划里前一条已写入的内容，必须在后一条失败时被还原。"""
+    fake = FakeBpy()
+    fake.add_cel_group("Cel_Skin", element_count=3, emission_strength=0.5)
+    view = fake.view_settings
+    view.exposure = 0.25
+
+    ops = [
+        execmod.PlanOp(
+            surface.Binding("VIEW_SETTINGS", "$scene", "exposure"),
+            1.75,
+            cost=schemamod.COST_L0,
+            param_id="color.exposure",
+        ),
+        execmod.PlanOp(
+            surface.Binding("NODE_SOCKET", "Cel_Skin/Emission/Ghost", "default_value"),
+            2.0,
+            cost=schemamod.COST_L1,
+            param_id="cel.Cel_Skin.emission_strength",
+        ),
+    ]
+    payload = run_apply(ops, fake)
+    assert payload["applied"] is False
+    assert view.exposure == pytest.approx(0.25), "失败的整份计划必须回滚已写入的部分"
+
+
+def test_executor_emission_readback_matches_plan_key() -> None:
+    """回读键与计划键一致 —— 校验 `verify_ops` 才能逐项比对。"""
+    fake = FakeBpy()
+    fake.add_cel_group("Cel_Skin", element_count=3, emission_strength=0.5)
+    op = execmod.PlanOp(
+        surface.Binding("NODE_SOCKET", "Cel_Skin/Emission/Strength", "default_value"),
+        0.7,
+        cost=schemamod.COST_L1,
+        param_id="cel.Cel_Skin.emission_strength",
+    )
+    stdout = run_generated_code(execmod.build_readback_code([op]), fake)
+    payload = execmod.extract_json(stdout)
+    assert payload["values"][EMISSION_KEY] == pytest.approx(0.5)
+    assert surface.plan_values([op]) == {EMISSION_KEY: 0.7}
 
 
 # -- 执行器：失败即回滚 ----------------------------------------------------

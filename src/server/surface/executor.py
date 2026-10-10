@@ -110,6 +110,10 @@ SETTERS: dict[tuple[str, str], tuple[str, str]] = {
         "_node_group({object_id}).mute",
         "_node_group({object_id}).mute = {value}",
     ),
+    ("NODE_SOCKET", "default_value"): (
+        "_node_socket({object_id})",
+        "_set_node_socket({object_id}, {value})",
+    ),
     ("WORLD", "use_nodes"): ("_world().use_nodes", "_world().use_nodes = {value}"),
     ("WORLD", "color"): ("_world_color()", "_set_world_color({value})"),
     ("WORLD", "node.strength"): ("_world_strength()", "_set_world_strength({value})"),
@@ -184,6 +188,38 @@ def _node_group(name):
     if ng is None:
         raise RuntimeError("node group not found: " + str(name))
     return ng
+
+
+def _node_socket_ref(object_id):
+    """``组名/节点名/插座名`` -> 真实插座对象。
+
+    三段都由服务端从探测结果拼出。任一段缺失都**抛出**（不返回 None）：
+    拓扑在基线与写入之间变了就必须让整份计划失败并回滚，
+    绝不能静默跳过 —— 否则界面会显示「已生效」而画面没变。
+    """
+    group_name, _, rest = str(object_id).partition("/")
+    node_name, _, socket_name = rest.partition("/")
+    if not group_name or not node_name or not socket_name:
+        raise RuntimeError("node socket binding is malformed: " + str(object_id))
+    node = _node_group(group_name).nodes.get(node_name)
+    if node is None:
+        raise RuntimeError("node not found: " + str(node_name))
+    for candidate in list(node.inputs):
+        if str(getattr(candidate, "name", "")) == socket_name:
+            return candidate
+    raise RuntimeError("node socket not found: " + str(socket_name))
+
+
+def _node_socket(object_id):
+    return float(_node_socket_ref(object_id).default_value)
+
+
+def _set_node_socket(object_id, value):
+    socket = _node_socket_ref(object_id)
+    if bool(getattr(socket, "is_linked", False)):
+        # 已被上游连线：写 default_value 不会影响画面。与其假装成功，不如失败。
+        raise RuntimeError("node socket is linked, default_value has no effect: " + str(object_id))
+    socket.default_value = float(value)
 
 
 def _ramp_ref(object_id):
