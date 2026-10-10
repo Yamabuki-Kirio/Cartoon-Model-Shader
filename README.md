@@ -23,7 +23,7 @@ MMD 刚入门，渲染水平很低，见谅。只用于自用。
 | 无污染预览 | 每次预览**从内存基线恢复后应用完整草稿**，不在上一次结果上叠加 |
 | 等待方式 | **不使用固定 `sleep`**；以任务 ID + 状态查询 / 推送等待 Blender 完成 |
 | 首版范围 | 当前场景中的**一个主要角色**；角色须处于管线支持的基准坐标 |
-| 参数面 | 界面由 46 项 schema 驱动，MVP 先开放约 20 项高价值参数（**当前已开放 10 项 L0**，见下文） |
+| 参数面 | 界面由**静态 schema 与运行时能力探测共同决定**（不设固定项数）；MVP 先开放高价值参数（**当前已开放 10 项 L0**，见下文） |
 | 预设存储 | 落在用户目录 `%LOCALAPPDATA%\CartoonModelShader\presets`，**不进仓库**；写入前拒绝任何本机路径、模型/贴图路径与凭据（不做静默清洗） |
 
 ## 三层架构
@@ -46,7 +46,7 @@ MMD 刚入门，渲染水平很低，见谅。只用于自用。
                                               └──────────────────────────┘
 ```
 
-- **前端**：本地 Web 界面，参数界面由 `reference/参数面清单.json` 动态生成，而非把 46 项控件写死。
+- **前端**：本地 Web 界面，参数界面由静态 schema 与运行时能力探测共同生成，而非把控件写死。
 - **本地控制服务**：管理连接、校验参数、排队去抖、保存预设与运行记录、推送状态。默认仅监听 localhost，启动时生成随机令牌校验请求。
 - **Blender 桥接层**：在现有 MCP 接口之上增加会话协议层（协议版本、任务 ID、能力查询、错误码、状态查询）。接口若不能主动推送，则由控制服务短间隔**非阻塞轮询**。
 
@@ -76,9 +76,11 @@ MMD 刚入门，渲染水平很低，见谅。只用于自用。
 ```
 Cartoon-Model-Shader/
 ├── docs/                            设计与需求文档
+├── docs/                            设计与需求文档
 │   ├── 需求文档.md
 │   ├── 技术设计.md
-│   ├── 接口文档.md                    全部接口的唯一权威（含令牌与保存流程）
+│   ├── 技术方案_v4.md                 v4 参数面技术方案（含 §8.4 提交 3A 落地记录）
+│   ├── 接口文档.md                    全部接口的唯一权威（含令牌、保存流程、v4 过渡接口）
 │   ├── 安全检查.md
 │   └── AI交付_第一步实施方案.md        MVP-01 任务书
 ├── reference/                       参考数据（参数面 schema 等）
@@ -97,16 +99,38 @@ Cartoon-Model-Shader/
 │   │   ├── color_looks.py           依赖枚举：view_transform → 合法 look 的探测/迁移/校验
 │   │   ├── presets.py               本地预设：存储 / 校验 / 敏感内容扫描 / 加载成草稿
 │   │   ├── blender_ops.py           由白名单生成只读/写入/渲染代码
-│   │   ├── binder.py                高层绑定：读基线 / 写草稿 / 渲染预览
-│   │   ├── session.py               内存基线 + 任务队列（旧任务自动作废）
+│   │   ├── binder.py                高层绑定：读基线 / 写草稿 / 渲染预览 / 通用执行器入口
+│   │   ├── session.py               内存基线 + 任务队列（旧任务自动作废）+ v4 任务路径
 │   │   ├── security.py              本机会话令牌（所有写接口的统一闸门）
 │   │   ├── presets.py               预设存储（原子写入；文件名由服务端派生）
 │   │   ├── project_ops.py           工程读/写固定模板 + 同目录时间戳备份
 │   │   ├── commit.py                应用到工程：确认令牌 / 回读校验 / 备份 / 保存
+│   │   ├── frontend.py              /next 构建产物托管（令牌只注入 HTML、越界 404）
+│   │   ├── surface_probe.py         只读拓扑探针（脱敏；v4 的探测原料）
+│   │   ├── surface_service.py       v4 参数面状态：身份 + 结构指纹 + schema + 基线值
+│   │   ├── surface/                 v4 参数面（纯函数式）
+│   │   │   ├── binding.py           结构化 binding + 字段白名单（注入防线）
+│   │   │   ├── identity.py          身份/结构/值三层指纹与比对
+│   │   │   ├── schema.py            递归节点模型
+│   │   │   ├── cel.py               Cel 色阶适配器（能力驱动，探不到即降级）
+│   │   │   ├── draft.py             完整草稿校验（唯一入口）
+│   │   │   └── executor.py          由固定模板生成写入/回读代码（原子、可回滚）
 │   │   ├── models.py                API 模型
 │   │   ├── errors.py                稳定错误码
 │   │   └── redact.py                诊断脱敏
-│   └── web/                         浏览器前端（原生 HTML/CSS/JS）
+│   └── web/                         旧页面（原生 HTML/CSS/JS；提交 5 才会下线）
+├── web/                             v4 工作台（Vite + Preact + TypeScript）
+│   ├── index.html                   构建入口（含 <!--TOON_TUNER_TOKEN--> 占位）
+│   ├── tooling/                     构建侧工具与断言（**不叫 build/**：`.gitignore` 忽略 `build/`）
+│   │   ├── token-placeholder.ts     令牌占位插件 + 「令牌形态」判据
+│   │   ├── dev-token-bridge.ts      仅开发期：/__dev/token 把后端注入的令牌转交页面
+│   │   ├── dev-token-bridge.test.ts 令牌桥：提取/失败原因/不缓存
+│   │   └── dist-artifacts.test.ts   产物断言 + 仓库卫生（文件不得被 .gitignore 忽略）
+│   ├── scripts/verify-dist.mjs      构建产物校验（npm run build 的最后一步）
+│   ├── src/{api,schema,state,components,features,styles,testing}/
+│   │   ├── api/dev-token.ts         仅开发期：把 dev server 的令牌装进与生产同一个全局变量
+│   │   └── testing/setup-dom.ts     测试环境保真：补 jsdom 缺失的 onpointer* IDL 属性
+│   └── dist/                        构建产物（**不入库**）
 ├── tests/                           假 MCP + 假 bpy 桩 + pytest 用例
 │   ├── fake_bpy.py                  可执行 bpy 桩（复刻 view_frame / ops.wm 保存等真实行为）
 │   ├── support.py                   公共测试支撑：统一携带会话令牌的 TestClient
@@ -117,8 +141,13 @@ Cartoon-Model-Shader/
 │   ├── test_presets.py              预设：名称校验/更新/越界/依赖枚举/路径穿越/原子写入失败
 │   ├── test_commit.py               保存：目标校验/确认令牌/备份/回读/失败不落盘
 │   ├── test_security_token.py       写接口令牌矩阵 + 不可注入契约
+│   ├── test_surface_probe.py        只读拓扑探针：脱敏 + 结构签名
+│   ├── test_surface_identity.py     三层指纹：身份/结构/值
+│   ├── test_surface_cel.py          Cel 适配器 + 通用执行器（整体写入/回滚）
+│   ├── test_v4_surface_api.py       v4 竖切端到端：基线/预览/失效/失败恢复/保存绑定
+│   ├── test_next_frontend.py        /next 托管：并存迁移/未构建诊断/令牌只进 HTML/路径穿越
 │   └── browser_check.mjs            真实浏览器验收（本机 Chrome/Edge + CDP）
-├── .github/workflows/test.yml       Windows CI：3.11 + 3.12 矩阵，只跑 pytest，不上传产物
+├── .github/workflows/test.yml       CI：pytest（3.11/3.12）与 web（Node 22）两个独立 job
 ├── config.example.json
 ├── requirements.txt
 ├── pytest.ini
@@ -143,7 +172,38 @@ pip install -r requirements.txt
 uvicorn src.server.app:app --host 127.0.0.1 --port 8765
 ```
 
-浏览器打开 <http://127.0.0.1:8765>。
+浏览器打开 <http://127.0.0.1:8765>（旧页面）或 <http://127.0.0.1:8765/next>（v4 工作台）。
+
+### v4 工作台（`/next`）需要先构建
+
+`/next` 由 FastAPI 托管 **Vite 构建产物**。构建产物**不入库**（`web/dist` 在 `.gitignore` 里），
+因此拉下代码后要先构建一次；未构建时 `/next` 会返回 `503 FRONTEND_NOT_BUILT`
+并附上构建步骤（**不会**悄悄回退到旧页面）：
+
+```powershell
+cd web
+npm ci
+npm run build
+```
+
+开发时可以用 Vite dev server（`npm run dev`，默认 5173，`/api` 已代理到 8765），
+但**生产入口始终是 FastAPI**：`dist` 里的 `index.html` 只有 `<!--TOON_TUNER_TOKEN-->` 占位，
+令牌由服务端在响应时注入，因此磁盘上的产物里永远没有令牌。
+
+开发期有个绕不开的落差：页面由 dev server 提供，而令牌只存在于 FastAPI 的响应里，
+于是**所有写请求都会 401**。为此 dev server 暴露了一个 `apply: "serve"` 的令牌桥
+（`GET /__dev/token`）：它代取一次 FastAPI 页面、把注入的令牌转交前端，
+前端仍然只从 `window.__TOON_TUNER_TOKEN__` 这一处读 —— 生产与开发**共用同一条读取路径**，
+所以「开发能用、生产 401」这类差异不会藏起来。该插件不进构建产物（`dist` 里搜不到它）。
+
+多一条关于缓存的约定：`index.html` 明确 `no-store`（它含本次进程的会话令牌），
+而 `assets/` 下的文件带内容哈希、可以长期缓存。
+
+`/next`（v4 工作台）建立基线的流程与旧页面一致但更严格：`POST /api/session/baseline`
+顺带创建「首张基线预览」任务，前端**轮询到该任务结束**才把图挂上 —— 响应里虽然已经带了
+`preview_url`，但那一刻文件还没落盘。因此「基线已建立」（可调参）与「基线图可用」是两个
+独立状态：生成中显示「正在生成基线预览…」，失败 / 被取代则明确说「基线已建立，但首张画面
+未生成」，不会挂一张 404 的图，也不会谎称还在生成。
 
 ### 已实现范围
 
@@ -213,6 +273,12 @@ uvicorn src.server.app:app --host 127.0.0.1 --port 8765
 工具会**停止自动预览**、弹出「当前帧/相机已变化，请刷新基线」横幅并禁用「重新取景」，
 **不会**把新构图当成参数效果端上来。点「建立 / 刷新基线」即可重新锁定并恢复自动预览。
 角色自身漂移与相机动画本身只产生**软告警**，不阻断预览。
+
+**参数恢复与「有未保存的修改」**：每次预览都从内存基线出发 —— 参数值、节点、相机与输出设置
+在预览结束后都会**恢复到原值**；本工具**不会保存、也不会覆盖**你的 `.blend` 文件。但 Blender 的
+`bpy.data.is_dirty` 是**粘性**标记：把值写回去也不会自动清除它。因此预览之后 Blender 仍可能显示
+「有未保存的修改」—— **那不代表工程内容有差异**，也不是缺陷，工具更不会用自动保存或重开工程去
+「修」这个标记。基线建立时工程本来是干净的，页面会就此给出一次说明（`project.dirty_flagged`）。
 
 ### 依赖枚举（视图变换 → Look）
 
@@ -362,6 +428,24 @@ pytest
 CI（`.github/workflows/test.yml`）在 **windows-latest** 上用 **Python 3.11 / 3.12** 各跑一遍：
 装 `requirements.txt` → `python -m pytest`。**不依赖真实 Blender**、**不上传任何产物**
 （模型、预览图、日志都不留）。真实 Blender / 真实浏览器验收仍是**人工步骤**，不进 Runner。
+前端另有独立的一套（**pytest 不依赖 Node**）：
+
+```powershell
+cd web
+npm ci
+npm run typecheck
+npm run build     # 末尾会跑 scripts/verify-dist.mjs 校验产物
+npm run test      # tooling/dist-artifacts.test.ts 会断言 dist 的真实内容，因此 build 要在 test 之前
+```
+
+前端测试有两条与**运行环境**有关的约定，目的不是「让测试变绿」，而是让测试可信：
+
+- **jsdom 缺少 `onpointer*` IDL 属性**：Preact 按 `"onpointerdown" in element` 决定注册的事件名，
+  为假时会注册驼峰 `PointerDown`，于是浏览器语义的 `pointerdown` 永远打不中 ——
+  表现是「拖动在测试里毫无反应」，看起来像组件坏了。`src/testing/setup-dom.ts` 在 `setupFiles`
+  里补上缺失的 IDL 属性（**只补存在性**，不伪造 `setPointerCapture` 等行为，组件已按不支持捕获降级）。
+- **开发期令牌桥**（`tooling/dev-token-bridge.test.ts`）：断言它能取到令牌、失败时给出明确原因、
+  响应不缓存。没有它，`npm run dev` 下所有写请求都会 401。
 
 测试使用内置假 MCP 服务与**假 `bpy` 桩**，不需要安装 Blender：
 
@@ -400,6 +484,29 @@ CI（`.github/workflows/test.yml`）在 **windows-latest** 上用 **Python 3.11 
   覆盖前生成同目录时间戳备份且内容为覆盖前版本、**备份失败则拒绝覆盖**；
   回读不一致 → 不保存且列出不一致项、保存失败 → 保留草稿并回报四态状态；
   路径里的引号只是普通字符（`repr` 量化），请求塞代码 / 额外字段一律 422。
+- v4 参数面相关（`tests/test_surface_probe.py` / `test_surface_identity.py` /
+  `test_surface_cel.py` / `test_v4_surface_api.py`）：
+  只读探针输出脱敏（路径键整体丢弃）；结构签名对**值**不敏感、对**色标数量与节点增删**敏感；
+  能力驱动降级（探不到色带 / 命中 0 或 >1 个 Emission 插座 / 假 socket 名不得变成生产硬编码）；
+  色带**整体写入**与整体回滚（数量不符、单项越界 ⇒ 整份不写）；
+  基线含 Cel schema + 身份 + 结构指纹、探不到组时安全降级但基线仍成功；
+  混合 L0 + Cel 草稿**只渲染一次**；
+  身份缺失 / 结构变化在**任何写入之前**失败且 `restore.attempted = false`；
+  值层外部改动只报告不作废；新任务取代旧任务；失败任务不覆盖最后一张成功预览；
+  写入 / 回读 / 渲染 / 恢复各阶段失败注入后 L0 与 Cel 两条基线都恢复并**分别报告**；
+  保存令牌绑定参数面草稿与结构指纹（篡改 ⇒ `COMMIT_TOKEN_MISMATCH` 且不落盘，
+  旧客户端不传这两个字段时行为完全不变）。
+- `/next` 托管相关（`tests/test_next_frontend.py`）：迁移期 `/` 与 `/next` 并存且互不影响；
+  未构建 ⇒ `503 FRONTEND_NOT_BUILT` + 构建步骤、**不回退旧页面**；
+  令牌只注入 HTML（静态资源逐字节直出，`index.html` 为 `no-store`，资源为 `immutable`）；
+  路径穿越（`../`、URL 编码、反斜杠、绝对路径、盘符）一律 404 且取不到 assets 之外的文件。
+- v4 前端（`web/`，Vitest 共 127 条）：递归 schema 解析与**未知 kind 降级为只读**；
+  `dirtyIds` 计算与提交前过滤（只读项 / 参考组 / 陌生 id 被剔除）；色标范围与严格递增、
+  2/3/4 档渲染、拖动与键盘输入的命令合并（一次拖动一条、不同色标不合并、复位/复制为原子命令）；
+  撤销/重做往返；复制到兼容组（数量不同即拒绝，不截断不补齐）；Sakura 恒只读；
+  结构失效后禁用预览与提交；外部值变化只提示；任务取代与代次丢弃旧结果；
+  失败任务保留最后一张成功预览；防缓存 URL；轮询结束/取消/超时/卸载；虚拟列表只挂可视行；
+  令牌请求头矩阵（写请求带、GET 不带、401/409/502 展示）；构建产物含唯一占位且无令牌形态串。
 
 ### 真实浏览器验收
 
@@ -447,6 +554,18 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 | DELETE | `/api/presets/{id}` | 删除预设 |
 | POST | `/api/session/commit/prepare` | 校验基线/草稿/保存模式/目标路径，返回一次性短效确认令牌 + 目标绝对路径 + 预计备份路径 + 告警 |
 | POST | `/api/session/commit` | 入参 `{"token", "mode", "draft", "target_path"}`：消费令牌 → 应用完整草稿 → 回读校验 → 备份 → 保存工程 |
+| GET | `/api/diagnostics/describe` | 只读拓扑导出（受管节点组 / ColorRamp 结构 / 对象与材质清单），**已脱敏**；用于校准 Cel 的真实 socket 名 |
+| GET | `/api/v4/surface/schema` | v4 递归 schema（`toon-surface/2`）：Cel 色带等参数树，每个节点带 `supported`/`editable`/`active`/`readonly_reason` |
+| GET | `/api/v4/session/baseline` | v4 基线：身份记录 + 结构指纹 + 基线值 + 降级清单（建立基线仍走 `POST /api/session/baseline`） |
+| POST | `/api/v4/preview` | v4 预览：L0 与 Cel 编进**同一个任务**，只渲染一次；可带 `expected_structure_hash` |
+| GET | `/api/v4/jobs/{job_id}` | v4 任务状态（与 `/api/jobs/{job_id}` 共用同一份存储） |
+| GET | `/next` | v4 工作台页面（构建产物；**未构建 ⇒ 503 `FRONTEND_NOT_BUILT`**，不回退旧页面） |
+| GET | `/next/assets/{path}` | v4 构建资源（内容哈希命名、长缓存；路径越界 ⇒ 404） |
+
+> 上表最后四行是 **v4 过渡接口**（Cel 竖切）。旧页面继续用前面的接口，行为一行不改；
+> `POST /api/session/baseline` 的响应里多了一个可选 `surface` 字段。
+> `POST /api/session/commit/prepare` / `commit` 各自新增**可选**的 `surface_draft` 与
+> `structure_hash`：都不传时行为与旧客户端完全一致。详见 [`docs/接口文档.md`](docs/接口文档.md) §6。
 
 > **令牌**：除 `GET` 之外的**所有写接口**都必须带请求头 `X-Toon-Tuner-Token`。
 > 令牌在进程启动时随机生成，只通过 `GET /` 的页面响应注入前端，**不写入静态文件、不写日志**；
@@ -459,6 +578,8 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 常用错误码：`PARAM_INVALID`（参数越界/未知字段）、`NO_BASELINE`（未建基线）、
 `FRAMING_STALE`（409，基线建立后帧或相机被外部改动，retryable —— 刷新基线即可恢复）、
 `FRAMING_UNAVAILABLE`（409，拿不到当前取景上下文）、
+`PREVIEW_OUTPUT_UNAVAILABLE`（409，非 retryable：预览只能出 PNG，但工程的输出设置切不过去 ——
+常见于把渲染输出设成影片格式的工程。**预览已中止，工程零改动**；把「输出属性 → 输出」改成图片格式后重试）、
 `INVALID_DEPENDENT_ENUM`（400，依赖枚举取值非法，例如 Standard 下提交 `AgX - Punchy`；返回体里带
 `parameter` / `value` / `depends_on` / `allowed`，`retryable=false`）。
 
@@ -469,6 +590,13 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 ### Blender 5.x 适配记录
 
 - 合成器节点树在 5.x 是 **`scene.compositing_node_group`**，不再是 `scene.node_tree`。
+- 输出格式多了 **`render.image_settings.media_type`**（`IMAGE` / `MULTI_LAYER_IMAGE` / `VIDEO`）。
+  **`media_type == "VIDEO"`（工程是影片输出）时，`file_format` 的可用集合被限定为影片格式**，
+  此时直接赋 `"PNG"` 会抛 `enum "PNG" not found in ('FFMPEG')` —— 必须先切回 `IMAGE`。
+  预览渲染因此**不硬写 PNG**：先「赋值 + 回读」地安全切换，切不过去就零污染中止。
+- `bl_rna.properties["file_format"].enum_items` **不能用来判断可用性** —— 影片态下它照样把 PNG 列出来。
+- `Image.save_render()` 的格式**听场景的 `image_settings`、不听文件扩展名**：给 `.png` 路径但在
+  JPEG 场景里调用，得到的是 JPEG。
 - 本管线的辉光节点为 **`AI_Compositor › Autocel_Glow`**（GLARE，label「辉光」）；该组内无 Tonemapping 节点。
 - `view_transform` / `look` 的候选值无法从 `bl_rna.enum_items` 取到（非 UI 上下文只返回 `NONE`）。
   `PyOpenColorIO` 的 `getViews(display)` 可以用来枚举视图，但 **`getLookNames()` 是 OCIO 全局名单、
@@ -515,9 +643,23 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 - [ ] **MVP-03 其余批次**：预设界面入口、A/B 对比、预览质量档位的实际应用、会话恢复
 - [ ] 保存预设 / 应用到工程（**须在「恢复基线」通过重复测试后才开始**）
 - [x] **保存预设 / 应用到工程（自动测试完成；真实 Blender 验收待办）** —— 原子写入的本地预设 + 一次性确认令牌 → 应用完整草稿 → 回读逐项校验 → 同目录时间戳备份 → 保存工程（默认另存为；覆盖路径必须二次确认）
+- [x] **v4 提交 1：只读拓扑探针与技术方案** —— `GET /api/diagnostics/describe`（脱敏）+ `docs/技术方案_v4.md`
+- [x] **v4 提交 2：递归 schema、三层身份、Cel 适配器、通用执行器** —— `src/server/surface/`
+- [x] **v4 提交 3A：Cel 后端完整竖切（自动测试完成；真实 Blender 验收待办）** —— 基线采集只读拓扑 → `GET /api/v4/surface/schema` → `POST /api/v4/preview`（L0 + Cel 同一任务、只渲染一次、失败即恢复两条基线并分别报告）→ 身份/结构闸门写入前判定 → 保存令牌绑定参数面草稿与结构指纹
+- [x] **v4 提交 3B：Vite/Preact 工作台与 Cel 色阶编辑器（自动测试完成；真实 Blender 验收待办）** —— `web/` 工程（Vite + Preact + TypeScript + Vitest，自研轻量虚拟列表）→ `/next` 三栏工作台（顶部状态栏 / 导航 / 固定预览 / 检查器 / 底部操作栏）→ Cel 编辑器（色带拖动、位置与 RGBA、插值、复制到兼容组、Sakura 只读）→ 前端命令栈（撤销/重做）→ 任务代次与防缓存预览 → CI 独立 `web` job
+- [ ] **v4 提交 4：完整参数族（世界/描边/渲染质量/灯光/相机/材质）与 L0–L3 调度，L0 迁入递归 schema**
+- [ ] **v4 提交 5：预设 v1→v2 迁移、新 UI 切换到 `/` 并下线旧页面**
+- [ ] **校对 `/next` 的真实浏览器效果**（本提交只做了 Vitest 的 jsdom 断言；真机浏览器仍需人工看一眼）
+- [x] **校准 Cel 的真实 socket 名** —— 真机确认（2026-10-11，Blender 5.2.1 LTS，受管 Cel 组
+      全部命中「`EMISSION` 节点（节点名本地化，如「自发光」）+ `Strength` 插座且未连线」）→
+      `cel.<group>.emission_strength` 写入 `NODE_SOCKET.default_value`
+      （`object_id` = 组名/节点名/插座名，三段来自探测结果）；插座被上游连线、或该组是
+      reference 角色时仍降级只读
+- [x] **渲染脚本侧辉光节点定位** —— 合成器 Glare 节点按 `bl_idname == "CompositorNodeGlare"`
+      定位（名字优先、类型回退）：真机上节点名随工程而变（实测 `GLOW_卡通辉光`），
+      硬编码任何名字都不可靠
 - [ ] **真实 Blender 验收保存流程**（人工步骤：另存为到新文件、覆盖当前工程、确认备份可打开、故意让保存失败并确认草稿保留）
-- [ ] Cel 色阶编辑器（7 组，L1）
-- [ ] 严格材质匹配与手工归类（L2）
+- [ ] **真实 Blender 验收 v4 竖切**（人工步骤：连续预览不累积污染、恢复基线逐项一致、保存重开后参数图一致）- [ ] 严格材质匹配与手工归类（L2）
 - [ ] A/B 对比、差异热力图、背景切换
 - [ ] 正式渲染与运行清单
 - [ ] 预设的「加载 / 应用到界面」（当前只支持保存与列出，加载留待后续）

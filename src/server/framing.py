@@ -1137,6 +1137,17 @@ def build_render_code(
     * 渲染前后都**不改帧**，渲染结束后恢复原分辨率。
     * ``expected`` 给出基线时的帧与相机名：若已被外部改动，则**不渲染**，
       直接回一个 ``FRAMING_STALE`` 中止标记（兜底，防止提交与执行之间的时间差）。
+
+    **输出格式（PNG）绝不硬写**：渲染前把 ``media_type`` / ``file_format`` /
+    ``color_mode`` / ``color_depth`` / ``filepath`` 整份记下，再「赋值 + 回读」地
+    切到 PNG —— 工程是影片输出（``media_type == "VIDEO"`` / ``FFMPEG``）时，
+    ``file_format`` 的可用集合被限定为影片格式，必须先切回 ``IMAGE`` 才能赋 PNG。
+    切不过去就**什么都不改**地中止并回 ``PREVIEW_OUTPUT_UNAVAILABLE``；
+    渲染结束（含异常、含中止）后在 ``finally`` 里**逐项**写回这些设置，
+    单项失败不阻断其余项，结果放在 ``output`` 里（``restored_ok`` / ``mismatches``）。
+
+    注意：输出格式是**工具运行设置**，只活在这一条生成代码的生命周期里 ——
+    既不写进 ``.blend``，也不随渲染结果持久化。
     """
     options = validate_options(framing)
     mode = options["mode"]
@@ -1158,11 +1169,103 @@ _width = {int(width)}
 _height = {int(height)}
 _percentage = {int(percentage)}
 
+_TARGET_FORMAT = "PNG"
+_TARGET_COLOR_MODE = "RGBA"
+#: 预览期间会临时改动的输出设置。``filepath`` 在 ``render`` 上，其余在 ``image_settings`` 上。
+_OUTPUT_FIELDS = ("media_type", "file_format", "color_mode", "color_depth")
+_image_settings = getattr(render, "image_settings", None)
+
+
+def _read_output_state():
+    """整份读回预览会碰的输出设置（读不到就是 None，不猜）。"""
+    _state = {{}}
+    for _name in _OUTPUT_FIELDS:
+        if _image_settings is None:
+            _state[_name] = None
+        else:
+            _state[_name] = _safe(lambda _n=_name: getattr(_image_settings, _n, None))
+    _state["filepath"] = _safe(lambda: getattr(render, "filepath", None))
+    return _state
+
+
+def _set_and_readback(_obj, _name, _value):
+    """写一个属性并**回读**；绝不把「没报错」当成「生效」。"""
+    _current = _safe(lambda: getattr(_obj, _name, None))
+    if _current == _value:
+        return {{"requested": _value, "readback": _current, "ok": True, "unchanged": True}}
+    _rec = {{"requested": _value, "readback": None, "ok": False, "error": None}}
+    try:
+        setattr(_obj, _name, _value)
+    except Exception as _exc:
+        _rec["error"] = "%s: %s" % (type(_exc).__name__, _exc)
+    _rec["readback"] = _safe(lambda: getattr(_obj, _name, None))
+    _rec["ok"] = _rec["readback"] == _value
+    return _rec
+
+
+def _use_png_output():
+    """把场景输出切到 PNG；失败时回一个**明确原因**（不抛给调用方）。
+
+    两条实测事实（Blender 5.2）决定了这里不能只写一行赋值：
+
+    * ``image_settings.media_type == "VIDEO"``（工程是影片输出）时，``file_format``
+      的可用集合被限定为影片格式，直接赋 ``"PNG"`` 会抛
+      ``enum "PNG" not found in ('FFMPEG')`` —— 必须先切回 ``IMAGE``；
+    * ``bl_rna.properties["file_format"].enum_items`` **不可信**：影片态下它照样把
+      PNG 列出来，只有赋值才报错。所以可用性一律以「赋值 + 回读」判定。
+    """
+    if _image_settings is None:
+        return False, "当前 Blender 的 render 上没有 image_settings，无法指定 PNG 输出。"
+    _media_now = _safe(lambda: getattr(_image_settings, "media_type", None))
+    if _media_now is not None and _media_now != "IMAGE":
+        try:
+            _image_settings.media_type = "IMAGE"
+        except Exception as _exc:
+            return False, "无法把输出媒体类型从 %s 切到 IMAGE：%s" % (_media_now, _exc)
+        if _safe(lambda: getattr(_image_settings, "media_type", None)) != "IMAGE":
+            return False, "把输出媒体类型切成 IMAGE 后回读仍不为 IMAGE。"
+    try:
+        _image_settings.file_format = _TARGET_FORMAT
+    except Exception as _exc:
+        return False, "当前工程的输出格式不接受 PNG：%s" % _exc
+    _fmt_now = _safe(lambda: getattr(_image_settings, "file_format", None))
+    if _fmt_now != _TARGET_FORMAT:
+        return False, "把输出格式赋成 PNG 后回读仍为 %s。" % _fmt_now
+    if hasattr(_image_settings, "color_mode"):
+        _safe(lambda: setattr(_image_settings, "color_mode", _TARGET_COLOR_MODE))
+    return True, None
+
+
+def _restore_output_state(_state):
+    """逐项写回输出设置；**单项失败不阻断其余项**，并把每项结果报出来。
+
+    顺序有意为之：``media_type`` 决定 ``file_format`` 的可用集合，必须最先恢复；
+    ``color_mode`` / ``color_depth`` 放最后 —— 改 ``file_format`` 会连带改它们。
+    """
+    _report = {{}}
+    if _image_settings is not None:
+        for _name in _OUTPUT_FIELDS:
+            _want = _state.get(_name)
+            if _want is None:
+                continue
+            _report[_name] = _set_and_readback(_image_settings, _name, _want)
+    _want_path = _state.get("filepath")
+    if _want_path is not None:
+        _report["filepath"] = _set_and_readback(render, "filepath", _want_path)
+    return _report
+
+
 os.makedirs(os.path.dirname(_target), exist_ok=True)
 _original_resolution = [render.resolution_x, render.resolution_y, render.resolution_percentage]
+_original_output = _read_output_state()
 _original_camera = scene.camera
 _original_camera_name = _original_camera.name if _original_camera is not None else None
 _frame_at_start = scene.frame_current
+
+_png_applied = None
+_png_reason = None
+_output_restore = {{}}
+_removed_partial = False
 _temporary = None
 _rendered = False
 _aborted = None
@@ -1184,11 +1287,21 @@ try:
         }}
 
     if _aborted is None:
+        # ★ 先把输出格式**安全**切到 PNG，再动任何东西：切不过去就什么都不改地中止。
+        #   绝不硬写 "PNG" —— 影片输出（FFMPEG）的工程上那行赋值必抛 TypeError。
+        _png_ok, _png_why = _use_png_output()
+        _png_applied = bool(_png_ok)
+        _png_reason = _png_why
+        if not _png_ok:
+            _aborted = {{
+                "code": "PREVIEW_OUTPUT_UNAVAILABLE",
+                "message": "无法把工程输出格式安全切到 PNG，预览已中止：%s" % _png_why,
+            }}
+
+    if _aborted is None:
         render.resolution_x = _width
         render.resolution_y = _height
         render.resolution_percentage = _percentage
-        render.image_settings.file_format = "PNG"
-        render.image_settings.color_mode = "RGBA"
 
         dg = bpy.context.evaluated_depsgraph_get()
         _character = _character_report(scene, dg)
@@ -1247,6 +1360,17 @@ finally:
         render.resolution_x, render.resolution_y, render.resolution_percentage = _original_resolution
     except Exception:
         pass
+    # 输出设置（media_type / file_format / color_mode / color_depth / filepath）逐项写回。
+    # 这一块自己吞掉一切异常，且逐项独立 —— 渲染、存图、删临时相机有任何一步炸了，
+    # 都不会阻断这里的恢复。
+    _output_restore = _restore_output_state(_original_output)
+    # 失败路径不留半成品预览文件
+    if not _rendered and _safe(lambda: os.path.isfile(_target), False):
+        try:
+            os.remove(_target)
+            _removed_partial = True
+        except Exception:
+            _removed_partial = False
 
 _camera_restored = scene.camera is _original_camera
 _leftovers = 0
@@ -1254,6 +1378,18 @@ try:
     _leftovers = len([o for o in bpy.data.objects if o.name == {TEMP_CAMERA_NAME!r}])
 except Exception:
     _leftovers = -1
+
+# 输出设置的无污染验证：逐项与「渲染前记录的原值」比对，验证不了就算**没通过**
+_output_now = _read_output_state()
+_output_mismatches = {{}}
+for _name in list(_OUTPUT_FIELDS) + ["filepath"]:
+    _want = _original_output.get(_name)
+    if _want is None:
+        continue
+    _got = _output_now.get(_name)
+    if _got != _want:
+        _output_mismatches[_name] = {{"expected": _want, "actual": _got}}
+_output_restored = not _output_mismatches
 
 _out = {{
     "rendered": _rendered,
@@ -1268,6 +1404,18 @@ _out = {{
     "camera_used": _camera_used_name,
     "camera_restored": _camera_restored,
     "temporary_camera_leftovers": _leftovers,
+    "partial_file_removed": _removed_partial,
+    "output": {{
+        "target_format": _TARGET_FORMAT,
+        "target_color_mode": _TARGET_COLOR_MODE,
+        "applied": _png_applied,
+        "unavailable_reason": _png_reason,
+        "original": _original_output,
+        "restored": _output_now,
+        "restore_steps": _output_restore,
+        "restored_ok": _output_restored,
+        "mismatches": _output_mismatches,
+    }},
     "framing": {{
         "mode": _mode,
         "mode_label": {FRAMING_MODES.get(mode, mode)!r},

@@ -1,7 +1,9 @@
 """FastAPI 应用：本地卡通渲染调参台。
 
 路由：
-* ``GET  /``                       单页界面
+* ``GET  /``                       旧单页界面（原生 HTML/CSS/JS，行为不变）
+* ``GET  /next``                   v4 工作台（构建产物；未构建 ⇒ 503 FRONTEND_NOT_BUILT）
+* ``GET  /next/assets/{path}``     v4 构建资源（内容哈希命名，长缓存；越界 ⇒ 404）
 * ``GET  /api/health``             仅检查本地控制服务
 * ``GET  /api/blender/status``     快速探测端口与协议
 * ``GET  /api/blender/scene``      执行完整只读场景探针
@@ -10,7 +12,7 @@
 * ``GET  /api/params/schema``      L0 参数表
 * ``GET  /api/color/looks``        某视图下 Blender 真正接受的 look 档位（依赖枚举）
 * ``POST /api/color/looks/refresh`` 重新扫描 look 能力表
-* ``POST /api/session/baseline``   采集内存基线（含取景快照）+ 首张预览
+* ``POST /api/session/baseline``   采集内存基线（含取景快照与 v4 拓扑）+ 首张预览
 * ``POST /api/session/restore``    回滚到基线（走同一套依赖映射）
 * ``POST /api/preview``            提交草稿 + 取景方式，产出预览任务
 * ``GET  /api/jobs/{id}``          任务状态
@@ -24,6 +26,11 @@
 * ``DELETE /api/presets/{id}``     删除预设
 * ``POST /api/session/commit/prepare`` 校验基线/草稿/模式/目标路径，签发一次性确认令牌
 * ``POST /api/session/commit``     消费令牌 → 应用完整草稿 → 回读校验 → 备份 → 保存工程
+* ``GET  /api/diagnostics/describe`` 只读拓扑探测（脱敏）
+* ``GET  /api/v4/surface/schema``  v4 递归 schema（Cel 竖切）
+* ``GET  /api/v4/session/baseline`` v4 基线（身份 + 结构指纹 + 基线值）
+* ``POST /api/v4/preview``         v4 预览：L0 + Cel 编进同一任务，只渲染一次
+* ``GET  /api/v4/jobs/{id}``       v4 任务状态（与 ``/api/jobs/{id}`` 同一份存储）
 
 安全边界：
 * 只监听 127.0.0.1（见 config 回环校验）。
@@ -38,6 +45,8 @@
   非法组合返回稳定错误 ``INVALID_DEPENDENT_ENUM``，不退化成 ``BLENDER_SCRIPT_ERROR``。
 * 预设存在 ``%LOCALAPPDATA%`` 下（不进仓库），写入前扫描并**拒绝**任何本机路径、
   模型/贴图路径与凭据；接口只回可展示位置，不回本机绝对路径。
+* ``/next`` 的前端构建产物由本服务托管；**令牌只注入 HTML**，静态资源逐字节直出，
+  且 ``index.html`` 明确 ``no-store``（它含本次进程的会话令牌）；资源路径越界一律 404。
 """
 
 from __future__ import annotations
@@ -59,10 +68,13 @@ from . import (
     __version__,
     errors,
     framing as framing_module,
+    frontend,
     params as params_module,
     presets as presets_module,
     scene_probe,
     security,
+    surface,
+    surface_probe,
 )
 from .binder import BlenderBinder, preview_dir, preview_png_name
 from .blender_mcp import BlenderMCPClient
@@ -92,10 +104,13 @@ from .models import (
     PreviewSubmitResponse,
     RestoreResponse,
     SceneResponse,
+    V4PreviewRequest,
 )
 from .presets import PresetStore
 from .redact import redact
 from .session import PreviewService, preview_url_for, validate_draft
+from .surface_service import SurfaceService
+from . import config as config_module
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
@@ -108,6 +123,37 @@ def _now_iso() -> str:
 
 def _error_detail(exc: errors.ToonTunerError) -> dict[str, Any]:
     return exc.to_payload()["error"]
+
+
+def _split_v4_draft(
+    draft: dict[str, Any], surface_service: SurfaceService
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """把 v4 草稿按**基线 schema 里的 id 集合**拆成 L0 与 Cel 两部分。
+
+    判定依据是 id 集合而不是字符串前缀：Cel 的 id 来自探测结果（组名是工程里的事实），
+    前缀规则无法假装覆盖它，也会在将来新增参数族时悄悄失准。
+    两边都不认识的 id 一律拒绝 —— 不静默丢弃用户提交的参数。
+    """
+    baseline = surface_service.baseline
+    surface_ids = set(surface.flatten(baseline.nodes)) if baseline is not None else set()
+
+    l0_draft: dict[str, Any] = {}
+    surface_draft: dict[str, Any] = {}
+    unknown: list[str] = []
+    for param_id, value in (draft or {}).items():
+        if param_id in surface_ids:
+            surface_draft[param_id] = value
+        elif param_id in params_module.BY_ID:
+            l0_draft[param_id] = value
+        else:
+            unknown.append(param_id)
+    if unknown:
+        raise errors.ToonTunerError(
+            errors.PARAM_INVALID,
+            "存在不在当前 v4 schema 内的参数：" + str(sorted(unknown)),
+            details={"unknown": sorted(unknown), "known_surface": sorted(surface_ids)[:24]},
+        )
+    return l0_draft, surface_draft
 
 
 class BlenderGateway:
@@ -197,7 +243,8 @@ def create_app(
     cfg = config or load_config()
     gateway = BlenderGateway(cfg)
     binder = BlenderBinder(cfg.blender_mcp)
-    preview = PreviewService(binder)
+    surface_service = SurfaceService()
+    preview = PreviewService(binder, surface_service)
     #: 所有写接口的统一闸门；令牌只在进程启动时生成一次。
     guard = security.SessionGuard()
     # 预设实现以 PR#2 的完整版为准；PR#3 的 cfg.presets_dir 作为额外覆盖入口接进来。
@@ -226,6 +273,7 @@ def create_app(
     app.state.session_token = guard.token
     app.state.presets = store
     app.state.commit = commit
+    app.state.surface = surface_service
 
     # 写接口统一的依赖：缺失/错误令牌一律 401 拒绝。
     require_token = [Depends(security.require_session_token)]
@@ -532,6 +580,8 @@ def create_app(
             draft=body.draft,
             target_path=body.target_path,
             confirm=body.confirm,
+            surface_draft=body.surface_draft,
+            structure_hash=body.structure_hash,
         )
 
     @app.post(
@@ -551,7 +601,97 @@ def create_app(
             mode=body.mode,
             draft=body.draft,
             target_path=body.target_path,
+            surface_draft=body.surface_draft,
+            structure_hash=body.structure_hash,
         )
+
+    # -- 诊断（只读，不需要令牌）------------------------------------------
+    @app.get("/api/diagnostics/describe", tags=["diagnostics"])
+    async def diagnostics_describe() -> dict[str, Any]:
+        """只读拓扑描述：受管节点组、ColorRamp 结构、对象/材质/贴图清单。
+
+        用途：Cel 色带的真实节点与插座名无法凭空确定，也不能靠猜。先在真机跑这个接口，
+        拿到拓扑后 schema 生成器**以探测结果为准**生成可编辑节点；探不到的组一律降级为
+        ``supported: false`` 的只读节点。
+
+        **脱敏**：不返回工程路径、贴图路径、令牌或用户目录；键名像路径的字段整体丢弃。
+        只读接口，因此按既有规则不校验会话令牌。
+        """
+        payload = await preview.call_binder(binder.describe_surface)
+        return {"ok": True, **surface_probe.describe_groups(
+            surface_probe.redact_describe(payload)
+        )}
+
+    # -- v4 参数面（Cel 竖切）---------------------------------------------
+    @app.get("/api/v4/surface/schema", tags=["v4"])
+    async def v4_surface_schema() -> dict[str, Any]:
+        """v4 递归 schema：每个节点都带 supported / editable / active / readonly_reason。
+
+        色带是**单一复合节点**（``kind: ramp``，内含 ``elements`` 与 ``interpolation``），
+        刻意不展开成 2N 个独立 id —— ColorRamp 是单个 datablock，整体写入才原子。
+        只读接口，因此按既有规则不校验会话令牌。
+        """
+        return {"ok": True, **surface_service.schema_public()}
+
+    @app.get("/api/v4/session/baseline", tags=["v4"])
+    async def v4_session_baseline() -> dict[str, Any]:
+        """v4 基线：身份记录 + 结构指纹 + 基线值 + 降级清单。
+
+        建立基线仍走 ``POST /api/session/baseline``（它会顺带采集这里的 v4 状态）；
+        本接口只读取当前 v4 基线。只读接口，不校验令牌。
+        """
+        payload = surface_service.public()
+        if not payload.get("available"):
+            raise errors.ToonTunerError(
+                errors.NO_BASELINE,
+                "尚未建立 v4 参数面基线。请先调用 POST /api/session/baseline。",
+                details={"probe_error": payload.get("error")},
+            )
+        # 基线那一刻的工程脏标记（只有 dirty / file_name）。这是**展示用**的附加
+        # 字段：拿不到就给空对象，绝不让它影响 v4 基线的可用性。
+        return {
+            "ok": True,
+            **payload,
+            "project": dict(preview.baseline_project_public() or {}),
+        }
+
+    @app.post(
+        "/api/v4/preview",
+        response_model=PreviewSubmitResponse,
+        tags=["v4"],
+        dependencies=require_token,
+    )
+    async def v4_preview(body: V4PreviewRequest) -> dict[str, Any]:
+        """提交 v4 预览：L0 与 Cel 编进**同一个任务**，因此只渲染一次、一起回滚。
+
+        提交阶段只做「客户端自己能发现的错」：草稿越界、色标数量变化、
+        客户端持有的结构指纹过期。真正的身份 / 结构闸门在任务里、**任何写入之前**再跑一遍。
+        """
+        options = framing_module.validate_options(
+            body.framing.model_dump() if body.framing is not None else None
+        )
+        l0_draft, surface_draft = _split_v4_draft(body.draft, surface_service)
+        job = await preview.submit_surface(
+            l0_draft=l0_draft,
+            surface_draft=surface_draft,
+            framing_options=options,
+            expected_structure_hash=body.expected_structure_hash,
+        )
+        return {
+            "ok": True,
+            "job_id": job.job_id,
+            "seq": job.seq,
+            "status": job.status,
+            "framing": framing_module.describe_options(dict(job.framing)),
+        }
+
+    @app.get("/api/v4/jobs/{job_id}", response_model=JobResponse, tags=["v4"])
+    async def v4_read_job(job_id: str) -> dict[str, Any]:
+        """v4 任务状态。与 ``/api/jobs/{id}`` 共用同一份任务存储（排队与取代机制同一套）。"""
+        job = preview.get_job(job_id)
+        if job is None:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        return job.to_public()
 
     # -- 静态页面 ---------------------------------------------------------
     index_file = WEB_DIR / "index.html"
@@ -560,7 +700,7 @@ def create_app(
 
     @app.get("/", include_in_schema=False)
     async def index() -> Any:
-        """单页界面。
+        """旧单页界面（原生 HTML/CSS/JS）。
 
         令牌在**响应时**注入：磁盘上的 ``index.html`` 只有占位注释，
         因此令牌永远不会出现在静态文件、构建产物或日志里。
@@ -574,6 +714,38 @@ def create_app(
                 errors.INTERNAL_ERROR, "前端页面缺失（src/web/index.html）"
             ).to_payload(),
         )
+
+    # -- v4 工作台（/next）------------------------------------------------
+    #: 构建产物目录：`web/dist`。只影响服务端自己；接口层不接受任何路径参数。
+    web_root = cfg.web_dir or (config_module.REPO_ROOT / "web")
+
+    @app.get("/next", include_in_schema=False, response_class=HTMLResponse)
+    async def next_index() -> Any:
+        """v4 工作台页面。
+
+        未构建时**明确报 503 FRONTEND_NOT_BUILT 与构建步骤**，
+        绝不回退到旧页面 —— 那会让人以为「新工作台就是这样」。
+        页面含会话令牌，因此 ``no-store``。
+        """
+        html = frontend.read_index(web_root)
+        response = HTMLResponse(security.inject_token(html, guard.token))
+        response.headers["Cache-Control"] = frontend.INDEX_CACHE_CONTROL
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+
+    @app.get("/next/assets/{asset_path:path}", include_in_schema=False)
+    async def next_asset(asset_path: str) -> Any:
+        """v4 构建资源。
+
+        * **逐字节直出**：不做任何令牌注入（令牌必须只出现在 HTML 里）；
+        * 文件名带内容哈希 ⇒ 长缓存；
+        * 路径越界与不存在一律 404。
+        """
+        path = frontend.resolve_asset(web_root, asset_path)
+        response = FileResponse(path, media_type=frontend.content_type_for(path))
+        response.headers["Cache-Control"] = frontend.ASSET_CACHE_CONTROL
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     return app
 

@@ -22,6 +22,7 @@ import math
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 # 一个最小合法 PNG（1x1 透明），用于校验「确实落盘了图片」
@@ -125,14 +126,49 @@ class FakeInputs:
         return socket
 
 
+class FakeColorRampElement:
+    def __init__(self, position: float, color: tuple[float, float, float, float]) -> None:
+        self.position = float(position)
+        self.color = tuple(float(v) for v in color)
+
+
+class FakeColorRamp:
+    """ColorRamp：``elements`` / ``interpolation``，行为贴近 bpy。
+
+    元素数量是**结构**信息（技术方案 §1 决策 3）：探针必须能读到它，
+    而写入路径永远走整体替换。
+    """
+
+    def __init__(
+        self,
+        elements: list[tuple[float, tuple[float, float, float, float]]] | None = None,
+        interpolation: str = "LINEAR",
+    ) -> None:
+        if elements is None:
+            elements = [
+                (0.0, (0.05, 0.05, 0.08, 1.0)),
+                (0.5, (0.5, 0.48, 0.46, 1.0)),
+                (1.0, (0.95, 0.94, 0.92, 1.0)),
+            ]
+        self.elements = [FakeColorRampElement(pos, col) for pos, col in elements]
+        self.interpolation = interpolation
+
+
 class FakeNode:
-    def __init__(self, name: str, node_type: str, inputs: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        node_type: str,
+        inputs: dict[str, Any] | None = None,
+        color_ramp: FakeColorRamp | None = None,
+    ) -> None:
         self.name = name
         self.label = name
         self.type = node_type
         self.bl_idname = "CompositorNode" + node_type.title()
         self.mute = False
         self.inputs = FakeInputs(inputs or {})
+        self.color_ramp = color_ramp
 
 
 class _NodeMap:
@@ -342,9 +378,136 @@ class FakeViewSettings:
 
 
 class FakeImageSettings:
+    """``render.image_settings``：复刻 Blender 5.2 里与「预览写 PNG」有关的真实行为。
+
+    全部来自真机实测（`/z/blender5.2.1` 上跑过探针），不是猜的：
+
+    * ``media_type`` 是**静态枚举**（``IMAGE`` / ``MULTI_LAYER_IMAGE`` / ``VIDEO``），
+      双向可赋；但 ``media_type == "VIDEO"``（工程是影片输出）时 ``file_format``
+      只接受影片格式，赋 ``"PNG"`` 会抛
+      ``TypeError: enum "PNG" not found in ('FFMPEG')`` —— 必须先切回 ``IMAGE``；
+    * ``bl_rna.properties["file_format"].enum_items`` **不可信**：影片态下它照样把 PNG
+      列出来，只有赋值才报错。所以可用性只能靠「赋值 + 回读」判定；
+    * 改 ``file_format`` 会**连带**改 ``color_mode`` / ``color_depth``
+      （PNG → RGB/16、JPEG → RGB/8、OPEN_EXR → RGB/32）。
+    """
+
+    MEDIA_TYPES = ("IMAGE", "MULTI_LAYER_IMAGE", "VIDEO")
+    IMAGE_FORMATS = (
+        "AVIF", "JPEG", "OPEN_EXR", "PNG", "WEBP", "BMP", "CINEON", "DPX",
+        "IRIS", "JPEG2000", "HDR", "TARGA", "TARGA_RAW", "TIFF",
+        "OPEN_EXR_MULTILAYER", "FFMPEG",
+    )
+    VIDEO_FORMATS = ("FFMPEG",)
+    COLOR_MODES = ("BW", "RGB", "RGBA")
+    COLOR_DEPTHS = ("8", "10", "12", "16", "32")
+    #: 每种格式的默认 (color_mode, color_depth)，与真机一致
+    FORMAT_DEFAULTS = {
+        "PNG": ("RGB", "16"),
+        "JPEG": ("RGB", "8"),
+        "OPEN_EXR": ("RGB", "32"),
+        "OPEN_EXR_MULTILAYER": ("RGB", "32"),
+        "TIFF": ("RGB", "8"),
+        "BMP": ("RGB", "8"),
+        "FFMPEG": ("RGB", "8"),
+    }
+
     def __init__(self) -> None:
-        self.file_format = "PNG"
-        self.color_mode = "RGBA"
+        self._media_type = "IMAGE"
+        self._file_format = "PNG"
+        self._color_mode = "RGBA"
+        self._color_depth = "8"
+        #: 测试注入：对这个值赋值时抛错（模拟枚举/权限拒绝）
+        self.reject_media_type: str | None = None
+        self.reject_file_format: str | None = None
+
+    # -- media_type --------------------------------------------------------
+    @property
+    def media_type(self) -> str:
+        return self._media_type
+
+    @media_type.setter
+    def media_type(self, value: str) -> None:
+        if value not in self.MEDIA_TYPES:
+            raise TypeError(
+                f'bpy_struct: item.attr = val: enum "{value}" not found in '
+                f"({', '.join(repr(v) for v in self.MEDIA_TYPES)})"
+            )
+        if self.reject_media_type == value:
+            raise TypeError(f"注入的媒体类型拒绝：{value}")
+        self._media_type = value
+
+    # -- file_format -------------------------------------------------------
+    @property
+    def available_file_formats(self) -> tuple[str, ...]:
+        return self.VIDEO_FORMATS if self._media_type == "VIDEO" else self.IMAGE_FORMATS
+
+    @property
+    def file_format(self) -> str:
+        return self._file_format
+
+    @file_format.setter
+    def file_format(self, value: str) -> None:
+        allowed = self.available_file_formats
+        if value not in allowed:
+            raise TypeError(
+                f'bpy_struct: item.attr = val: enum "{value}" not found in '
+                f"({', '.join(repr(v) for v in allowed)})"
+            )
+        if self.reject_file_format == value:
+            raise TypeError(f"注入的格式拒绝：{value}")
+        self._file_format = value
+        # 真机行为：换格式会连带重置 color_mode / color_depth
+        mode, depth = self.FORMAT_DEFAULTS.get(value, ("RGB", "8"))
+        self._color_mode = mode
+        self._color_depth = depth
+
+    # -- color_mode / color_depth -----------------------------------------
+    @property
+    def color_mode(self) -> str:
+        return self._color_mode
+
+    @color_mode.setter
+    def color_mode(self, value: str) -> None:
+        if value not in self.COLOR_MODES:
+            raise TypeError(
+                f'bpy_struct: item.attr = val: enum "{value}" not found in '
+                f"({', '.join(repr(v) for v in self.COLOR_MODES)})"
+            )
+        self._color_mode = value
+
+    @property
+    def color_depth(self) -> str:
+        return self._color_depth
+
+    @color_depth.setter
+    def color_depth(self, value: str) -> None:
+        if value not in self.COLOR_DEPTHS:
+            raise TypeError(
+                f'bpy_struct: item.attr = val: enum "{value}" not found in '
+                f"({', '.join(repr(v) for v in self.COLOR_DEPTHS)})"
+            )
+        self._color_depth = value
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "media_type": self._media_type,
+            "file_format": self._file_format,
+            "color_mode": self._color_mode,
+            "color_depth": self._color_depth,
+        }
+
+    #: 真机里 ``bl_rna.properties[...].enum_items`` 返回的**静态全量**列表 ——
+    #: 影片态下它照样把 PNG 列出来，但赋值会抛错。这个陷阱值得单独钉一个测试。
+    STATIC_ENUM_ITEMS = {
+        "media_type": MEDIA_TYPES,
+        "file_format": IMAGE_FORMATS,
+        "color_mode": COLOR_MODES,
+        "color_depth": COLOR_DEPTHS,
+    }
+
+    def static_enum_items(self, prop: str) -> tuple[str, ...]:
+        return self.STATIC_ENUM_ITEMS[prop]
 
 
 class FakeRender:
@@ -606,6 +769,8 @@ class FakeObjects:
         return obj
 
     def remove(self, obj: FakeObject, do_unlink: bool = False) -> None:
+        if self._bpy.remove_object_error is not None:
+            raise RuntimeError(self._bpy.remove_object_error)
         if obj in self._items:
             self._items.remove(obj)
         scene = obj._scene
@@ -706,13 +871,27 @@ class FakeDepsgraph:
 
 
 class FakeImage:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, *, size: tuple[int, int] = (0, 0), colorspace: str = "sRGB") -> None:
         self.name = name
         self.saved_to: list[str] = []
+        self.size = (int(size[0]), int(size[1]))
+        self.colorspace_settings = SimpleNamespace(name=colorspace)
+        #: 测试注入：非 None 时 save_render 抛错（模拟存图失败）
+        self.save_error: str | None = None
+        #: 存图失败前先落盘的半成品字节（用于验证「失败路径不留残留文件」）
+        self.save_partial_bytes: bytes | None = None
+        #: 每次 save_render 时**场景**的输出格式 —— 真机的格式由场景决定、不看扩展名
+        self.saved_with_format: list[str | None] = []
 
     def save_render(self, filepath: str, scene: Any = None) -> None:
+        image_settings = getattr(getattr(scene, "render", None), "image_settings", None)
+        self.saved_with_format.append(getattr(image_settings, "file_format", None))
         path = Path(filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if self.save_partial_bytes is not None:
+            path.write_bytes(self.save_partial_bytes)
+        if self.save_error is not None:
+            raise RuntimeError(self.save_error)
         path.write_bytes(PNG_BYTES)
         self.saved_to.append(filepath)
 
@@ -725,6 +904,54 @@ class _ImageMap:
     def get(self, name: str) -> FakeImage | None:
         return self._by_name.get(name)
 
+    def add(self, image: FakeImage) -> FakeImage:
+        self._by_name[image.name] = image
+        return image
+
+    def __iter__(self) -> Iterator[FakeImage]:
+        return iter(list(self._by_name.values()))
+
+    def __len__(self) -> int:
+        return len(self._by_name)
+
+
+class FakeMaterial:
+    def __init__(
+        self,
+        name: str,
+        *,
+        blend_method: str = "OPAQUE",
+        use_nodes: bool = True,
+        base_color: tuple[float, float, float, float] = (0.8, 0.8, 0.8, 1.0),
+    ) -> None:
+        self.name = name
+        self.blend_method = blend_method
+        self.use_nodes = use_nodes
+        self.diffuse_color = base_color
+
+
+class _MaterialMap:
+    """``bpy.data.materials``：迭代 + get。"""
+
+    def __init__(self, items: list[FakeMaterial] | None = None) -> None:
+        self._items = list(items or [])
+
+    def add(self, material: FakeMaterial) -> FakeMaterial:
+        self._items.append(material)
+        return material
+
+    def get(self, name: str) -> FakeMaterial | None:
+        for item in self._items:
+            if item.name == name:
+                return item
+        return None
+
+    def __iter__(self) -> Iterator[FakeMaterial]:
+        return iter(list(self._items))
+
+    def __len__(self) -> int:
+        return len(self._items)
+
 
 class FakeOpsRender:
     def __init__(self, bpy: "FakeBpy") -> None:
@@ -732,6 +959,8 @@ class FakeOpsRender:
 
     def render(self, write_still: bool = True, **kwargs: Any) -> None:
         scene = self._bpy.context.scene
+        if self._bpy.render_error is not None:
+            raise RuntimeError(self._bpy.render_error)
         self._bpy.render_count += 1
         self._bpy.last_render_camera = scene.camera.name if scene.camera is not None else None
         self._bpy.last_render_resolution = (
@@ -803,6 +1032,7 @@ class _Data:
         self.is_dirty = False
         self.objects = FakeObjects(bpy)
         self.cameras = FakeCameras(bpy)
+        self.materials = _MaterialMap()
 
 
 class _App:
@@ -827,8 +1057,16 @@ class _Context:
 class FakeBpy:
     """可执行的 `bpy` 替身。"""
 
-    def __init__(self, capability: dict[str, list[str]] | None = None) -> None:
-        glare = FakeNode("Autocel_Glow", "GLARE", dict(DEFAULT_GLARE_INPUTS))
+    def __init__(
+        self,
+        capability: dict[str, list[str]] | None = None,
+        *,
+        glare_node_name: str = "Autocel_Glow",
+    ) -> None:
+        #: 辉光节点的名字。真实工程里它是 Blender 的**本地化默认名**
+        #: （中文 UI「眩光」/ 英文 UI「Glare」）—— 管线建完 CompositorNodeGlare
+        #: 之后从不改名。做成参数，才能回归「按类型定位而不是按名字定位」（F3）。
+        glare = FakeNode(glare_node_name, "GLARE", dict(DEFAULT_GLARE_INPUTS))
         self.node_groups: dict[str, FakeNodeGroup] = {
             "AI_Compositor": FakeNodeGroup(
                 "AI_Compositor",
@@ -841,6 +1079,8 @@ class FakeBpy:
         }
         #: 是否让 PyOpenColorIO 可用（关闭时只能退回 RNA，用于验证降级路径）
         self.ocio_available = True
+        #: Cel 组 → 材质数（只读影响面，供探针/Schema 使用）
+        self.cel_material_counts: dict[str, int] = {}
         self._scene = FakeScene(self, capability)
         self.context = _Context(self)
         self.app = _App()
@@ -854,6 +1094,10 @@ class FakeBpy:
         self.save_calls: list[dict[str, Any]] = []
         #: 测试注入：设置后任何保存都抛 RuntimeError（模拟磁盘/权限失败）
         self.save_error: str | None = None
+        #: 测试注入：设置后 render 抛 RuntimeError（模拟渲染失败）
+        self.render_error: str | None = None
+        #: 测试注入：设置后对象删除抛 RuntimeError（模拟临时相机清理失败）
+        self.remove_object_error: str | None = None
         self.build_default_scene()
 
     # -- 工程（.blend）状态 ------------------------------------------------
@@ -869,6 +1113,49 @@ class FakeBpy:
         self.data.filepath = str(target)
         self.data.is_dirty = bool(dirty)
         return target
+
+    # -- Cel 色阶节点组（v4 竖切用）--------------------------------------
+    def add_cel_group(
+        self,
+        name: str,
+        *,
+        element_count: int = 3,
+        interpolation: str = "LINEAR",
+        materials: int = 0,
+        emission_strength: float | None = None,
+        emission_node_name: str = "Emission",
+        emission_socket: str = "Strength",
+        emission_linked: bool = False,
+    ) -> FakeNodeGroup:
+        """往 ``bpy.data.node_groups`` 里注册一个 Cel 组。
+
+        刻意包含一个带 ``color_ramp`` 的 ColorRamp 节点（真实管线以它承载色阶），
+        以及一个可选的 Emission 节点 —— 后者用来验证「探到才生成可编辑节点」。
+
+        真机对照（Blender 5.2.1 LTS，中文 UI 下节点名是「自发光」、插座名仍是
+        英文 ``Strength``、``linked=False``）：``emission_linked=True`` 用于复现
+        「插座被上游连线 ⇒ default_value 写了也不生效」的降级路径。
+        """
+        elements = []
+        for index in range(max(2, int(element_count))):
+            ratio = index / max(1, (max(2, int(element_count)) - 1))
+            elements.append((round(ratio, 4), (round(ratio * 0.9, 4), 0.2, 1.0 - round(ratio * 0.5, 4), 1.0)))
+        ramp = FakeColorRamp(elements=elements, interpolation=interpolation)
+
+        nodes: list[FakeNode] = [
+            FakeNode("ColorRamp", "VALTORGB", color_ramp=ramp),
+        ]
+        if emission_strength is not None:
+            node = FakeNode(emission_node_name, "EMISSION", {emission_socket: float(emission_strength)})
+            if emission_linked:
+                socket = node.inputs.get(emission_socket)
+                if socket is not None:
+                    socket.is_linked = True
+            nodes.append(node)
+        group = FakeNodeGroup(name, nodes)
+        self.node_groups[name] = group
+        self.cel_material_counts[name] = int(materials)
+        return group
 
     @property
     def view_settings(self) -> FakeViewSettings:
@@ -954,6 +1241,10 @@ class FakeBpy:
     def glare_node(self) -> FakeNode:
         group = self.node_groups["AI_Compositor"]
         node = group.nodes.get("Autocel_Glow")
+        if node is None:
+            # 真实工程里名字是本地化的（「眩光」/「Glare」）—— 按类型回退
+            node = next((n for n in group.nodes
+                         if getattr(n, "bl_idname", "") == "CompositorNodeGlare"), None)
         assert node is not None
         return node
 
@@ -993,6 +1284,9 @@ class FakeBpy:
             "camera_rotation": None if camera is None else tuple(camera.rotation_euler),
             "camera_lens": None if camera is None else camera.data.lens,
             "camera_shift": None if camera is None else (camera.data.shift_x, camera.data.shift_y),
+            # 输出设置（PNG 相关）也必须逐项还原 —— 放进来后，所有取景测试都顺带覆盖它
+            "output": scene.render.image_settings.snapshot(),
+            "output_filepath": scene.render.filepath,
         }
 
     def temp_camera_objects(self) -> list[FakeObject]:

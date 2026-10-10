@@ -1,0 +1,24 @@
+{
+  "name": "cartoon-model-shader-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Cartoon-Model-Shader v4 参数工作台（Preact + TypeScript）。由 FastAPI 托管构建产物。",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "vite build && node scripts/verify-dist.mjs"
+  },
+  "dependencies": {
+    "preact": "^10.24.3"
+  },
+  "devDependencies": {
+    "@testing-library/preact": "^3.2.4",
+    "@types/node": "^22.9.0",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8"
+  }
+}

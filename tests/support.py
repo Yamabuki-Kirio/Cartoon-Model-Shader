@@ -32,10 +32,15 @@ def make_config(
     port: int,
     *,
     presets_dir: Path | None = None,
+    web_dir: Path | None = None,
     response_timeout: float = 3.0,
     connect_timeout: float = 1.0,
 ) -> AppConfig:
-    """构造测试配置；``presets_dir`` 一律指向临时目录，绝不写进真实的 LOCALAPPDATA。"""
+    """构造测试配置。
+
+    ``presets_dir`` / ``web_dir`` 一律由调用方指向临时目录，绝不写进（也绝不读）
+    开发者真实的 ``%LOCALAPPDATA%`` 与仓库里的 ``web/dist``。
+    """
     return AppConfig(
         blender_mcp=BlenderMCPConfig(
             host="127.0.0.1",
@@ -45,6 +50,7 @@ def make_config(
         ),
         server=ServerConfig(host="127.0.0.1", port=8765),
         presets_dir=presets_dir,
+        web_dir=web_dir,
     )
 
 

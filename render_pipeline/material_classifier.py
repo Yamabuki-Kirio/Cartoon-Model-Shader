@@ -23,6 +23,85 @@ import unicodedata
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RULES_PATH = os.path.join(_HERE, "material_rules.json")
 
+
+def default_maps_dir():
+    """
+    侧车映射的默认存放目录 —— **绝不落在仓库内的 model_material_maps/**。
+
+    仓库里那份只放随代码分发的只读样例（example.material-map.json，由
+    tests/test_render_pipeline_repo_guard.py 守卫）。用户确认结果与「待填写」
+    模板都属于运行数据，按项目既有约定落到用户数据目录（与预设存储同源：
+    %LOCALAPPDATA%\\CartoonModelShader）。
+
+    优先级：TOON_MAPS_DIR > --maps-dir（调用方传入）> 本函数默认值。
+    """
+    env = os.environ.get("TOON_MAPS_DIR")
+    if env:
+        return os.path.abspath(env)
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "CartoonModelShader", "model_material_maps")
+
+
+#: 用户目录环境变量 -> 展示占位符。**顺序重要**：LOCALAPPDATA / APPDATA 都嵌在
+#: USERPROFILE 之下，先匹配更具体的那个，展示结果才不是 `%USERPROFILE%\AppData\Local\…`。
+_PATH_PLACEHOLDERS = (
+    ("LOCALAPPDATA", "%LOCALAPPDATA%"),
+    ("APPDATA", "%APPDATA%"),
+    ("USERPROFILE", "%USERPROFILE%"),
+)
+
+
+def display_path(path, root=None, root_placeholder="<OUTPUT_DIR>"):
+    """
+    把绝对路径转成【不含用户名】的展示形式，供 run_manifest / provenance / 页面留档。
+
+    清单与页面是给人看的：既不需要绝对路径，也不该把用户名带出去。
+    规则（按优先级）：
+
+      0. 给了 ``root`` 且 ``path`` 落在它之下 ⇒ ``<OUTPUT_DIR>[\\子路径]``
+         （渲染输出目录常被建在系统临时目录下，业务语义比物理路径更有用）；
+      1. 落在 %LOCALAPPDATA% / %APPDATA% / %USERPROFILE% 之下 ⇒ 换成对应占位符
+         （默认侧车映射目录因此展示为 `%LOCALAPPDATA%\\CartoonModelShader\\model_material_maps`）；
+      2. 其余路径若仍出现当前用户名（例如自定义目录建在用户主目录下），
+         只保留文件名 —— 兜底，绝不放用户名出清单；
+      3. 其它情况原样返回（例如与用户名无关的项目盘素材路径）。
+
+    注意：**只在展示层脱敏**。哈希、读写、越界判定仍用真实绝对路径。
+    """
+    if path in (None, ""):
+        return path
+    text = str(path)
+    try:
+        full = os.path.abspath(text)
+    except Exception:
+        return text
+
+    if root not in (None, ""):
+        root_abs = os.path.abspath(str(root))
+        root_norm = os.path.normcase(root_abs)
+        full_norm = os.path.normcase(full)
+        if full_norm == root_norm:
+            return root_placeholder
+        if full_norm.startswith(root_norm + os.sep):
+            rest = full[len(root_abs):].lstrip("\\/")
+            return root_placeholder + os.sep + rest
+
+    norm = os.path.normcase(full)
+    for env_name, placeholder in _PATH_PLACEHOLDERS:
+        base = os.environ.get(env_name)
+        if not base:
+            continue
+        base_abs = os.path.abspath(base)
+        base_norm = os.path.normcase(base_abs)
+        if norm == base_norm or norm.startswith(base_norm + os.sep):
+            rest = full[len(base_abs):].lstrip("\\/")
+            return placeholder + (os.sep + rest if rest else "")
+
+    username = (os.environ.get("USERNAME") or "").strip()
+    if username and username.lower() in full.lower():
+        return os.path.basename(full) or full
+    return full
+
 # 规范化时要抹掉的分隔符
 _SEP_RE = re.compile(r"[\s_\-\.\+\(\)\[\]\{\}（）【】·・、,，:：/\\|]+")
 _TRAIL_NUM_RE = re.compile(r"\d+$")
@@ -96,6 +175,10 @@ class Rules:
                 "id": r.get("id"),
                 "pattern": re.compile(r["pattern"], re.IGNORECASE),
                 "pattern_src": r["pattern"],
+                # 排除词（可选）：命中它则【本条规则不适用】，继续往下试别的层级。
+                # 用途：像「眼」这种单字 token 会命中「神之眼」/「眼镜」等非眼睛材质。
+                "unless": (re.compile(r["unless"], re.IGNORECASE) if r.get("unless") else None),
+                "unless_src": r.get("unless"),
                 "class": r.get("class"),
                 "confidence": float(r.get("confidence", self.confidence.get("semantic_rule", 0.75))),
                 "note": r.get("note", ""),
@@ -251,9 +334,15 @@ class MaterialClassifier(object):
 
         # ---- L4 语义正则（对 compact 与 nfc 都试）
         for rule in r.semantic_rules:
-            if rule["pattern"].search(n["compact"]) or rule["pattern"].search(n["nfc"]):
-                return self._mk(name, n, rule["class"], "semantic_rule", rule["id"],
-                                rule["confidence"], "L4", note=rule["note"])
+            if not (rule["pattern"].search(n["compact"]) or rule["pattern"].search(n["nfc"])):
+                continue
+            unless = rule.get("unless")
+            if unless and (unless.search(n["compact"]) or unless.search(n["nfc"])):
+                # 排除词命中：本条规则不适用（例：「神之眼」不因含「眼」被判成眼睛），
+                # 继续往下试其余规则与层级，绝不在这里硬塞一个分类。
+                continue
+            return self._mk(name, n, rule["class"], "semantic_rule", rule["id"],
+                            rule["confidence"], "L4", note=rule["note"])
 
         # ---- L5 结构特征
         if ctx:
@@ -354,8 +443,9 @@ def load_classifier(rules_path=None):
 def map_path_for(model_dir, fingerprint, maps_dir=None):
     """
     侧车映射文件路径。身份【只看指纹】，不看路径 —— 移动模型目录不会丢映射。
+    默认目录见 default_maps_dir()：**不是**仓库内的 model_material_maps/。
     """
-    maps_dir = maps_dir or os.path.join(_HERE, "model_material_maps")
+    maps_dir = maps_dir or default_maps_dir()
     return os.path.join(maps_dir, "%s.material-map.json" % fingerprint)
 
 
@@ -384,13 +474,24 @@ def load_model_map(model_dir=None, fingerprint=None, maps_dir=None, explicit_pat
 
 
 def write_map_template(path, entries, model_meta=None):
-    """生成待填写模板：所有待确认材质先写成 UNRESOLVED。"""
+    """
+    生成「待填写」模板：所有待确认材质先写成 UNRESOLVED。
+
+    ★ source 必须写 template_unconfirmed，不能写 user_confirmed ——
+      模板是管线生成的**待办清单**，不是用户确认结果；标成 user_confirmed 会让
+      下游报告与审计误以为「这些归类已经有人确认过」。
+    """
     data = {
         "schema": "toon-material-map/1",
+        "kind": "template",
+        "status": "unconfirmed",
         "model": model_meta or {},
-        "assignments": {name: {"group": "UNRESOLVED", "source": "user_confirmed",
+        "assignments": {name: {"group": "UNRESOLVED", "source": "template_unconfirmed",
                                "hint": hint} for name, hint in entries}
     }
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return path

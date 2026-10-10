@@ -9,10 +9,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from . import blender_ops, color_looks, errors, framing, project_ops
+from . import blender_ops, color_looks, errors, framing, project_ops, surface_probe
 from .blender_mcp import BlenderMCPClient
 from .config import BlenderMCPConfig
 from .redact import redact
+from .surface import executor as surface_executor
 
 PREVIEW_DIR_NAME = "toon-tuner-previews"
 #: 预览渲染的**长边**像素数（另一条边按工程纵横比等比缩放，绝不改变纵横比）
@@ -119,6 +120,15 @@ class BlenderBinder:
         )
         return color_looks.parse_payload(captured)
 
+    def describe_surface(self) -> dict[str, Any]:
+        """只读拓扑描述（v4）：受管节点组 / ColorRamp 结构 / 对象与材质清单。
+
+        探针无入参、只读、不改任何 ``bpy`` 数据；脱敏在服务端侧再做一遍
+        （``surface_probe.redact_describe``），不依赖 Blender 侧自觉。
+        """
+        captured = self._client().execute_code(surface_probe.build_describe_code())
+        return surface_probe.parse_describe(captured)
+
     # -- 写入 -----------------------------------------------------------
     def apply_values(self, values: dict[str, Any]) -> dict[str, Any]:
         """原子应用一组取值。
@@ -143,6 +153,35 @@ class BlenderBinder:
                 errors.BLENDER_SCRIPT_ERROR,
                 "应用草稿失败，且 Blender 未给出可识别的失败原因。",
                 details={"blender_payload": payload},
+            )
+        return payload
+
+    # -- 通用执行器（v4 参数面）------------------------------------------
+    def apply_surface_ops(self, ops: list[Any]) -> dict[str, Any]:
+        """用 v4 通用执行器**原子**应用一组计划操作（色带整体替换等）。
+
+        Blender 侧失败不回结构化 ``failure`` 之外的任何东西：执行器已经把它自己
+        写过的部分回滚到快照，这里只负责翻成稳定错误码 ``SURFACE_APPLY_FAILED``
+        并把「失败在哪条参数、什么原因」留在 details 里。
+
+        空计划是合法输入（例如工程里一个 Cel 组都没探到）：直接返回空结果，
+        不去下发一段必然报错的空脚本。
+        """
+        if not ops:
+            return {"applied": True, "failure": None, "snapshot": {}, "values": {}}
+        captured = self._client().execute_code(surface_executor.build_apply_code(ops))
+        payload = surface_executor.extract_json(captured)
+        if payload.get("applied") is False:
+            failure = payload.get("failure") or {}
+            raise errors.ToonTunerError(
+                errors.SURFACE_APPLY_FAILED,
+                f"参数写入失败：{redact(str(failure.get('message') or '')) or '未给出可识别的原因'}"
+                "（本次写入已被回滚）。",
+                details={
+                    "stage": failure.get("stage"),
+                    "failure_type": failure.get("type"),
+                    "restored": True,
+                },
             )
         return payload
 
@@ -172,8 +211,9 @@ class BlenderBinder:
         if isinstance(aborted, dict) and aborted.get("code"):
             code_ = str(aborted["code"])
             message = str(aborted.get("message") or "取景前置条件已变化，预览中止。")
-            if code_ == errors.FRAMING_STALE:
-                raise errors.ToonTunerError(errors.FRAMING_STALE, message)
+            # 中止码本身就是稳定错误码的直接投递（Blender 侧已保证零污染后才回这个标记）
+            if code_ in (errors.FRAMING_STALE, errors.PREVIEW_OUTPUT_UNAVAILABLE):
+                raise errors.ToonTunerError(code_, message)
             raise errors.ToonTunerError(
                 errors.PREVIEW_FAILED, message, details={"abort_code": code_}
             )

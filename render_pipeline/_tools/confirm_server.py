@@ -71,7 +71,7 @@ sys.path.insert(0, V31)
 sys.path.insert(0, HERE)
 
 import run_contract as RC                       # noqa: E402
-from material_classifier import map_path_for    # noqa: E402
+from material_classifier import map_path_for, default_maps_dir, display_path   # noqa: E402
 from render_lock import RenderLock, LockBusy    # noqa: E402
 
 ROOT = os.environ.get("TOON_MODEL_ROOT", "")
@@ -83,6 +83,10 @@ RUNTIME_DIR = os.environ.get("TOON_RUNTIME_DIR", os.path.join(V31, "runtime"))
 CONF_DIR = os.path.join(RUNTIME_DIR, "confirmation")
 JOB_DIR = os.path.join(CONF_DIR, "jobs")
 LOCK_DIR = os.path.join(CONF_DIR, ".locks")
+
+# ★ F6：默认侧车映射目录 = **用户数据目录**，不是仓库内的 model_material_maps/。
+#   那一个目录只放随代码分发的只读样例；用户确认结果属于运行数据，不入库。
+DEFAULT_MAPS_DIR = os.environ.get("TOON_MAPS_DIR") or default_maps_dir()
 
 STATE = {"models": {}, "order": [], "maps_dir": None, "lock": threading.RLock()}
 
@@ -242,9 +246,23 @@ def session_state():
     return "waiting" if pending_items() else "ready"
 
 
+def _display_result(result, out_root):
+    """结果条目 → 对外展示副本（路径一律换成逻辑路径）。"""
+    item = dict(result)
+    if item.get("out_dir"):
+        item["out_dir"] = display_path(item["out_dir"], root=out_root)
+    if item.get("map_file"):
+        item["map_file"] = display_path(item["map_file"])
+    return item
+
+
 def render_status():
     st = session_state()
     shippable = bool(RENDER["outcome"]) and RC.is_shippable(RENDER["outcome"])
+    job = RENDER["job"] or {}
+    # ★ O4：对外**只给逻辑路径**（`<OUTPUT_DIR>` / `%LOCALAPPDATA%\…`）。
+    #   真实绝对路径留在服务端内部（job / RENDER），页面与日志不回显用户名目录。
+    out_root = job.get("out_root")
     return {
         "schema": "toon-render-status/1",
         "session_id": RENDER["session_id"],
@@ -257,17 +275,20 @@ def render_status():
         "attempt": RENDER["attempt"],
         "outcome": RENDER["outcome"],
         "shippable": shippable,
-        "results": RENDER["results"],
+        "results": [_display_result(r, out_root) for r in RENDER["results"]],
         "history": RENDER["history"],
-        "outputs": sorted({os.path.dirname(r["out_dir"]) if os.path.isfile(r["out_dir"]) else r["out_dir"]
-                           for r in RENDER["results"] if r.get("out_dir")}),
-        "out_root": (RENDER["job"] or {}).get("out_root"),
+        "outputs": sorted({display_path(
+            os.path.dirname(r["out_dir"]) if os.path.isfile(r["out_dir"]) else r["out_dir"],
+            root=out_root)
+            for r in RENDER["results"] if r.get("out_dir")}),
+        "out_root": display_path(out_root, root=out_root),
         "error": RENDER["error"],
         "blender_channel": blender_channel_ready(),
         "started_at": RENDER["started_at"],
         "ended_at": RENDER["ended_at"],
-        "targets": [{"label": t.get("label"), "out": t.get("out")}
-                    for t in ((RENDER["job"] or {}).get("targets") or [])],
+        "targets": [{"label": t.get("label"),
+                     "out": display_path(t.get("out"), root=out_root)}
+                    for t in (job.get("targets") or [])],
     }
 
 
@@ -372,6 +393,10 @@ def _run_one(tgt, out_dir, job, timeout=1800):
             "--resolve", job.get("source_blend") or SOURCE_BLEND,
             "--script", job.get("script") or SCRIPT,
             "--auto-frame", str(int(job.get("auto_frame") or 0)),
+            # ★ F6：把映射目录一路带到驱动与主脚本。以前这里只传 --material-map（且是在
+            #   会话启动时定死的 map_file），用户在这次会话里刚写下的确认结果到不了渲染侧。
+            #   现在两条路都给：显式文件优先，目录兜底（渲染时按指纹重查）。
+            "--maps-dir", job.get("maps_dir") or STATE.get("maps_dir") or DEFAULT_MAPS_DIR,
             "--log", logp, "--done", done]
     mf = tgt.get("map_file")
     if mf and os.path.isfile(mf):
@@ -743,7 +768,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--confirmation")
     ap.add_argument("--all", action="store_true")
-    ap.add_argument("--maps-dir", default=os.path.join(V31, "model_material_maps"))
+    ap.add_argument("--maps-dir", default=DEFAULT_MAPS_DIR)
     ap.add_argument("--port", type=int, default=8770)
     ap.add_argument("--open", action="store_true")
     ap.add_argument("--check", action="store_true")

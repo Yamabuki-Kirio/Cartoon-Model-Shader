@@ -26,6 +26,8 @@ INVALID_DEPENDENT_ENUM = "INVALID_DEPENDENT_ENUM"
 # 取景（framing）
 FRAMING_STALE = "FRAMING_STALE"
 FRAMING_UNAVAILABLE = "FRAMING_UNAVAILABLE"
+#: 预览必须输出 PNG，但工程的输出设置无法被安全切换过来（例如影片输出 FFMPEG）
+PREVIEW_OUTPUT_UNAVAILABLE = "PREVIEW_OUTPUT_UNAVAILABLE"
 # 会话令牌（所有写接口）
 SESSION_TOKEN_INVALID = "SESSION_TOKEN_INVALID"
 # 保存 / 应用到工程
@@ -51,6 +53,20 @@ PRESET_INVALID = "PRESET_INVALID"
 PRESET_SCHEMA_UNSUPPORTED = "PRESET_SCHEMA_UNSUPPORTED"
 PRESET_NAME_CONFLICT = "PRESET_NAME_CONFLICT"
 PRESET_STORAGE_ERROR = "PRESET_STORAGE_ERROR"
+# v4 参数面（递归 schema / 结构化 binding / 三层身份）
+SCHEMA_INVALID = "SCHEMA_INVALID"
+INVALID_BINDING = "INVALID_BINDING"
+STRUCTURE_CHANGED = "STRUCTURE_CHANGED"
+IDENTITY_MISSING = "IDENTITY_MISSING"
+UNSUPPORTED_PARAM = "UNSUPPORTED_PARAM"
+NOT_EDITABLE = "NOT_EDITABLE"
+ASSET_UNKNOWN = "ASSET_UNKNOWN"
+PRESET_INCOMPATIBLE = "PRESET_INCOMPATIBLE"
+FRONTEND_NOT_BUILT = "FRONTEND_NOT_BUILT"
+#: v4 通用执行器在 Blender 侧写入失败（该次写入已被执行器自己回滚）。
+SURFACE_APPLY_FAILED = "SURFACE_APPLY_FAILED"
+#: `/next` 的静态资源不存在（含路径越界；两种情况刻意不区分）。
+ASSET_NOT_FOUND = "ASSET_NOT_FOUND"
 
 #: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，
 #: 便于调用方直接读到 ``parameter`` / ``value`` / ``depends_on`` / ``allowed``。
@@ -128,6 +144,12 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         409,
         True,
         "无法自动取景：请确认场景里有可见的角色网格（已排除刚体代理与描边壳）以及一台活动相机。",
+    ),
+    PREVIEW_OUTPUT_UNAVAILABLE: (
+        409,
+        False,
+        "预览只能输出 PNG，但当前工程的输出设置切不过去（常见原因：工程把渲染输出设为影片格式，"
+        "如 FFMPEG）。预览已中止，工程未被改动。请把「输出属性 → 输出」改为图片格式后重试。",
     ),
     PRESET_NOT_FOUND: (
         404,
@@ -221,6 +243,69 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         True,
         "失败后未能把 Blender 恢复到提交前的状态。请到 Blender 里人工确认曝光/辉光取值，"
         "必要时点「恢复基线」；磁盘上的工程文件未被写入。",
+    ),
+    SCHEMA_INVALID: (
+        500,
+        False,
+        "参数 schema 自身不一致（重复 id 或声明了白名单外的字段）。这是服务端装配问题，"
+        "不会写入 Blender；请更新到修正版本后重启服务。",
+    ),
+    INVALID_BINDING: (
+        500,
+        False,
+        "参数绑定不合法（字段不在白名单内或 object_id 形态非法）。这是服务端装配问题，"
+        "不会写入 Blender。",
+    ),
+    STRUCTURE_CHANGED: (
+        409,
+        True,
+        "工程结构已变化（对象增删、节点拓扑、色标数量或材质槽变化）。草稿与保存确认令牌已作废，"
+        "请重新建立基线后再继续。",
+    ),
+    IDENTITY_MISSING: (
+        409,
+        True,
+        "受管对象被重命名或删除，无法再安全地写入（本工具不做猜测迁移）。"
+        "请重新建立基线，并确认工程里的对象命名未被改动。",
+    ),
+    UNSUPPORTED_PARAM: (
+        400,
+        False,
+        "该参数在当前工程中探测不到（supported=false），写入会被忽略或写错位置，因此已拒绝。"
+        "请刷新基线，或确认工程里对应的节点/插座确实存在。",
+    ),
+    NOT_EDITABLE: (
+        400,
+        False,
+        "该参数当前不可编辑（editable=false）。结构性改动需要先通过检查点恢复验收；"
+        "详情见响应里的 readonly_reason。",
+    ),
+    ASSET_UNKNOWN: (
+        400,
+        False,
+        "资源 id 不在当前基线的资源表内（或看起来像文件路径）。资源只能从服务端枚举出来的候选里选。",
+    ),
+    PRESET_INCOMPATIBLE: (
+        409,
+        False,
+        "预设与当前工程不兼容，存在阻断项。请查看兼容性报告后决定是否强制应用（不会静默丢弃字段）。",
+    ),
+    FRONTEND_NOT_BUILT: (
+        503,
+        False,
+        "前端尚未构建，无法提供页面。请在 web/ 目录执行 npm ci 与 npm run build 后重试"
+        "（开发时可用 Vite dev server 并把 /api 代理到本服务）。",
+    ),
+    SURFACE_APPLY_FAILED: (
+        502,
+        True,
+        "参数写入 Blender 失败（本次写入已被自动回滚，工程里的取值未改变）。"
+        "请确认对应对象仍然存在后重试。",
+    ),
+    ASSET_NOT_FOUND: (
+        404,
+        False,
+        "前端静态资源不存在。若页面白屏，请重新执行 npm run build 后再刷新。",
     ),
 }
 

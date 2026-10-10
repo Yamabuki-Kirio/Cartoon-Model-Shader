@@ -1,8 +1,12 @@
 {
   "schema": "toon-material-rules/1",
-  "version": "3.0.0",
-  "updated": "2026-10-09",
+  "version": "3.1.0",
+  "updated": "2026-10-11",
   "note": "本文件是【唯一规则源】。主脚本(一键卡通渲染.py)与预检器(pmx_material_probe.py)都必须从本文件读取规则，禁止任何副本。改动规则只需改这里。",
+  "changelog": {
+    "3.1.0": "① semantic_rules 新增可选排除词 unless：命中即本条规则不适用（修 F4：单字「眼」把「神之眼」误判成眼睛材质）。② unresolved_patterns 新增「神之眼」类饰品的反例提示。",
+    "3.0.0": "v3 分层决策 + 严格/诊断双政策。"
+  },
 
   "class_to_group": {
     "skin": "Cel_Skin",
@@ -74,7 +78,9 @@
      "note": "放在 hair 之前，避免 hairshadow 被当成头发"},
     {"id": "face", "pattern": "face|颜|脸|面", "class": "face", "confidence": 0.80,
      "note": "含简体 颜（旧版只有日文/繁体 顔，一字之差拖垮 7 个模型）"},
-    {"id": "eye", "pattern": "eye|目|眼|瞳|pupil|iris", "class": "eye", "confidence": 0.85},
+    {"id": "eye", "pattern": "eye|目|眼|瞳|pupil|iris", "class": "eye", "confidence": 0.85,
+     "unless": "神之眼|神之瞳|神之心|眼镜|眼鏡|墨镜|眼罩|目隠し|まぶた|glasses|eyewear",
+     "note": "★ 必须带 unless：单个「眼/目」会命中「神之眼」这类饰品名与「眼镜」类配饰，把饰品判成眼球材质。排除词命中则本条不适用，继续下沉（最终多半落到 L6 待人工确认）。"},
     {"id": "face_detail", "pattern": "teeth|齿|牙|tongue|舌|lash|睫毛|睫|brow|眉|まつげ|口|二重", "class": "face_detail", "confidence": 0.80,
      "note": "源工程里牙/舌/睫/眉走 Cel_Eyes；口腔/口线/Mouth 同类"},
     {"id": "emission", "pattern": "glow|光|emission|emissive|hika|管道|导管|表盘|pipe|tube", "class": "emission", "confidence": 0.75},
@@ -98,6 +104,7 @@
   ],
 
   "unresolved_patterns": [
+    {"pattern": "神之眼|神之瞳|神之心", "hint": "★ 反例（F4）：「神之眼」一类神明造物饰品**不是**眼睛材质，只是名字里带「眼」。必须人工确认，绝不允许自动归入眼睛。多数情况应归金属/配饰（Cel_Dark）。"},
     {"pattern": "表情", "hint": "疑似表情切换件（贴图多为 emotion/common_face）。MMD 中 morph 权重 0 时可能不可见，但也可能是默认脸——必须人工确认，不能静默忽略。"},
     {"pattern": "emotion", "hint": "疑似表情切换件，同「表情」。"},
     {"pattern": "新規", "hint": "作者随手命名的未命名材质。实测贴图可能是主体贴图（如 体.png），面数可达 1.5 万——绝不可忽略。"},
