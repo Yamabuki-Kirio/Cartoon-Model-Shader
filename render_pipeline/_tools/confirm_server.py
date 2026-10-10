@@ -71,7 +71,7 @@ sys.path.insert(0, V31)
 sys.path.insert(0, HERE)
 
 import run_contract as RC                       # noqa: E402
-from material_classifier import map_path_for    # noqa: E402
+from material_classifier import map_path_for, default_maps_dir   # noqa: E402
 from render_lock import RenderLock, LockBusy    # noqa: E402
 
 ROOT = os.environ.get("TOON_MODEL_ROOT", "")
@@ -83,6 +83,10 @@ RUNTIME_DIR = os.environ.get("TOON_RUNTIME_DIR", os.path.join(V31, "runtime"))
 CONF_DIR = os.path.join(RUNTIME_DIR, "confirmation")
 JOB_DIR = os.path.join(CONF_DIR, "jobs")
 LOCK_DIR = os.path.join(CONF_DIR, ".locks")
+
+# ★ F6：默认侧车映射目录 = **用户数据目录**，不是仓库内的 model_material_maps/。
+#   那一个目录只放随代码分发的只读样例；用户确认结果属于运行数据，不入库。
+DEFAULT_MAPS_DIR = os.environ.get("TOON_MAPS_DIR") or default_maps_dir()
 
 STATE = {"models": {}, "order": [], "maps_dir": None, "lock": threading.RLock()}
 
@@ -372,6 +376,10 @@ def _run_one(tgt, out_dir, job, timeout=1800):
             "--resolve", job.get("source_blend") or SOURCE_BLEND,
             "--script", job.get("script") or SCRIPT,
             "--auto-frame", str(int(job.get("auto_frame") or 0)),
+            # ★ F6：把映射目录一路带到驱动与主脚本。以前这里只传 --material-map（且是在
+            #   会话启动时定死的 map_file），用户在这次会话里刚写下的确认结果到不了渲染侧。
+            #   现在两条路都给：显式文件优先，目录兜底（渲染时按指纹重查）。
+            "--maps-dir", job.get("maps_dir") or STATE.get("maps_dir") or DEFAULT_MAPS_DIR,
             "--log", logp, "--done", done]
     mf = tgt.get("map_file")
     if mf and os.path.isfile(mf):
@@ -743,7 +751,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--confirmation")
     ap.add_argument("--all", action="store_true")
-    ap.add_argument("--maps-dir", default=os.path.join(V31, "model_material_maps"))
+    ap.add_argument("--maps-dir", default=DEFAULT_MAPS_DIR)
     ap.add_argument("--port", type=int, default=8770)
     ap.add_argument("--open", action="store_true")
     ap.add_argument("--check", action="store_true")

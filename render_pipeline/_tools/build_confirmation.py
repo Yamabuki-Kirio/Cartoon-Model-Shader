@@ -34,7 +34,7 @@ sys.path.insert(0, V31)
 import pmx_features as PF                       # noqa: E402
 import structure_classifier as SC               # noqa: E402
 import decision as DEC                          # noqa: E402
-from material_classifier import MaterialClassifier, load_model_map  # noqa: E402
+from material_classifier import MaterialClassifier, load_model_map, default_maps_dir  # noqa: E402
 
 ROOT = os.environ.get("TOON_MODEL_ROOT", "")
 RUNTIME_DIR = os.environ.get("TOON_RUNTIME_DIR", os.path.join(V31, "runtime"))
@@ -139,12 +139,15 @@ def main():
     ap.add_argument("--pmx", default=None)
     ap.add_argument("--root", default=ROOT)
     ap.add_argument("--out", default=OUT)
+    # ★ F6：映射目录必须可由外部贯穿；默认=用户数据目录（不是仓库内的 model_material_maps/）
+    ap.add_argument("--maps-dir", default=None)
     a = ap.parse_args()
     if not a.pmx and not a.root:
         ap.error("批量模式需要 --root 或环境变量 TOON_MODEL_ROOT")
 
     clf = MaterialClassifier()
-    maps_dir = os.path.join(V31, "model_material_maps")
+    maps_dir = os.path.abspath(a.maps_dir) if a.maps_dir else (
+        os.environ.get("TOON_MAPS_DIR") or default_maps_dir())
     out_dir = os.path.abspath(a.out)
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(os.path.join(out_dir, "previews"), exist_ok=True)

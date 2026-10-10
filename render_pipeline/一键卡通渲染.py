@@ -66,6 +66,12 @@ CLASSIFIER = MC.MaterialClassifier(RULES_PATH)
 MATERIAL_POLICY = os.environ.get("TOON_MATERIAL_POLICY", "strict").strip().lower()
 ALLOW_LOW_CONFIDENCE = os.environ.get("TOON_ALLOW_LOW_CONFIDENCE", "0").strip().lower() in ("1", "true", "yes", "on")
 MATERIAL_MAP_PATH = os.environ.get("TOON_MATERIAL_MAP") or None
+# ★ F6：侧车映射目录必须可以由外部贯穿进来（TOON_MAPS_DIR，或入口的 --maps-dir）。
+#   默认值来自 MC.default_maps_dir()，**不是**仓库内的 model_material_maps/ ——
+#   那个目录只放随代码分发的只读样例，运行数据（确认结果/待填模板）概不写入。
+MAPS_DIR = os.environ.get("TOON_MAPS_DIR") or MC.default_maps_dir()
+RESOLVED_MAP_PATH = None   # 运行期由 load_model_map() 填充：本次【实际用到】的映射文件
+MAP_RESOLVED_BY = None     # "explicit" | "fingerprint" | None
 MODEL_MAP = None          # 运行期由 load_model_map() 填充：{材质名: {"group":..., "source":...}}
 CLASSIFICATION_LOG = []   # 本次运行逐材质的分类结果（写进 run_manifest.json）
 
@@ -501,6 +507,23 @@ def sha256_of(path):
         return None
 
 
+def _maps_dir_in_repo():
+    """
+    侧车映射目录是否落在【仓库代码目录】内 —— 期望恒为 False。
+
+    运行数据（用户确认结果、待填模板）不得写进随代码分发的目录；
+    仓库内的 render_pipeline/model_material_maps/ 只放只读样例，
+    由 tests/test_render_pipeline_repo_guard.py 守卫。此标志写进 run_manifest，
+    让任何一次运行都能被事后审计出「有没有往仓库里写东西」。
+    """
+    try:
+        v3 = os.path.abspath(V3_DIR)
+        md = os.path.abspath(MAPS_DIR)
+        return md == v3 or md.startswith(v3 + os.sep)
+    except Exception:
+        return None
+
+
 def write_run_manifest(out_dir, pre_existing, extra_inputs=(), extra_info=None):
     """本次运行的完整清单：输入哈希 + 脚本哈希 + 输出哈希 + 生效配置"""
     import time
@@ -535,9 +558,18 @@ def write_run_manifest(out_dir, pre_existing, extra_inputs=(), extra_info=None):
                       "schema": CLASSIFIER.rules.schema,
                       "version": CLASSIFIER.rules.version,
                       "sha256": sha256_of(RULES_PATH)},
-            "material_map": {"path": (os.path.basename(MATERIAL_MAP_PATH)
-                                      if MATERIAL_MAP_PATH else None),
-                             "sha256": sha256_of(MATERIAL_MAP_PATH) if MATERIAL_MAP_PATH else None},
+            # ★ F8：这里必须记「本次实际用到」的那份映射（显式传入，或按指纹命中）。
+            #   以前只记 MATERIAL_MAP_PATH，于是按指纹命中的映射完全不留痕 ——
+            #   清单里 provenance.material_map 恒为 null，而 material_classification
+            #   又写着 mapping_source_counts.model_map=1，自相矛盾，产物不可追溯。
+            "material_map": {
+                "path": (os.path.basename(RESOLVED_MAP_PATH) if RESOLVED_MAP_PATH else None),
+                "sha256": sha256_of(RESOLVED_MAP_PATH) if RESOLVED_MAP_PATH else None,
+                "resolved_by": MAP_RESOLVED_BY,
+                "entry_count": len(MODEL_MAP or {}),
+                "maps_dir": MAPS_DIR,
+                "maps_dir_in_repo": _maps_dir_in_repo(),
+            },
             "v3_dir": V3_DIR,
         },
         "material_classification": dict(RUN_INFO.get("material_classification", {})),
@@ -1184,35 +1216,51 @@ def model_fingerprint():
 
 
 def load_model_map():
-    """加载侧车映射：显式 --material-map 优先，否则按指纹去 model_material_maps/ 找。"""
-    global MODEL_MAP
-    maps_dir = os.path.join(V3_DIR, "model_material_maps")
+    """
+    加载侧车映射：显式 --material-map 优先，否则按指纹去 MAPS_DIR 找。
+
+    ★ F6：无论走哪条路，都把「本次实际用到的映射文件」记进 RESOLVED_MAP_PATH，
+      供 run_manifest.provenance 溯源 —— 否则产物无法证明用的是哪一份确认结果。
+    """
+    global MODEL_MAP, RESOLVED_MAP_PATH, MAP_RESOLVED_BY
+    maps_dir = MAPS_DIR
     if MATERIAL_MAP_PATH and os.path.isfile(MATERIAL_MAP_PATH):
         MODEL_MAP, meta = MC.load_model_map(explicit_path=MATERIAL_MAP_PATH, maps_dir=maps_dir)
+        if MODEL_MAP:
+            RESOLVED_MAP_PATH, MAP_RESOLVED_BY = MATERIAL_MAP_PATH, "explicit"
         log(f"      侧车映射：{MATERIAL_MAP_PATH}（{len(MODEL_MAP or {})} 条）")
         return meta
     fp = model_fingerprint()
     if fp:
+        cand = MC.map_path_for(None, fp.split(":", 1)[1], maps_dir)
         MODEL_MAP, meta = MC.load_model_map(
             fingerprint=fp.split(":", 1)[1], maps_dir=maps_dir)
         if MODEL_MAP:
-            log(f"      侧车映射：按指纹 {fp[:19]}… 命中 model_material_maps/（{len(MODEL_MAP)} 条）")
+            RESOLVED_MAP_PATH, MAP_RESOLVED_BY = cand, "fingerprint"
+            log(f"      侧车映射：按指纹 {fp[:19]}… 命中 {cand}（{len(MODEL_MAP)} 条）")
             return meta
-        log(f"      侧车映射：按指纹 {fp[:19]}… 未找到（首次处理该模型属正常）")
+        log(f"      侧车映射：按指纹 {fp[:19]}… 未找到（目录 {maps_dir}；首次处理该模型属正常）")
     else:
         log("      侧车映射：无模型指纹（未提供 --pmx/--blend 输入），跳过")
     return None
 
 
 def write_map_template_for_run(unresolved_names, model_meta, out_dir):
-    """给本次运行生成"待填写"的侧车映射模板，落到 model_material_maps/ 与输出目录各一份。"""
+    """
+    给本次运行生成「待填写」的侧车映射模板。
+
+    ★ F6：落点只有输出目录 —— 绝不写进仓库内的 model_material_maps/。
+      模板是**运行数据**（本次运行产出的待办清单），不是随代码分发的资产；
+      用户确认结果另有落点：由确认服务按 --maps-dir 写进用户数据目录。
+      两者分离后，仓库代码目录不会再被运行过程污染。
+    """
     if not unresolved_names:
         return None
     fp = model_fingerprint()
     if not fp:
         return None
-    dst = MC.map_path_for(None, fp.split(":", 1)[1],
-                          os.path.join(V3_DIR, "model_material_maps"))
+    dst = os.path.join(out_dir or OUT_DIR,
+                       "%s.material-map.template.json" % fp.split(":", 1)[1][:16])
     entries = [(n, "待确认") for n in unresolved_names]
     MC.write_map_template(dst, entries, model_meta)
     return dst

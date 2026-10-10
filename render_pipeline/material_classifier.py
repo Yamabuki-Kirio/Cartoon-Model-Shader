@@ -23,6 +23,24 @@ import unicodedata
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RULES_PATH = os.path.join(_HERE, "material_rules.json")
 
+
+def default_maps_dir():
+    """
+    侧车映射的默认存放目录 —— **绝不落在仓库内的 model_material_maps/**。
+
+    仓库里那份只放随代码分发的只读样例（example.material-map.json，由
+    tests/test_render_pipeline_repo_guard.py 守卫）。用户确认结果与「待填写」
+    模板都属于运行数据，按项目既有约定落到用户数据目录（与预设存储同源：
+    %LOCALAPPDATA%\\CartoonModelShader）。
+
+    优先级：TOON_MAPS_DIR > --maps-dir（调用方传入）> 本函数默认值。
+    """
+    env = os.environ.get("TOON_MAPS_DIR")
+    if env:
+        return os.path.abspath(env)
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "CartoonModelShader", "model_material_maps")
+
 # 规范化时要抹掉的分隔符
 _SEP_RE = re.compile(r"[\s_\-\.\+\(\)\[\]\{\}（）【】·・、,，:：/\\|]+")
 _TRAIL_NUM_RE = re.compile(r"\d+$")
@@ -96,6 +114,10 @@ class Rules:
                 "id": r.get("id"),
                 "pattern": re.compile(r["pattern"], re.IGNORECASE),
                 "pattern_src": r["pattern"],
+                # 排除词（可选）：命中它则【本条规则不适用】，继续往下试别的层级。
+                # 用途：像「眼」这种单字 token 会命中「神之眼」/「眼镜」等非眼睛材质。
+                "unless": (re.compile(r["unless"], re.IGNORECASE) if r.get("unless") else None),
+                "unless_src": r.get("unless"),
                 "class": r.get("class"),
                 "confidence": float(r.get("confidence", self.confidence.get("semantic_rule", 0.75))),
                 "note": r.get("note", ""),
@@ -251,9 +273,15 @@ class MaterialClassifier(object):
 
         # ---- L4 语义正则（对 compact 与 nfc 都试）
         for rule in r.semantic_rules:
-            if rule["pattern"].search(n["compact"]) or rule["pattern"].search(n["nfc"]):
-                return self._mk(name, n, rule["class"], "semantic_rule", rule["id"],
-                                rule["confidence"], "L4", note=rule["note"])
+            if not (rule["pattern"].search(n["compact"]) or rule["pattern"].search(n["nfc"])):
+                continue
+            unless = rule.get("unless")
+            if unless and (unless.search(n["compact"]) or unless.search(n["nfc"])):
+                # 排除词命中：本条规则不适用（例：「神之眼」不因含「眼」被判成眼睛），
+                # 继续往下试其余规则与层级，绝不在这里硬塞一个分类。
+                continue
+            return self._mk(name, n, rule["class"], "semantic_rule", rule["id"],
+                            rule["confidence"], "L4", note=rule["note"])
 
         # ---- L5 结构特征
         if ctx:
@@ -354,8 +382,9 @@ def load_classifier(rules_path=None):
 def map_path_for(model_dir, fingerprint, maps_dir=None):
     """
     侧车映射文件路径。身份【只看指纹】，不看路径 —— 移动模型目录不会丢映射。
+    默认目录见 default_maps_dir()：**不是**仓库内的 model_material_maps/。
     """
-    maps_dir = maps_dir or os.path.join(_HERE, "model_material_maps")
+    maps_dir = maps_dir or default_maps_dir()
     return os.path.join(maps_dir, "%s.material-map.json" % fingerprint)
 
 
@@ -384,13 +413,24 @@ def load_model_map(model_dir=None, fingerprint=None, maps_dir=None, explicit_pat
 
 
 def write_map_template(path, entries, model_meta=None):
-    """生成待填写模板：所有待确认材质先写成 UNRESOLVED。"""
+    """
+    生成「待填写」模板：所有待确认材质先写成 UNRESOLVED。
+
+    ★ source 必须写 template_unconfirmed，不能写 user_confirmed ——
+      模板是管线生成的**待办清单**，不是用户确认结果；标成 user_confirmed 会让
+      下游报告与审计误以为「这些归类已经有人确认过」。
+    """
     data = {
         "schema": "toon-material-map/1",
+        "kind": "template",
+        "status": "unconfirmed",
         "model": model_meta or {},
-        "assignments": {name: {"group": "UNRESOLVED", "source": "user_confirmed",
+        "assignments": {name: {"group": "UNRESOLVED", "source": "template_unconfirmed",
                                "hint": hint} for name, hint in entries}
     }
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return path

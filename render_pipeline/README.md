@@ -51,7 +51,14 @@ python .\render_pipeline\开始渲染.py `
 | `DIAGNOSTIC` | 否 |
 | `FAILED` | 否 |
 
-运行数据默认写入 `render_pipeline/runtime/`，真实侧车映射写入 `model_material_maps/`；两者均被 Git 忽略。仓库只保留虚构格式示例。
+运行数据默认写入 `render_pipeline/runtime/`。
+
+侧车映射目录由 `--maps-dir` 全程贯穿（入口 → 确认服务 → 驱动 → 主脚本），默认值是**用户数据目录**
+`%LOCALAPPDATA%\CartoonModelShader\model_material_maps`（可用 `TOON_MAPS_DIR` 覆盖），
+**不是仓库内的 `render_pipeline/model_material_maps/`** —— 那一个目录只放随代码分发的只读样例
+（`example.material-map.json`，由 `tests/test_render_pipeline_repo_guard.py` 守卫）。
+用户确认结果与「待填写」模板都属于运行数据，一律不写进仓库代码目录：模板落输出目录，
+确认结果落 `--maps-dir` 指向的用户数据目录。
 
 ## 测试
 

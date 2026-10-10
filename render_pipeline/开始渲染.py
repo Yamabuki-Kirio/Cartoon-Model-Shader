@@ -31,6 +31,8 @@
     --auto-frame 0|1      构图
     --no-confirm-ui       即使需要确认也不开页面（只打印缺什么）
     --port <n>            本地确认页端口，默认 8770
+    --maps-dir <目录>     侧车映射目录；默认=用户数据目录（不在仓库内），
+                          经入口 → 确认服务 → 驱动 → 主脚本全程贯穿（F6）
 """
 import argparse
 import hashlib
@@ -62,6 +64,54 @@ LOCK_DIR = os.path.join(CONF_DIR, ".locks")
 PY = sys.executable
 
 TERMINAL = ("success", "rejected", "diagnostic", "failed")
+
+
+def default_maps_dir():
+    """
+    侧车映射的默认目录 —— 与项目既有约定一致：**用户数据不进仓库**。
+
+    %LOCALAPPDATA%\\CartoonModelShader\\model_material_maps（用 TOON_MAPS_DIR 可覆盖）。
+    仓库内的 render_pipeline/model_material_maps/ 只放随代码分发的只读样例
+    （example.material-map.json，由 tests/test_render_pipeline_repo_guard.py 守卫），
+    运行数据（用户确认结果、待填模板）一律不写进去。
+    """
+    env = os.environ.get("TOON_MAPS_DIR")
+    if env:
+        return os.path.abspath(env)
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "CartoonModelShader", "model_material_maps")
+
+
+def ensure_out_dir(out_dir):
+    """
+    创建输出目录，失败时给**稳定错误码 + 可读说明**（F7）。
+
+    以前这里是裸 os.makedirs：--out 指向「已存在的文件」或「不存在的盘符」时
+    直接抛 FileExistsError / FileNotFoundError 的 traceback，调用方既拿不到
+    错误码也拿不到可读原因。返回 (ok, error_dict)。
+    """
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        return True, None
+    except FileExistsError:
+        return False, {"code": "OUTPUT_NOT_WRITABLE",
+                       "message": "输出目录不可用：该路径已存在且不是一个目录。",
+                       "retryable": False,
+                       "hint": "换一个 --out 目录，或先删掉/改名同名的文件。",
+                       "details": {"out_dir": out_dir}}
+    except OSError as e:
+        return False, {"code": "OUTPUT_NOT_WRITABLE",
+                       "message": "无法创建输出目录：%s" % (getattr(e, "strerror", None) or e),
+                       "retryable": False,
+                       "hint": "检查该路径所在磁盘是否存在、是否有写权限，或换一个 --out 目录。",
+                       "details": {"out_dir": out_dir, "errno": getattr(e, "errno", None)}}
+
+
+def report_error(err):
+    """把结构化错误打成两行可读文本。"""
+    out("  !! %s：%s" % (err.get("code"), err.get("message")))
+    if err.get("hint"):
+        out("     %s" % err["hint"])
 
 
 def out(*a):
@@ -157,7 +207,7 @@ def preflight(pmx, maps_dir=None):
     import build_confirmation as BC
     from material_classifier import MaterialClassifier
     clf = MaterialClassifier()
-    payload = BC.build_one(pmx, clf, maps_dir or os.path.join(HERE, "model_material_maps"))
+    payload = BC.build_one(pmx, clf, maps_dir or default_maps_dir())
     if not payload:
         return None, None
     os.makedirs(CONF_DIR, exist_ok=True)
@@ -170,6 +220,10 @@ def preflight(pmx, maps_dir=None):
 
 def ensure_previews(pmx, conf_path):
     """缺预览图就补（串行、按指纹派发）。"""
+    # ★ F7：预览目录以前从不创建（preflight 只建 CONF_DIR），派发后 Blender 侧
+    #   open(log_path,'w') 直接 FileNotFoundError → 只打印「预览图派发失败」。
+    #   出厂默认配置首次运行必然踩到，确认页因此拿不到遮罩 / 透视高亮 / 推荐图。
+    os.makedirs(PREVIEW_DIR, exist_ok=True)
     with io.open(conf_path, encoding="utf-8") as f:
         conf = json.load(f)
     req = [x for x in conf["items"] if x.get("requires_user")]
@@ -182,7 +236,9 @@ def ensure_previews(pmx, conf_path):
     if not need:
         return True
     out("  生成 %d 张预览图（首次需要，之后会复用）…" % len(need))
-    done = os.path.join(HERE, "_tools", "_preview_run.done")
+    # ★ F6：完成标记以前写在仓库代码目录（_tools/_preview_run.done）——那是运行数据，
+    #   会把仓库工作树弄脏。改到 PREVIEW_DIR（运行目录）下。
+    done = os.path.join(PREVIEW_DIR, "_preview_run.done")
     logp = os.path.join(PREVIEW_DIR, "_%s.log" % hashlib.sha256(pmx.encode()).hexdigest()[:8])
     for p in (done, logp):
         try:
@@ -222,7 +278,7 @@ def write_job(pmx, out_dir, mode, auto_frame, maps_dir=None):
         "driver": os.path.join(HERE, "一键渲染_通用驱动.py"),
         "script": os.path.join(HERE, "一键卡通渲染.py"),
         "out_root": os.path.dirname(out_dir),
-        "maps_dir": maps_dir or os.path.join(HERE, "model_material_maps"),
+        "maps_dir": maps_dir or default_maps_dir(),
         "session_label": os.path.basename(pmx),
         "targets": [{"fingerprint": fp, "pmx": pmx,
                      "label": os.path.basename(pmx), "out": out_dir}],
@@ -238,7 +294,10 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
     本进程全程不启动渲染，因此不可能与页面按钮产生两个 Blender。
     返回大写终态 token。
     """
-    os.makedirs(out_dir, exist_ok=True)
+    ok, err = ensure_out_dir(out_dir)
+    if not ok:
+        report_error(err)
+        return "FAILED"
     job_path = write_job(pmx, out_dir, mode, auto_frame, maps_dir)
     logp = os.path.join(out_dir, "confirm_server.log")
     buf = open(logp, "w", encoding="utf-8", errors="replace")
@@ -249,7 +308,7 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
                             "--source-blend", SOURCE_BLEND,
                             "--blender", BLENDER,
                             "--runtime-dir", RUNTIME_DIR,
-                            "--maps-dir", maps_dir or os.path.join(HERE, "model_material_maps")],
+                            "--maps-dir", maps_dir or default_maps_dir()],
                            stdout=buf, stderr=subprocess.STDOUT)
     url = "http://127.0.0.1:%d/" % port
     try:
@@ -321,9 +380,12 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
             pass
 
 
-def render(pmx, out_dir, mode, auto_frame):
+def render(pmx, out_dir, mode, auto_frame, maps_dir=None):
     """无需确认时的直接渲染。带跨进程锁，防止重复起 Blender。"""
-    os.makedirs(out_dir, exist_ok=True)
+    ok, err = ensure_out_dir(out_dir)
+    if not ok:
+        report_error(err)
+        return 1
     os.makedirs(LOCK_DIR, exist_ok=True)
     lockp = os.path.join(LOCK_DIR, "%s.render.lock" % sha256_of(pmx)[:16])
     try:
@@ -346,6 +408,9 @@ def render(pmx, out_dir, mode, auto_frame):
                 "--resolve", SOURCE_BLEND,
                 "--script", os.path.join(HERE, "一键卡通渲染.py"),
                 "--auto-frame", "1" if auto_frame else "0",
+                # ★ F6：直渲路径过去完全不传映射目录 —— 于是已确认过的模型
+                #   （预检「映射命中 1 / 需确认 0」→ 走这条路）会把确认结果丢掉。
+                "--maps-dir", maps_dir or default_maps_dir(),
                 "--log", logp, "--done", done]
         out("  渲染中…（日志 %s）" % logp)
         r = launch_blender(argv, logp)
@@ -383,14 +448,17 @@ def main():
                     help="Blender 可执行文件；也可设 TOON_BLENDER")
     ap.add_argument("--runtime-dir", default=RUNTIME_DIR,
                     help="确认数据、预览、任务与锁的运行目录")
-    ap.add_argument("--maps-dir", default=os.path.join(HERE, "model_material_maps"),
-                    help="侧车映射目录（默认工程内 model_material_maps；试跑可指向临时目录）")
+    ap.add_argument("--maps-dir", default=None,
+                    help="侧车映射目录；不传则用用户数据目录"
+                         "（%%LOCALAPPDATA%%\\CartoonModelShader\\model_material_maps，"
+                         "TOON_MAPS_DIR 可覆盖）。**默认不指向仓库**，运行数据不入库")
     a = ap.parse_args()
 
     ROOT = os.path.abspath(a.model_root) if a.model_root else ""
     SOURCE_BLEND = os.path.abspath(a.source_blend) if a.source_blend else ""
     BLENDER = os.path.abspath(a.blender) if a.blender else ""
     RUNTIME_DIR = os.path.abspath(a.runtime_dir)
+    a.maps_dir = os.path.abspath(a.maps_dir) if a.maps_dir else default_maps_dir()
     CONF_DIR = os.path.join(RUNTIME_DIR, "confirmation")
     PREVIEW_DIR = os.path.join(CONF_DIR, "previews")
     JOB_DIR = os.path.join(CONF_DIR, "jobs")
@@ -436,7 +504,7 @@ def main():
     requiring = [x for x in payload["items"] if x["requires_user"]]
     if not requiring:
         out("[2/3] 无需人工确认 —— 直接渲染")
-        rc = render(pmx, out_dir, a.mode, bool(a.auto_frame))
+        rc = render(pmx, out_dir, a.mode, bool(a.auto_frame), a.maps_dir)
         out("[3/3] 完成（输出：%s）" % out_dir)
         return rc
 

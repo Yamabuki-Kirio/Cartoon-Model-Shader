@@ -17,7 +17,8 @@ _V3 = os.path.dirname(_HERE)
 sys.path.insert(0, _V3)
 
 from material_classifier import (MaterialClassifier, Rules,  # noqa: E402
-                                 map_path_for, load_model_map, write_map_template)
+                                 map_path_for, load_model_map, write_map_template,
+                                 default_maps_dir)
 from pmx_material_probe import render_md  # noqa: E402
 
 
@@ -129,6 +130,54 @@ class TestLayering(unittest.TestCase):
     def test_body_shell_is_cloth(self):
         """源工程里「身_体」是躯干外壳，走 Cel_Cloth 不是 skin"""
         self.assertEqual(self.c.classify("身_体").klass, "cloth")
+
+
+class TestEyeAccessoryExclusion(unittest.TestCase):
+    """
+    ★ 反例回归（F4）：单字「眼 / 目」会命中**饰品名**。
+
+    真机误判：迪奥娜的「神之眼」（bone_y_center=0.541 髋部 / 68 三角面 / 无 morph）
+    被 eye 语义规则自动判成眼睛材质并**直接执行、无人工确认**。
+
+    要求：① 这类名字绝不能自动归入眼睛材质；② 必须降为待确认；
+          ③ 反例不得误伤真眼睛；④ 规则必须显式声明排除词（可回归、可审计）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = MaterialClassifier()
+
+    def test_gods_eye_is_not_eye_material(self):
+        """「神之眼」是饰品，不是眼球材质"""
+        c = self.c.classify("神之眼")
+        self.assertNotEqual(c.klass, "eye", "神之眼不得被判为眼睛材质")
+        self.assertNotEqual(c.group, "RayToon_Eyes_Unlit",
+                            "神之眼不得落到眼睛节点组")
+        self.assertTrue(c.needs_review, "必须降为待确认，不得自动执行")
+
+    def test_eye_accessories_never_auto_eye(self):
+        """带「眼」的配饰/护具一律不得自动判成眼睛材质"""
+        for name in ("神之眼", "眼罩", "眼镜", "墨镜"):
+            c = self.c.classify(name)
+            self.assertNotEqual(c.klass, "eye", "%s 不得被判为眼睛材质" % name)
+
+    def test_real_eyes_still_eye(self):
+        """排除词不能误伤真眼睛 —— 这是反例的另一半"""
+        for name in ("眼", "目", "瞳", "瞳孔", "黒目", "eyes", "EyeWhite"):
+            self.assertEqual(self.c.classify(name).klass, "eye", name)
+
+    def test_ruleset_declares_unless_for_eye(self):
+        """排除词必须是规则文件里的**声明**，不是代码里的特判"""
+        r = Rules()
+        eye = [x for x in r.semantic_rules if x["id"] == "eye"]
+        self.assertEqual(len(eye), 1, "eye 规则必须唯一")
+        self.assertIsNotNone(eye[0]["unless"], "eye 规则必须声明 unless 排除词")
+        self.assertIn("神之眼", eye[0]["unless_src"])
+
+    def test_unless_does_not_swallow_other_classes(self):
+        """排除词只挡 eye 这一条规则，不能连带把别名层/其它规则也关掉"""
+        self.assertEqual(self.c.classify("眼镜").klass, "metal")
+        self.assertEqual(self.c.classify("墨镜").klass, "metal")
 
 
 class TestUnresolvedAndIgnore(unittest.TestCase):
@@ -293,6 +342,49 @@ class TestSidecarMap(unittest.TestCase):
             self.assertEqual(a["口腔"]["group"], "Cel_Eyes")
             self.assertEqual(a["表情"]["group"], "Cel_Dark")
             self.assertEqual(a["表情"]["source"], "user_confirmed")
+
+    def test_template_never_claims_user_confirmed(self):
+        """★ F6：模板是管线生成的**待办清单**，不是用户确认结果。
+
+        以前 write_map_template 把每条都标 source=user_confirmed，于是报告与审计
+        会以为「这些归类已经有人确认过」—— 这是失实的来源标注。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "x.material-map.json")
+            write_map_template(p, [("表情", "hint")], None)
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data["assignments"]["表情"]["source"], "template_unconfirmed")
+            self.assertEqual(data.get("kind"), "template")
+            self.assertEqual(data.get("status"), "unconfirmed")
+
+    def test_default_maps_dir_is_outside_the_repo(self):
+        """★ F6：默认映射目录**绝不能在仓库代码目录内** —— 运行数据不入库。
+
+        仓库内的 render_pipeline/model_material_maps/ 只放随代码分发的只读样例，
+        由 tests/test_render_pipeline_repo_guard.py 守卫。
+        """
+        d = os.path.abspath(default_maps_dir())
+        repo = os.path.abspath(_V3)
+        self.assertFalse(d.startswith(repo + os.sep),
+                         "默认映射目录落在仓库内（运行数据会污染代码目录）：%s" % d)
+        self.assertTrue(d.endswith(os.path.join("CartoonModelShader", "model_material_maps")),
+                        "默认映射目录应与预设存储同源：%s" % d)
+
+    def test_default_maps_dir_honours_env(self):
+        """TOON_MAPS_DIR 必须能覆盖默认值（入口→确认服务→驱动→主脚本靠它贯穿）"""
+        old = os.environ.get("TOON_MAPS_DIR")
+        # 注意：这里刻意不写绝对盘符字面量 ——
+        # tests/test_render_pipeline_repo_guard.py 会扫描本目录源码里的开发机路径。
+        rel = os.path.join("tmp-maps-for-test", "maps")
+        try:
+            os.environ["TOON_MAPS_DIR"] = rel
+            self.assertEqual(default_maps_dir(), os.path.abspath(rel))
+        finally:
+            if old is None:
+                os.environ.pop("TOON_MAPS_DIR", None)
+            else:
+                os.environ["TOON_MAPS_DIR"] = old
 
 
 class TestSummary(unittest.TestCase):

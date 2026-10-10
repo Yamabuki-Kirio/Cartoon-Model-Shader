@@ -17,6 +17,7 @@ v3 相对 v2 的变化：
       --out  <输出目录>                    # 必填
       --material-policy strict|diagnostic  # 默认 strict
       --material-map <侧车映射.json>        # 可选，优先于按指纹自动查找
+      --maps-dir <目录>                     # 侧车映射目录（默认=用户数据目录，见下）
       --preflight-only                     # 只出预检报告就退出
       --write-map-template                 # 额外生成待填写的映射模板
       --allow-low-confidence               # 允许低置信度分类继续（默认不允许）
@@ -29,6 +30,11 @@ v3 相对 v2 的变化：
 
 关于辉光：源工程那套 Glare 参数在其工程里是被旁路的、从未生效，且 Blender 5.x 的
 Glare 节点已无 Mix 输入，照抄会明显过曝。用上面三个开关覆盖为实测可用的值。
+
+关于 --maps-dir：侧车映射目录一律由外部贯穿（入口 → 确认服务 → 本驱动 → 主脚本）。
+默认值是**用户数据目录**（%LOCALAPPDATA%\\CartoonModelShader\\model_material_maps，
+可用 TOON_MAPS_DIR 覆盖），**不是**仓库内的 render_pipeline/model_material_maps/ ——
+后者只放随代码分发的只读样例，运行数据（用户确认结果、待填模板）概不写入。
 """
 import bpy
 import os
@@ -126,6 +132,18 @@ POLICY = str(POLICY).strip().lower()
 if POLICY not in ("strict", "diagnostic"):
     raise SystemExit("--material-policy 只能是 strict 或 diagnostic，收到 %r" % POLICY)
 
+# ★ F6：侧车映射目录必须由外部贯穿进来，且**默认值不是仓库内的 model_material_maps/**。
+#   优先级：--maps-dir > TOON_MAPS_DIR > 用户数据目录（与预设存储同源）。
+MAPS_DIR = arg("--maps-dir") or os.environ.get("TOON_MAPS_DIR") or None
+if not MAPS_DIR:
+    try:
+        import material_classifier as _MC
+        MAPS_DIR = _MC.default_maps_dir()
+    except Exception:
+        _base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        MAPS_DIR = os.path.join(_base, "CartoonModelShader", "model_material_maps")
+MAPS_DIR = os.path.abspath(MAPS_DIR)
+
 def log(m):
     line = "[%s] %s" % (time.strftime("%H:%M:%S"), m)
     print(line, flush=True)
@@ -190,13 +208,13 @@ def enable_mmd():
 # ------------------------------------------------------------------ 预检（不需要场景）
 def run_preflight(target_pmx, report_dir):
     sys.path.insert(0, V3_DIR)
-    from material_classifier import MaterialClassifier, map_path_for, write_map_template
+    from material_classifier import MaterialClassifier, write_map_template
     import pmx_material_probe as probe
 
     clf = MaterialClassifier(RULES_PATH)
     os.makedirs(report_dir, exist_ok=True)
     rec = probe.preflight(target_pmx, clf,
-                          maps_dir=os.path.join(V3_DIR, "model_material_maps"),
+                          maps_dir=MAPS_DIR,
                           explicit_map=MATERIAL_MAP)
 
     # 报告可能被带出本机：把绝对路径换成相对/文件名
@@ -223,7 +241,9 @@ def run_preflight(target_pmx, report_dir):
 
     if WRITE_MAP_TEMPLATE:
         fp = (rec.get("fingerprint_file") or "").split(":", 1)[-1]
-        dst = map_path_for(None, fp, os.path.join(V3_DIR, "model_material_maps"))
+        # ★ F6：模板是**运行数据** → 只落 report_dir（输出目录）。
+        #   绝不写进仓库内的 model_material_maps/（那里只放随代码分发的只读样例）。
+        dst = os.path.join(report_dir, "%s.material-map.template.json" % fp[:16])
         entries = [(d["original_name"], "建议 %s（%s）" % (d["class"], d["matched_by"]))
                    for d in rec["materials"] if d["needs_review"] or d["class"] == "unresolved"]
         write_map_template(dst, entries, {
@@ -260,6 +280,7 @@ def main():
             "注意旧语义 --strict 0 现在对应 diagnostic（出带标识的诊断图），"
             "不再等于「静默兜底到 Cel_Dark」——静默兜底已彻底移除。")
     log("map      = %s" % (MATERIAL_MAP or "(按模型指纹自动查找)"))
+    log("maps-dir = %s" % MAPS_DIR)
     log("rules    = %s" % RULES_PATH)
     log("resolve  = %s" % SOURCE)
     log("script   = %s" % SCRIPT)
@@ -340,6 +361,9 @@ def main():
     os.environ["TOON_MATERIAL_POLICY"] = POLICY
     os.environ["TOON_RULES"] = RULES_PATH
     os.environ["TOON_ALLOW_LOW_CONFIDENCE"] = "1" if ALLOW_LOW_CONF else "0"
+    # ★ F6：把映射目录贯穿到主脚本（它顶部读 TOON_MAPS_DIR），否则渲染侧只能去
+    #        仓库内的 model_material_maps/ 找 —— 用户确认结果就永远到不了渲染侧。
+    os.environ["TOON_MAPS_DIR"] = MAPS_DIR
     if MATERIAL_MAP:
         os.environ["TOON_MATERIAL_MAP"] = MATERIAL_MAP
 
