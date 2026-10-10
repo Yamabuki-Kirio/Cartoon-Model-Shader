@@ -843,6 +843,9 @@ class CommitService:
         return {
             "ok": True,
             "mode": ticket.mode,
+            # 保存链路刻意**保留真实绝对路径**：覆盖 .blend 之前必须让用户看清
+            # 到底写到哪个文件，这是既有的安全约定（二次确认），不是路径泄漏。
+            # （O4 的脱敏针对的是**服务端派生**的路径：渲染输出、场景工程路径、诊断。）
             "target_path": ticket.target_path,
             "backup_path": status["backup"]["path"] or status["backup"]["path_confirmed"],
             "saved": True,

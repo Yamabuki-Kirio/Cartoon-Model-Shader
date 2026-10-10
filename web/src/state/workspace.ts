@@ -68,6 +68,17 @@ export interface PreviewState {
  */
 export type BaselinePreviewStatus = "none" | "pending" | "ready" | "failed";
 
+/**
+ * 工程脏标记提示文案（O3）。
+ *
+ * 只承诺**我们能保证**的事：参数值 / 节点 / 相机 / 输出设置会恢复原值；本工具不写盘。
+ * **不承诺**「Blender 看起来是干净的」—— 脏标记由 Blender 维护且不能由我们清除。
+ */
+export const PROJECT_DIRTY_NOTICE =
+  "本次预览只改内存：参数值、节点、相机与输出设置都已恢复原值。" +
+  "本工具不会保存或覆盖你的 .blend 文件；" +
+  "Blender 仍可能显示「有未保存的修改」，那是本次写入留下的标记，不代表工程内容有差异。";
+
 export interface WorkspaceState {
   schema: SurfaceSchema | null;
   baseline: SurfaceBaselinePublic | null;
@@ -97,6 +108,14 @@ export interface WorkspaceState {
   activeGroupId: string | null;
   error: ErrorDetail | null;
   notice: string | null;
+  /**
+   * 工程脏标记提示（O3）。
+   *
+   * Blender 的 `bpy.data.is_dirty` 是**粘性**的：把参数写回原值也不会清除它，
+   * 而本工具只在用户显式走保存流程时才写盘。于是「基线时干净、预览后变脏」
+   * 几乎必然发生 —— 它不是缺陷，也不代表工程内容真的被改了。为空表示无需提示。
+   */
+  projectNotice: string | null;
   loading: boolean;
   /** 结构失效：草稿已作废，预览被禁用，直到刷新基线。 */
   historyBlocked: boolean;
@@ -200,6 +219,7 @@ export function createWorkspace(options: WorkspaceOptions) {
     activeGroupId: null,
     error: null,
     notice: null,
+    projectNotice: null,
     loading: false,
     historyBlocked: false,
     framingChoice: DEFAULT_FRAMING,
@@ -296,6 +316,11 @@ export function createWorkspace(options: WorkspaceOptions) {
       notice: stale
         ? "本次画面基于提交时的草稿；你在渲染期间又改过草稿，已标记为过期。"
         : null,
+      // O3：工程本来是干净的，预览后 Blender 却显示「有未保存的修改」——
+      // 那是写入留下的粘性标记，不是内容差异。不改承诺、不尝试清标记，只如实说明。
+      projectNotice: result.project?.dirty_flagged
+        ? PROJECT_DIRTY_NOTICE
+        : store.getState().projectNotice,
     });
   }
 
@@ -578,6 +603,9 @@ export function createWorkspace(options: WorkspaceOptions) {
     },
     clearNotice(): void {
       store.setState({ notice: null });
+    },
+    clearProjectNotice(): void {
+      store.setState({ projectNotice: null });
     },
     clearError(): void {
       // **只**清提示。`historyBlocked` 是安全锁，只能由「成功刷新基线」解除

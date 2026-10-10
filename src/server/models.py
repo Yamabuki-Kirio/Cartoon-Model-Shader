@@ -133,6 +133,10 @@ class BaselineResponse(BaseModel):
     #: ``view_transform`` -> ``[{value, label}]``：Blender 真实接受的 look 档位
     look_map: dict[str, list[dict[str, str]]] = Field(default_factory=dict)
     preview_resolution: list[int] = Field(default_factory=list)
+    #: 建立基线那一刻的工程脏标记（只有 ``dirty`` / ``file_name``，**不含绝对路径**）。
+    #: 与预览结果里的 ``project`` 对应，供页面判断「原本干净、预览后才变脏」。
+    #: **新增的可选字段**：旧页面不看它，因此 L0 响应契约不变。
+    project: dict[str, Any] = Field(default_factory=dict)
     #: v4 参数面基线（只读拓扑探针 + 递归 schema + 三层指纹）。
     #: **新增的可选字段**：旧页面不看它，因此 L0 响应契约不变。
     surface: dict[str, Any] | None = None

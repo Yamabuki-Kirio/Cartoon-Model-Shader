@@ -57,6 +57,15 @@ export interface JobState {
   error?: JobError | null;
 }
 
+/** 工程脏标记快照（O3）。只含布尔值与文件名 —— 绝对路径不出现。 */
+export interface ProjectStateSummary {
+  dirty_at_baseline?: boolean | null;
+  dirty_after_preview?: boolean | null;
+  /** 仅当「基线干净 → 预览后变脏」时为真：这才是需要向用户解释的情形。 */
+  dirty_flagged?: boolean;
+  file_name?: string | null;
+}
+
 export interface JobResult {
   preview_url: string;
   render_resolution?: number[] | null;
@@ -73,6 +82,7 @@ export interface JobResult {
   surface_restore_mismatches?: Array<Record<string, unknown>>;
   external_changes?: ExternalChange[];
   framing?: Record<string, unknown>;
+  project?: ProjectStateSummary | null;
   [key: string]: unknown;
 }
 
@@ -96,6 +106,8 @@ export interface SurfaceBaselinePublic {
   degraded?: string[];
   identities?: Array<{ object_type: string; name: string; source: string }>;
   values?: Record<string, unknown>;
+  /** 建立基线时的工程脏标记（只含布尔值与文件名）。 */
+  project?: { dirty?: boolean | null; file_name?: string | null } | null;
   /** 只有「刚建立基线」的那次响应会带（那是首张预览的 job） */
   preview_url?: string | null;
   error?: ErrorDetail | null;

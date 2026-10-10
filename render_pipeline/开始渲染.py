@@ -51,6 +51,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "_tools"))
 
+from material_classifier import display_path      # noqa: E402
 from render_lock import RenderLock, LockBusy    # noqa: E402
 
 ROOT = os.environ.get("TOON_MODEL_ROOT", "")
@@ -98,20 +99,43 @@ def ensure_out_dir(out_dir):
                        "message": "输出目录不可用：该路径已存在且不是一个目录。",
                        "retryable": False,
                        "hint": "换一个 --out 目录，或先删掉/改名同名的文件。",
-                       "details": {"out_dir": out_dir}}
+                       # ★ O4：错误响应只给**逻辑路径**，不回显用户名目录。
+                       "details": {"out_dir": display_path(out_dir)}}
     except OSError as e:
         return False, {"code": "OUTPUT_NOT_WRITABLE",
                        "message": "无法创建输出目录：%s" % (getattr(e, "strerror", None) or e),
                        "retryable": False,
                        "hint": "检查该路径所在磁盘是否存在、是否有写权限，或换一个 --out 目录。",
-                       "details": {"out_dir": out_dir, "errno": getattr(e, "errno", None)}}
+                       "details": {"out_dir": display_path(out_dir),
+                                   "errno": getattr(e, "errno", None)}}
 
 
-def report_error(err):
-    """把结构化错误打成两行可读文本。"""
-    out("  !! %s：%s" % (err.get("code"), err.get("message")))
+def report_final(outcome, out_dir, confirm_path=False):
+    """
+    末行必须与**结构化终态**一致 —— 只有 ``status == "SUCCESS"`` 才允许出现「完成」。
+
+    以前直渲路径在 ``render()`` 返回后**无条件**打印「[3/3] 完成（输出：…）」，
+    哪怕 ``render()`` 已经因为 ``--out`` 不可写（``OUTPUT_NOT_WRITABLE``）返回 1，
+    末行仍说「完成」，与事实相反。失败时必须给 **失败阶段 + 错误码**。
+    """
+    err = (outcome or {}).get("error") or {}
+    if (outcome or {}).get("status") == "SUCCESS":
+        out("[3/3] 完成（输出：%s）" % out_dir)
+        return
+    stage = (outcome or {}).get("stage") or "渲染"
+    line = "[3/3] 失败（阶段：%s" % stage
+    if err.get("code"):
+        line += "；错误码 %s" % err["code"]
+    line += "） —— 未产出成品"
+    out(line)
+    if err.get("message"):
+        out("      ↳ %s" % err["message"])
     if err.get("hint"):
-        out("     %s" % err["hint"])
+        out("      ↳ %s" % err["hint"])
+    tail = "按契约不可交付"
+    if confirm_path:
+        tail += "；确认结果已保留，可直接重试渲染"
+    out("      （%s；输出目录：%s）" % (tail, out_dir))
 
 
 def out(*a):
@@ -292,12 +316,13 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
     """
     启动确认页 → 等用户确认 → **服务端自动续跑渲染** → 轮询终态。
     本进程全程不启动渲染，因此不可能与页面按钮产生两个 Blender。
-    返回大写终态 token。
+
+    返回 ``(token, outcome)``：``token`` 是大写终态，``outcome`` 与 ``render()``
+    同构（``status`` / ``stage`` / ``error``），供 ``report_final`` 打印末行。
     """
     ok, err = ensure_out_dir(out_dir)
     if not ok:
-        report_error(err)
-        return "FAILED"
+        return "FAILED", {"status": "FAILED", "stage": "准备输出目录", "error": err}
     job_path = write_job(pmx, out_dir, mode, auto_frame, maps_dir)
     logp = os.path.join(out_dir, "confirm_server.log")
     buf = open(logp, "w", encoding="utf-8", errors="replace")
@@ -317,7 +342,9 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
         while time.time() - t0 < 30:
             if srv.poll() is not None:
                 out("  !! 确认服务启动失败（退出码 %s），见 %s" % (srv.returncode, logp))
-                return "FAILED"
+                return "FAILED", {"status": "FAILED", "stage": "启动确认服务",
+                                  "error": {"code": "CONFIRM_SERVER_START_FAILED",
+                                            "message": "确认服务启动失败（退出码 %s）" % srv.returncode}}
             try:
                 d = http_json(url + "api/session", timeout=3)
                 sid = d.get("session_id")
@@ -327,7 +354,9 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
                 time.sleep(0.5)
         if not sid:
             out("  !! 确认服务未就绪（30s 超时），见 %s" % logp)
-            return "FAILED"
+            return "FAILED", {"status": "FAILED", "stage": "启动确认服务",
+                              "error": {"code": "CONFIRM_SERVER_NOT_READY",
+                                        "message": "确认服务未就绪（30s 超时）"}}
 
         out("  已启动本地确认页：%s" % url)
         out("  会话 id：%s（渲染任务由服务端唯一持有）" % sid)
@@ -344,7 +373,10 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
             except Exception:
                 if srv.poll() is not None:
                     out("  !! 确认服务已退出（退出码 %s），见 %s" % (srv.returncode, logp))
-                    return "FAILED"
+                    return "FAILED", {"status": "FAILED", "stage": "确认与渲染",
+                                      "error": {"code": "CONFIRM_SERVER_EXITED",
+                                                "message": "确认服务已退出（退出码 %s）"
+                                                           % srv.returncode}}
                 time.sleep(1.5)
                 continue
             key = (st.get("state"), st.get("attempt"), st.get("pending"))
@@ -358,13 +390,22 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
                 out("  [%s] %s %s" % (time.strftime("%H:%M:%S"),
                                       st.get("state_label") or st.get("state"), extra))
             if st.get("state") in TERMINAL:
+                failures = [r for r in (st.get("results") or []) if r.get("error")]
                 for r in (st.get("results") or []):
                     out("      %-24s %s  %s"
                         % (str(r.get("label"))[:24], r.get("outcome"),
                            r.get("out_dir") or ""))
                     if r.get("error"):
                         out("        ↳ %s" % r["error"])
-                return (st.get("outcome") or "FAILED").upper()
+                token = (st.get("outcome") or "FAILED").upper()
+                if token == "SUCCESS":
+                    return token, {"status": "SUCCESS", "token": token}
+                return token, {
+                    "status": "FAILED", "stage": "确认与渲染", "token": token,
+                    "error": {"code": token,
+                              "message": (failures[0]["error"] if failures
+                                          else "终态 %s：按契约不得进入成品流程" % token)},
+                }
             time.sleep(1.5)
     except KeyboardInterrupt:
         out("\n  ！中断：确认服务会被停止；若渲染已在后台启动，它会继续跑完。")
@@ -381,18 +422,29 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
 
 
 def render(pmx, out_dir, mode, auto_frame, maps_dir=None):
-    """无需确认时的直接渲染。带跨进程锁，防止重复起 Blender。"""
+    """
+    无需确认时的直接渲染。带跨进程锁，防止重复起 Blender。
+
+    返回 ``(rc, outcome)``。``outcome`` 是**结构化终态**：
+
+    * ``{"status": "SUCCESS", "token": "SUCCESS"}``
+    * ``{"status": "FAILED", "stage": <失败阶段>, "error": {...}}``
+
+    调用方一律用 ``report_final`` 打印末行 —— 未拿到 SUCCESS 就绝不允许出现「完成」。
+    """
     ok, err = ensure_out_dir(out_dir)
     if not ok:
-        report_error(err)
-        return 1
+        return 1, {"status": "FAILED", "stage": "准备输出目录", "error": err}
     os.makedirs(LOCK_DIR, exist_ok=True)
     lockp = os.path.join(LOCK_DIR, "%s.render.lock" % sha256_of(pmx)[:16])
     try:
         lk = RenderLock(lockp, tag="direct:start-render").acquire()
     except LockBusy as e:
         out("  !! 已有渲染在跑，拒绝重复启动：%s" % json.dumps(e.holder, ensure_ascii=False))
-        return 1
+        return 1, {"status": "FAILED", "stage": "获取渲染锁",
+                   "error": {"code": "RENDER_BUSY",
+                             "message": "已有渲染在跑，拒绝重复启动",
+                             "holder": e.holder}}
     try:
         logp = os.path.join(out_dir, "render.stdout.log")
         done = os.path.join(out_dir, "render.done")
@@ -416,7 +468,9 @@ def render(pmx, out_dir, mode, auto_frame, maps_dir=None):
         r = launch_blender(argv, logp)
         if "@@LAUNCH@@" not in json.dumps(r):
             out("  !! 渲染派发失败：%s" % str(r)[:150])
-            return 1
+            return 1, {"status": "FAILED", "stage": "派发渲染进程",
+                       "error": {"code": "RENDER_DISPATCH_FAILED",
+                                 "message": "渲染派发失败：%s" % str(r)[:150]}}
         t0 = time.time()
         while time.time() - t0 < 1800:
             if os.path.isfile(done):
@@ -424,7 +478,14 @@ def render(pmx, out_dir, mode, auto_frame, maps_dir=None):
             time.sleep(2)
         st = open(done, encoding="utf-8").read().strip() if os.path.isfile(done) else "(超时)"
         out("  渲染终态：%s" % st)
-        return 0 if st.splitlines()[0].strip() == "SUCCESS" else 1
+        lines = [ln.strip() for ln in st.splitlines() if ln.strip()]
+        token = lines[0] if lines else ""
+        if token == "SUCCESS":
+            return 0, {"status": "SUCCESS", "token": token}
+        return 1, {"status": "FAILED", "stage": "渲染",
+                   "error": {"code": token or "RENDER_TIMEOUT",
+                             "message": "渲染终态：%s（按契约不可交付）"
+                                        % (token or "超时未返回终态")}}
     finally:
         lk.release()
 
@@ -494,7 +555,9 @@ def main():
     out("[1/3] 预检与自动分类…")
     conf_path, payload = preflight(pmx, a.maps_dir)
     if not payload:
-        out("  !! 预检失败，无法解析该 PMX")
+        report_final({"status": "FAILED", "stage": "预检与自动分类",
+                      "error": {"code": "PREFLIGHT_FAILED",
+                                "message": "预检失败，无法解析该 PMX"}}, out_dir)
         return 1
     s = payload["summary_all"]
     out("  材质 %d：语义自动 %d / 映射命中 %d / 需确认 %d / 无依据 %d"
@@ -504,8 +567,8 @@ def main():
     requiring = [x for x in payload["items"] if x["requires_user"]]
     if not requiring:
         out("[2/3] 无需人工确认 —— 直接渲染")
-        rc = render(pmx, out_dir, a.mode, bool(a.auto_frame), a.maps_dir)
-        out("[3/3] 完成（输出：%s）" % out_dir)
+        rc, outcome = render(pmx, out_dir, a.mode, bool(a.auto_frame), a.maps_dir)
+        report_final(outcome, out_dir)
         return rc
 
     out("[2/3] 有 %d 个材质需要确认：%s"
@@ -515,15 +578,17 @@ def main():
             % (x["material"], x["proposed_class"] or "—", x["stage"]))
     if a.no_confirm_ui:
         out("  --no-confirm-ui：只报告，不打开确认页")
+        report_final({"status": "FAILED", "stage": "等待人工确认",
+                      "error": {"code": "CONFIRMATION_REQUIRED",
+                                "message": "有 %d 个材质需要人工确认，"
+                                           "--no-confirm-ui 下只报告不渲染" % len(requiring)}},
+                     out_dir)
         return 1
 
     ensure_previews(pmx, conf_path)
-    token = run_confirm_and_render(pmx, conf_path, out_dir, a.mode, bool(a.auto_frame),
-                                   a.port, a.maps_dir)
-    out("[3/3] 终态：%s" % token)
-    if token != "SUCCESS":
-        out("      （非 SUCCESS：按契约不得进入成品流程；确认结果已保留，可直接重试渲染）")
-    out("      输出目录：%s" % out_dir)
+    token, outcome = run_confirm_and_render(pmx, conf_path, out_dir, a.mode,
+                                            bool(a.auto_frame), a.port, a.maps_dir)
+    report_final(outcome, out_dir, confirm_path=True)
     return 0 if token == "SUCCESS" else 1
 
 

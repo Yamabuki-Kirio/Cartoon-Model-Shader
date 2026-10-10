@@ -71,7 +71,7 @@ sys.path.insert(0, V31)
 sys.path.insert(0, HERE)
 
 import run_contract as RC                       # noqa: E402
-from material_classifier import map_path_for, default_maps_dir   # noqa: E402
+from material_classifier import map_path_for, default_maps_dir, display_path   # noqa: E402
 from render_lock import RenderLock, LockBusy    # noqa: E402
 
 ROOT = os.environ.get("TOON_MODEL_ROOT", "")
@@ -246,9 +246,23 @@ def session_state():
     return "waiting" if pending_items() else "ready"
 
 
+def _display_result(result, out_root):
+    """结果条目 → 对外展示副本（路径一律换成逻辑路径）。"""
+    item = dict(result)
+    if item.get("out_dir"):
+        item["out_dir"] = display_path(item["out_dir"], root=out_root)
+    if item.get("map_file"):
+        item["map_file"] = display_path(item["map_file"])
+    return item
+
+
 def render_status():
     st = session_state()
     shippable = bool(RENDER["outcome"]) and RC.is_shippable(RENDER["outcome"])
+    job = RENDER["job"] or {}
+    # ★ O4：对外**只给逻辑路径**（`<OUTPUT_DIR>` / `%LOCALAPPDATA%\…`）。
+    #   真实绝对路径留在服务端内部（job / RENDER），页面与日志不回显用户名目录。
+    out_root = job.get("out_root")
     return {
         "schema": "toon-render-status/1",
         "session_id": RENDER["session_id"],
@@ -261,17 +275,20 @@ def render_status():
         "attempt": RENDER["attempt"],
         "outcome": RENDER["outcome"],
         "shippable": shippable,
-        "results": RENDER["results"],
+        "results": [_display_result(r, out_root) for r in RENDER["results"]],
         "history": RENDER["history"],
-        "outputs": sorted({os.path.dirname(r["out_dir"]) if os.path.isfile(r["out_dir"]) else r["out_dir"]
-                           for r in RENDER["results"] if r.get("out_dir")}),
-        "out_root": (RENDER["job"] or {}).get("out_root"),
+        "outputs": sorted({display_path(
+            os.path.dirname(r["out_dir"]) if os.path.isfile(r["out_dir"]) else r["out_dir"],
+            root=out_root)
+            for r in RENDER["results"] if r.get("out_dir")}),
+        "out_root": display_path(out_root, root=out_root),
         "error": RENDER["error"],
         "blender_channel": blender_channel_ready(),
         "started_at": RENDER["started_at"],
         "ended_at": RENDER["ended_at"],
-        "targets": [{"label": t.get("label"), "out": t.get("out")}
-                    for t in ((RENDER["job"] or {}).get("targets") or [])],
+        "targets": [{"label": t.get("label"),
+                     "out": display_path(t.get("out"), root=out_root)}
+                    for t in (job.get("targets") or [])],
     }
 
 

@@ -647,7 +647,13 @@ def create_app(
                 "尚未建立 v4 参数面基线。请先调用 POST /api/session/baseline。",
                 details={"probe_error": payload.get("error")},
             )
-        return {"ok": True, **payload}
+        # 基线那一刻的工程脏标记（只有 dirty / file_name）。这是**展示用**的附加
+        # 字段：拿不到就给空对象，绝不让它影响 v4 基线的可用性。
+        return {
+            "ok": True,
+            **payload,
+            "project": dict(preview.baseline_project_public() or {}),
+        }
 
     @app.post(
         "/api/v4/preview",

@@ -122,6 +122,30 @@ def _render_output_summary(render: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _project_dirty_summary(
+    dirty_at_baseline: Any, state: dict[str, Any] | None
+) -> dict[str, Any]:
+    """预览结束后的工程脏标记快照（O3）。
+
+    Blender 的 ``bpy.data.is_dirty`` 是**粘性**的：把参数写回原值并不会清除它。
+    本工具又只在用户显式走「保存」流程时才写盘 —— 所以「基线时干净、预览后变脏」
+    几乎必然发生，**这不是缺陷，也不需要（更不能）靠自动保存去「修」**。
+    页面据此给出准确措辞：值/节点/相机/输出设置已恢复，工程没被保存。
+
+    只回布尔值与 basename —— 绝对路径一律不进公开响应。
+    """
+    payload = state or {}
+    dirty_after = payload.get("is_dirty")
+    dirty_after = bool(dirty_after) if dirty_after is not None else None
+    return {
+        "dirty_at_baseline": dirty_at_baseline,
+        "dirty_after_preview": dirty_after,
+        #: 仅当「基线干净 → 预览后变脏」时为真：这才是需要向用户解释的情形。
+        "dirty_flagged": dirty_at_baseline is False and dirty_after is True,
+        "file_name": payload.get("file_name"),
+    }
+
+
 def preview_url_for(job_id: str) -> str:
     """预览图的唯一 HTTP 端点。
 
@@ -206,6 +230,13 @@ class Baseline:
     #: ``view_transform`` -> ``[{value, label}]``：Blender 真实接受的 look 档位。
     #: look 是**依赖枚举**，不查这张表就写值必然踩 enum not found。
     look_map: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    #: 建立基线时的**工程脏标记**（`bpy.data.is_dirty`）与工程文件名。
+    #:
+    #: Blender 的脏标记是**粘性的**：写回原值也不会自动清除，而本工具不保存工程
+    #: （保存是另一个需要二次确认的动作）。因此「基线时干净、预览后变脏」是
+    #: **预期行为**，必须在页面上说清楚，否则用户会以为工程内容真的被改了。
+    #: 这里只存布尔值与 basename —— **绝不**把绝对路径带进公开响应。
+    project: dict[str, Any] = field(default_factory=dict)
 
     @property
     def preview_resolution(self) -> tuple[int, int, int]:
@@ -325,6 +356,7 @@ def baseline_from_payload(
     payload: dict[str, Any],
     framing_snapshot: dict[str, Any] | None = None,
     look_map: dict[str, list[dict[str, str]]] | None = None,
+    project: dict[str, Any] | None = None,
 ) -> Baseline:
     values = values_from_read(payload)
     view_transform = values.get("color.view_transform")
@@ -339,6 +371,7 @@ def baseline_from_payload(
         render=payload.get("render") or {},
         framing=framing_snapshot or {},
         look_map=dict(look_map or {}),
+        project=dict(project or {}),
     )
 
 
@@ -398,6 +431,8 @@ class PreviewService:
             "framing": _deep_copy(b.framing),
             "look_map": _deep_copy(b.look_map),
             "preview_resolution": list(b.preview_resolution),
+            # 工程脏标记快照（只有 dirty / file_name，不含任何绝对路径）
+            "project": _deep_copy(b.project),
             # v4：**新增的可选字段**。旧页面不看它，因此 L0 契约不变。
             "surface": self._surface.public(),
         }
@@ -418,6 +453,16 @@ class PreviewService:
             self._baseline = baseline
         return self.baseline_public() or {}
 
+    def baseline_project_public(self) -> dict[str, Any] | None:
+        """基线那一刻的工程脏标记快照（**只有布尔值与文件名**）。
+
+        无基线时返回 ``None``。给 ``/api/v4/session/baseline`` 用：页面据此判断
+        「原本干净、预览后才变脏」。刻意不返回任何绝对路径。
+        """
+        if self._baseline is None:
+            return None
+        return _deep_copy(self._baseline.project)
+
     async def _capture(self) -> Baseline:
         payload = await self._call(self._binder.read_exposure)
         context = await self._call(self._binder.read_framing)
@@ -426,6 +471,7 @@ class PreviewService:
             payload,
             framing_module.baseline_snapshot(context),
             capability.get("looks") or {},
+            project=self._baseline_project_snapshot(await self._safe_project_state()),
         )
         await self._capture_surface()
         return baseline
@@ -783,6 +829,11 @@ class PreviewService:
                 "framing": _render_framing_summary(render, job.framing),
                 # 输出设置（PNG 隔离）有没有被污染 —— 可审计、且计入闸门
                 "output": _render_output_summary(render),
+                # 工程脏标记（O3），与 v4 任务同一形状
+                "project": _project_dirty_summary(
+                    (baseline.project or {}).get("dirty"),
+                    await self._safe_project_state(),
+                ),
             }
             self._finish(job, JOB_DONE, result=result)
         except errors.ToonTunerError as exc:
@@ -932,6 +983,12 @@ class PreviewService:
                 "framing": _render_framing_summary(render, job.framing),
                 # 输出设置（PNG 隔离）有没有被污染 —— 可审计、且计入闸门
                 "output": _render_output_summary(render),
+                # 工程脏标记（O3）：本工具不保存工程；写回原值也不会清除 Blender
+                # 的脏标记。这里如实报出「基线时是否干净 / 预览后是否变脏」。
+                "project": _project_dirty_summary(
+                    (baseline.project or {}).get("dirty"),
+                    await self._safe_project_state(),
+                ),
             }
             self._finish(job, JOB_DONE, result=result)
         except errors.ToonTunerError as exc:
@@ -1064,6 +1121,23 @@ class PreviewService:
         return out
 
     # -- 工具 ------------------------------------------------------------
+    @staticmethod
+    def _baseline_project_snapshot(state: dict[str, Any] | None) -> dict[str, Any]:
+        """基线时的工程状态 → 只保留布尔值与 basename（绝对路径不入库）。"""
+        payload = state or {}
+        dirty = payload.get("is_dirty")
+        return {
+            "dirty": bool(dirty) if dirty is not None else None,
+            "file_name": payload.get("file_name"),
+        }
+
+    async def _safe_project_state(self) -> dict[str, Any] | None:
+        """读工程状态。**纯展示用**：读不到就返回 ``None``，绝不因此让预览任务失败。"""
+        try:
+            return await self._call(self._binder.read_project)
+        except Exception:
+            return None
+
     async def _call(self, fn: Callable[..., Any], *args: Any) -> Any:
         async with self._blender_lock:
             return await asyncio.to_thread(fn, *args)

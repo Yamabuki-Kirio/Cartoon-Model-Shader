@@ -152,6 +152,55 @@ describe("工作台整体", () => {
     expect(getByTestId("banner-external").textContent).toContain("cel.Cel_Skin.ramp[0].position");
   });
 
+  it("工程原本干净、预览后变脏 ⇒ 横幅说明「工程未被保存」（O3）", async () => {
+    const { workspace } = await setup({
+      job: vi.fn(async () =>
+        jobPayload({
+          result: {
+            ...jobPayload().result,
+            project: {
+              dirty_at_baseline: false,
+              dirty_after_preview: true,
+              dirty_flagged: true,
+              file_name: "一个工程.blend",
+            },
+          },
+        }) as unknown as JobState
+      ),
+    });
+    const { getByTestId, queryByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    expect(queryByTestId("banner-project-dirty")).toBeNull();
+
+    await workspace.actions.applyAndPreview();
+    await settle();
+
+    const banner = getByTestId("banner-project-dirty");
+    expect(banner.textContent).toContain("工程未被保存");
+    expect(banner.textContent).toContain("不会保存或覆盖");
+
+    // 可关闭 —— 用户读过后不该常驻
+    fireEvent.click(banner.querySelector(".banner-dismiss") as Element);
+    await settle(2);
+    expect(queryByTestId("banner-project-dirty")).toBeNull();
+  });
+
+  it("工程本来就脏时不给「未被保存」横幅（O3）", async () => {
+    const { workspace } = await setup({
+      job: vi.fn(async () =>
+        jobPayload({
+          result: {
+            ...jobPayload().result,
+            project: { dirty_at_baseline: true, dirty_after_preview: true, dirty_flagged: false },
+          },
+        }) as unknown as JobState
+      ),
+    });
+    const { queryByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    await workspace.actions.applyAndPreview();
+    await settle();
+    expect(queryByTestId("banner-project-dirty")).toBeNull();
+  });
+
   it("底部提示区分「未预览 / 已预览 / 画面过期 / 一致」", async () => {
     const { workspace } = await setup();
     const { getByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);

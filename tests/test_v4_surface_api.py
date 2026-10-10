@@ -51,6 +51,8 @@ class SurfaceInjector:
         self.fail_cel_write_at: int | None = None
         self.mismatch_cel_readback_at: int | None = None
         self.fail_render = False
+        #: 置 True 后，**下一次** L0 写入会把桩的 ``is_dirty`` 翻成 True（一次性）。
+        self.mark_dirty_on_l0_write = False
 
     def reset(self) -> None:
         self.cel_writes = 0
@@ -58,6 +60,7 @@ class SurfaceInjector:
         self.fail_cel_write_at = None
         self.mismatch_cel_readback_at = None
         self.fail_render = False
+        self.mark_dirty_on_l0_write = False
 
     @staticmethod
     def _is_cel(code: str) -> bool:
@@ -119,6 +122,11 @@ class SurfaceInjector:
 
         if "vs.exposure = " in code:
             self.l0_writes += 1
+            if self.mark_dirty_on_l0_write:
+                # 模拟真实 Blender 的粘性脏标记：写过数据后 `is_dirty` 变 True，
+                # 即使事后把值写回原值也不会自动清掉。
+                self.fake.data.is_dirty = True
+                self.mark_dirty_on_l0_write = False
         return run_generated_code(code, self.fake)
 
 
@@ -259,6 +267,84 @@ def test_v4_baseline_endpoint_requires_baseline(tmp_path: Path) -> None:
         response = env.client.get("/api/v4/session/baseline")
         assert response.status_code == 409
         assert response.json()["error"]["code"] == "NO_BASELINE"
+
+
+# -- 1b. 工程脏标记（O3）与路径脱敏（O4）----------------------------------
+
+
+def test_v4_baseline_endpoint_carries_project_dirty_flag(tmp_path: Path) -> None:
+    """O3/O4：v4 基线必须带 ``project``，且**只有布尔值与文件名**。
+
+    回归：``SurfaceBaseline.to_public()`` 里没有这个字段，路由必须自己补上 ——
+    否则接口文档承诺的 ``project`` 会静默消失（返回体是普通 dict，不会报错）。
+    """
+    with running_env(tmp_path) as env:
+        env.fake.set_project(tmp_path / "scene.blend", dirty=False)
+        take_baseline(env)
+
+        body = env.client.get("/api/v4/session/baseline").json()
+        assert "project" in body, "v4 基线响应必须带 project"
+        project = body["project"]
+        assert set(project) <= {"dirty", "file_name"}, project
+        assert project["dirty"] is False
+        assert project["file_name"] == "scene.blend"
+        assert "\\" not in json.dumps(project), "project 不得含任何路径分隔符"
+
+
+def test_v4_baseline_project_snapshot_absent_without_clean_flag(tmp_path: Path) -> None:
+    """桩未打开工程时快照仍要在（值为 None），**不能**整个键消失。"""
+    with running_env(tmp_path) as env:
+        take_baseline(env)
+        project = env.client.get("/api/v4/session/baseline").json()["project"]
+        assert set(project) <= {"dirty", "file_name"}
+        assert project.get("dirty") in (None, False)
+
+
+def test_preview_reports_dirty_flagged_when_baseline_was_clean(tmp_path: Path) -> None:
+    """O3 端到端：基线干净 → 预览后变脏 ⇒ ``dirty_flagged = true``。
+
+    这是前端弹出「工程未被保存」说明的唯一依据，必须从**任务结果**里真实拿到，
+    而不是靠前端自己猜。
+    """
+    with running_env(tmp_path) as env:
+        env.fake.set_project(tmp_path / "scene.blend", dirty=False)
+        take_baseline(env)
+        assert env.fake.data.is_dirty is False
+
+        # 下一次 L0 写入把桩的 is_dirty 翻成 True（模拟 Blender 的粘性脏标记）
+        env.injector.mark_dirty_on_l0_write = True
+        job = wait_job(env.client, submit(env, {"color.exposure": 0.35})["job_id"])
+        assert job["status"] == "done", job.get("error")
+
+        project = job["result"]["project"]
+        assert set(project) <= {
+            "dirty_at_baseline",
+            "dirty_after_preview",
+            "dirty_flagged",
+            "file_name",
+        }, project
+        assert project["dirty_at_baseline"] is False
+        assert project["dirty_after_preview"] is True
+        assert project["dirty_flagged"] is True
+        assert project["file_name"] == "scene.blend"
+        assert "\\" not in json.dumps(project)
+        # 值本身确实被恢复了 —— 脏标记粘性**不是**因为工具没还原参数
+        assert job["result"]["restored"]["color.exposure"] == pytest.approx(0.0)
+
+
+def test_preview_does_not_flag_dirty_when_baseline_was_already_dirty(tmp_path: Path) -> None:
+    """基线本来就脏 ⇒ 不提示。否则用户在编辑途中每点一次预览都被打扰。"""
+    with running_env(tmp_path) as env:
+        env.fake.set_project(tmp_path / "scene.blend", dirty=True)
+        take_baseline(env)
+
+        env.injector.mark_dirty_on_l0_write = True
+        job = wait_job(env.client, submit(env, {"color.exposure": 0.35})["job_id"])
+        assert job["status"] == "done", job.get("error")
+
+        project = job["result"]["project"]
+        assert project["dirty_at_baseline"] is True
+        assert project["dirty_flagged"] is False
 
 
 # -- 2. 预览：应用与恢复 ---------------------------------------------------

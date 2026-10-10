@@ -254,3 +254,123 @@ class TestRulesVersionBumped:
         assert got >= (3, 1, 0), "unless 排除机制上线后规则版本必须提升：%s" % r.version
         eye = [x for x in r.semantic_rules if x["id"] == "eye"][0]
         assert eye["unless"] is not None
+
+
+# ------------------------------------------------------------------ O2 终态措辞
+class TestFinalLineMatchesStructuredOutcome:
+    """末行必须与结构化终态一致：**只有 SUCCESS 才允许出现「完成」**。
+
+    真机验收观察（O2）：`--out` 不可写时 `render()` 已返回 1，main 却仍无条件
+    打印「[3/3] 完成（输出：…）」—— 末行与事实相反，逐字读到终端的人会被误导。
+    """
+
+    def _capture(self, m, outcome, out_dir, confirm_path=False):
+        lines = []
+        orig = m.out
+        m.out = lambda *a: lines.append(" ".join(str(x) for x in a))
+        try:
+            m.report_final(outcome, out_dir, confirm_path=confirm_path)
+        finally:
+            m.out = orig
+        return "\n".join(lines)
+
+    def test_failure_never_says_completed(self, tmp_path):
+        m = _entry_module()
+        text = self._capture(m, {
+            "status": "FAILED", "stage": "准备输出目录",
+            "error": {"code": "OUTPUT_NOT_WRITABLE",
+                      "message": "输出目录不可用：该路径已存在且不是一个目录。",
+                      "hint": "换一个 --out 目录。"},
+        }, str(tmp_path))
+        assert "完成" not in text, text
+        assert "OUTPUT_NOT_WRITABLE" in text, text
+        assert "准备输出目录" in text, text
+
+    def test_success_says_completed(self, tmp_path):
+        m = _entry_module()
+        text = self._capture(m, {"status": "SUCCESS", "token": "SUCCESS"}, str(tmp_path))
+        assert "完成" in text, text
+        assert str(tmp_path) in text, text
+
+    def test_confirm_path_failure_points_at_retry(self, tmp_path):
+        m = _entry_module()
+        text = self._capture(m, {"status": "FAILED", "stage": "确认与渲染",
+                                 "token": "REJECTED",
+                                 "error": {"code": "REJECTED",
+                                           "message": "终态 REJECTED"}},
+                             str(tmp_path), confirm_path=True)
+        assert "REJECTED" in text, text
+        assert "确认与渲染" in text, text
+        assert "重试渲染" in text, text
+        assert "完成" not in text, text
+
+    def test_render_returns_structured_outcome_when_out_unusable(self, tmp_path):
+        """行为验证：输出目录不可用时 render() 直接返回 (1, 结构化终态)。"""
+        m = _entry_module()
+        f = tmp_path / "not_a_dir.txt"
+        f.write_text("x", encoding="utf-8")
+        rc, outcome = m.render(str(tmp_path / "m.pmx"), str(f), "faithful", False)
+        assert rc == 1
+        assert outcome["status"] == "FAILED"
+        assert outcome["stage"] == "准备输出目录"
+        assert outcome["error"]["code"] == "OUTPUT_NOT_WRITABLE"
+
+    def test_main_delegates_final_line_to_report_final(self):
+        """契约：main 不得自行拼接 [3/3] 末行 —— 一律交给 report_final。"""
+        body = _text(ENTRY).split("def main(", 1)[1]
+        assert "[3/3]" not in body, "main 里出现了自拼的 [3/3] 末行"
+        assert "report_final(" in body
+
+
+# ------------------------------------------------------------------ O4 逻辑路径
+class TestRenderStatusLogicalPaths:
+    """O4：确认服务对外只给逻辑路径，真实绝对路径留在服务端内部。"""
+
+    @staticmethod
+    def _load_confirm_server():
+        spec = importlib.util.spec_from_file_location("confirm_server_under_test", CONFIRM_SERVER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_out_root_targets_and_results_are_logical(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        monkeypatch.setenv("APPDATA", str(tmp_path / "roaming"))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        mod = self._load_confirm_server()
+
+        root = str(tmp_path / "runtime" / "output")
+        out_dir = os.path.join(root, "m_1011")
+        monkeypatch.setitem(mod.RENDER, "job", {
+            "out_root": root,
+            "targets": [{"label": "m.pmx", "out": out_dir}],
+        })
+        monkeypatch.setitem(mod.RENDER, "results", [
+            {"label": "m.pmx", "outcome": "SUCCESS", "out_dir": out_dir,
+             "map_file": os.path.join(str(tmp_path), "maps", "abc.material-map.json")},
+        ])
+
+        st = mod.render_status()
+        child = "<OUTPUT_DIR>" + os.sep + "m_1011"
+        assert st["out_root"] == "<OUTPUT_DIR>"
+        assert st["targets"][0]["out"] == child
+        assert st["results"][0]["out_dir"] == child
+        assert st["outputs"] == [child]
+        # 用户名 / 绝对路径不得到响应里
+        assert str(tmp_path) not in repr(st)
+        assert "USERPROFILE" not in repr(st) or "%USERPROFILE%" in repr(st)
+
+    def test_map_file_is_logical_too(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        mod = self._load_confirm_server()
+        root = str(tmp_path / "runtime" / "output")
+        map_file = os.path.join(str(tmp_path), "maps", "x.material-map.json")
+        monkeypatch.setitem(mod.RENDER, "job", {"out_root": root, "targets": []})
+        monkeypatch.setitem(mod.RENDER, "results", [
+            {"label": "m.pmx", "outcome": "SUCCESS", "out_dir": "", "map_file": map_file},
+        ])
+        st = mod.render_status()
+        assert st["results"][0]["map_file"].startswith("%LOCALAPPDATA%")
+        assert str(tmp_path) not in repr(st)
+

@@ -518,6 +518,59 @@ describe("建立基线：轮询首张预览任务", () => {
     expect(state.baselinePreviewStatus).toBe("failed");
     expect(state.loading).toBe(false);
   });
+
+  it("基线原本干净、预览后变脏 ⇒ 提示「工程未被保存」（O3）", async () => {
+    const { workspace } = makeWorkspace({
+      job: vi.fn(async () =>
+        jobPayload({
+          result: {
+            ...jobPayload().result,
+            project: {
+              dirty_at_baseline: false,
+              dirty_after_preview: true,
+              dirty_flagged: true,
+              file_name: "一个工程.blend",
+            },
+          },
+        }) as unknown as JobState
+      ),
+    });
+    await workspace.actions.bootstrap();
+    await workspace.actions.applyAndPreview();
+    await settle();
+
+    const state = workspace.store.getState();
+    // 只承诺我们能保证的：恢复原值 + 不写盘；不承诺「Blender 看起来是干净的」
+    expect(state.projectNotice).toContain("不会保存或覆盖");
+    expect(state.projectNotice).toContain("不代表工程内容有差异");
+    // 绝对路径/用户名不得出现在提示里
+    expect(state.projectNotice).not.toContain("\\\\");
+    expect(state.projectNotice).not.toContain("Users");
+
+    workspace.actions.clearProjectNotice();
+    expect(workspace.store.getState().projectNotice).toBeNull();
+  });
+
+  it("工程本来就脏（或服务端未标记）⇒ 不提示（O3）", async () => {
+    const { workspace } = makeWorkspace({
+      job: vi.fn(async () =>
+        jobPayload({
+          result: {
+            ...jobPayload().result,
+            project: {
+              dirty_at_baseline: true,
+              dirty_after_preview: true,
+              dirty_flagged: false,
+            },
+          },
+        }) as unknown as JobState
+      ),
+    });
+    await workspace.actions.bootstrap();
+    await workspace.actions.applyAndPreview();
+    await settle();
+    expect(workspace.store.getState().projectNotice).toBeNull();
+  });
 });
 
 describe("分组 id 反推", () => {

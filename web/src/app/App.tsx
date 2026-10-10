@@ -63,6 +63,18 @@ export function App({ workspace, autoBootstrap = true }: { workspace: Workspace;
           </Banner>
         ) : null}
 
+        {/* O3：工程本来干净、预览后 Blender 显示「有未保存的修改」时，说清楚原因。 */}
+        {state.projectNotice ? (
+          <Banner
+            tone="info"
+            title="工程未被保存"
+            testId="banner-project-dirty"
+            onDismiss={() => workspace.actions.clearProjectNotice()}
+          >
+            {state.projectNotice}
+          </Banner>
+        ) : null}
+
         {externalChanges.length > 0 ? (
           <Banner tone="warn" title="检测到外部改动" testId="banner-external">
             以下取值在 Blender 里被改过（只提示，不作废草稿）：

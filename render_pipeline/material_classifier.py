@@ -51,13 +51,15 @@ _PATH_PLACEHOLDERS = (
 )
 
 
-def display_path(path):
+def display_path(path, root=None, root_placeholder="<OUTPUT_DIR>"):
     """
-    把绝对路径转成【不含用户名】的展示形式，供 run_manifest / provenance 留档。
+    把绝对路径转成【不含用户名】的展示形式，供 run_manifest / provenance / 页面留档。
 
-    清单是给人审计的：既不需要绝对路径，也不该把用户名带出去。
+    清单与页面是给人看的：既不需要绝对路径，也不该把用户名带出去。
     规则（按优先级）：
 
+      0. 给了 ``root`` 且 ``path`` 落在它之下 ⇒ ``<OUTPUT_DIR>[\\子路径]``
+         （渲染输出目录常被建在系统临时目录下，业务语义比物理路径更有用）；
       1. 落在 %LOCALAPPDATA% / %APPDATA% / %USERPROFILE% 之下 ⇒ 换成对应占位符
          （默认侧车映射目录因此展示为 `%LOCALAPPDATA%\\CartoonModelShader\\model_material_maps`）；
       2. 其余路径若仍出现当前用户名（例如自定义目录建在用户主目录下），
@@ -73,6 +75,16 @@ def display_path(path):
         full = os.path.abspath(text)
     except Exception:
         return text
+
+    if root not in (None, ""):
+        root_abs = os.path.abspath(str(root))
+        root_norm = os.path.normcase(root_abs)
+        full_norm = os.path.normcase(full)
+        if full_norm == root_norm:
+            return root_placeholder
+        if full_norm.startswith(root_norm + os.sep):
+            rest = full[len(root_abs):].lstrip("\\/")
+            return root_placeholder + os.sep + rest
 
     norm = os.path.normcase(full)
     for env_name, placeholder in _PATH_PLACEHOLDERS:
