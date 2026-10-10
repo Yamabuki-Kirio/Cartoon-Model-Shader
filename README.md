@@ -572,6 +572,8 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 常用错误码：`PARAM_INVALID`（参数越界/未知字段）、`NO_BASELINE`（未建基线）、
 `FRAMING_STALE`（409，基线建立后帧或相机被外部改动，retryable —— 刷新基线即可恢复）、
 `FRAMING_UNAVAILABLE`（409，拿不到当前取景上下文）、
+`PREVIEW_OUTPUT_UNAVAILABLE`（409，非 retryable：预览只能出 PNG，但工程的输出设置切不过去 ——
+常见于把渲染输出设成影片格式的工程。**预览已中止，工程零改动**；把「输出属性 → 输出」改成图片格式后重试）、
 `INVALID_DEPENDENT_ENUM`（400，依赖枚举取值非法，例如 Standard 下提交 `AgX - Punchy`；返回体里带
 `parameter` / `value` / `depends_on` / `allowed`，`retryable=false`）。
 
@@ -582,6 +584,13 @@ node tests/browser_check.mjs http://127.0.0.1:8765
 ### Blender 5.x 适配记录
 
 - 合成器节点树在 5.x 是 **`scene.compositing_node_group`**，不再是 `scene.node_tree`。
+- 输出格式多了 **`render.image_settings.media_type`**（`IMAGE` / `MULTI_LAYER_IMAGE` / `VIDEO`）。
+  **`media_type == "VIDEO"`（工程是影片输出）时，`file_format` 的可用集合被限定为影片格式**，
+  此时直接赋 `"PNG"` 会抛 `enum "PNG" not found in ('FFMPEG')` —— 必须先切回 `IMAGE`。
+  预览渲染因此**不硬写 PNG**：先「赋值 + 回读」地安全切换，切不过去就零污染中止。
+- `bl_rna.properties["file_format"].enum_items` **不能用来判断可用性** —— 影片态下它照样把 PNG 列出来。
+- `Image.save_render()` 的格式**听场景的 `image_settings`、不听文件扩展名**：给 `.png` 路径但在
+  JPEG 场景里调用，得到的是 JPEG。
 - 本管线的辉光节点为 **`AI_Compositor › Autocel_Glow`**（GLARE，label「辉光」）；该组内无 Tonemapping 节点。
 - `view_transform` / `look` 的候选值无法从 `bl_rna.enum_items` 取到（非 UI 上下文只返回 `NONE`）。
   `PyOpenColorIO` 的 `getViews(display)` 可以用来枚举视图，但 **`getLookNames()` 是 OCIO 全局名单、

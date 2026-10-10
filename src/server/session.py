@@ -79,6 +79,49 @@ def _render_framing_summary(render: dict[str, Any], job_framing: dict[str, Any] 
     }
 
 
+def _render_output_summary(render: dict[str, Any]) -> dict[str, Any]:
+    """整理「预览的输出设置有没有被污染」。
+
+    Blender 侧在渲染前整份记下 ``media_type`` / ``file_format`` / ``color_mode`` /
+    ``color_depth`` / ``filepath``，渲染结束（含异常、含中止）后逐项回读。这里只做三件事：
+
+    * 如实透出改了没有、还原了没有（``applied`` / ``restore_steps``）；
+    * 给出 ``restored_ok`` —— 「逐项写回都成功且不再有差异」；
+    * 给出 ``verified`` 闸门 —— **必须同时拿到改前与回读两份值并且逐项相等**。
+      拿不到（载荷缺字段）一律算**没通过**，不报假绿。
+    """
+    raw = render.get("output")
+    empty = {
+        "target_format": None,
+        "applied": None,
+        "unavailable_reason": None,
+        "original": None,
+        "restored": None,
+        "restore_steps": None,
+        "mismatches": None,
+        "restored_ok": None,
+        "verified": False,
+    }
+    if not isinstance(raw, dict):
+        return empty
+
+    original = raw.get("original")
+    restored = raw.get("restored")
+    mismatches = raw.get("mismatches") or {}
+    verified = bool(original) and isinstance(original, dict) and restored == original
+    return {
+        "target_format": raw.get("target_format"),
+        "applied": raw.get("applied"),
+        "unavailable_reason": raw.get("unavailable_reason"),
+        "original": original if isinstance(original, dict) else None,
+        "restored": restored if isinstance(restored, dict) else None,
+        "restore_steps": raw.get("restore_steps"),
+        "mismatches": mismatches,
+        "restored_ok": bool(raw.get("restored_ok")) and not mismatches,
+        "verified": verified,
+    }
+
+
 def preview_url_for(job_id: str) -> str:
     """预览图的唯一 HTTP 端点。
 
@@ -738,6 +781,8 @@ class PreviewService:
                 "parameters": _parameter_records(baseline, job, applied),
                 "view_transform": baseline.view_transform,
                 "framing": _render_framing_summary(render, job.framing),
+                # 输出设置（PNG 隔离）有没有被污染 —— 可审计、且计入闸门
+                "output": _render_output_summary(render),
             }
             self._finish(job, JOB_DONE, result=result)
         except errors.ToonTunerError as exc:
@@ -885,6 +930,8 @@ class PreviewService:
                 "parameters": _parameter_records(baseline, job, applied),
                 "view_transform": baseline.view_transform,
                 "framing": _render_framing_summary(render, job.framing),
+                # 输出设置（PNG 隔离）有没有被污染 —— 可审计、且计入闸门
+                "output": _render_output_summary(render),
             }
             self._finish(job, JOB_DONE, result=result)
         except errors.ToonTunerError as exc:

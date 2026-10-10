@@ -378,9 +378,136 @@ class FakeViewSettings:
 
 
 class FakeImageSettings:
+    """``render.image_settings``：复刻 Blender 5.2 里与「预览写 PNG」有关的真实行为。
+
+    全部来自真机实测（`/z/blender5.2.1` 上跑过探针），不是猜的：
+
+    * ``media_type`` 是**静态枚举**（``IMAGE`` / ``MULTI_LAYER_IMAGE`` / ``VIDEO``），
+      双向可赋；但 ``media_type == "VIDEO"``（工程是影片输出）时 ``file_format``
+      只接受影片格式，赋 ``"PNG"`` 会抛
+      ``TypeError: enum "PNG" not found in ('FFMPEG')`` —— 必须先切回 ``IMAGE``；
+    * ``bl_rna.properties["file_format"].enum_items`` **不可信**：影片态下它照样把 PNG
+      列出来，只有赋值才报错。所以可用性只能靠「赋值 + 回读」判定；
+    * 改 ``file_format`` 会**连带**改 ``color_mode`` / ``color_depth``
+      （PNG → RGB/16、JPEG → RGB/8、OPEN_EXR → RGB/32）。
+    """
+
+    MEDIA_TYPES = ("IMAGE", "MULTI_LAYER_IMAGE", "VIDEO")
+    IMAGE_FORMATS = (
+        "AVIF", "JPEG", "OPEN_EXR", "PNG", "WEBP", "BMP", "CINEON", "DPX",
+        "IRIS", "JPEG2000", "HDR", "TARGA", "TARGA_RAW", "TIFF",
+        "OPEN_EXR_MULTILAYER", "FFMPEG",
+    )
+    VIDEO_FORMATS = ("FFMPEG",)
+    COLOR_MODES = ("BW", "RGB", "RGBA")
+    COLOR_DEPTHS = ("8", "10", "12", "16", "32")
+    #: 每种格式的默认 (color_mode, color_depth)，与真机一致
+    FORMAT_DEFAULTS = {
+        "PNG": ("RGB", "16"),
+        "JPEG": ("RGB", "8"),
+        "OPEN_EXR": ("RGB", "32"),
+        "OPEN_EXR_MULTILAYER": ("RGB", "32"),
+        "TIFF": ("RGB", "8"),
+        "BMP": ("RGB", "8"),
+        "FFMPEG": ("RGB", "8"),
+    }
+
     def __init__(self) -> None:
-        self.file_format = "PNG"
-        self.color_mode = "RGBA"
+        self._media_type = "IMAGE"
+        self._file_format = "PNG"
+        self._color_mode = "RGBA"
+        self._color_depth = "8"
+        #: 测试注入：对这个值赋值时抛错（模拟枚举/权限拒绝）
+        self.reject_media_type: str | None = None
+        self.reject_file_format: str | None = None
+
+    # -- media_type --------------------------------------------------------
+    @property
+    def media_type(self) -> str:
+        return self._media_type
+
+    @media_type.setter
+    def media_type(self, value: str) -> None:
+        if value not in self.MEDIA_TYPES:
+            raise TypeError(
+                f'bpy_struct: item.attr = val: enum "{value}" not found in '
+                f"({', '.join(repr(v) for v in self.MEDIA_TYPES)})"
+            )
+        if self.reject_media_type == value:
+            raise TypeError(f"注入的媒体类型拒绝：{value}")
+        self._media_type = value
+
+    # -- file_format -------------------------------------------------------
+    @property
+    def available_file_formats(self) -> tuple[str, ...]:
+        return self.VIDEO_FORMATS if self._media_type == "VIDEO" else self.IMAGE_FORMATS
+
+    @property
+    def file_format(self) -> str:
+        return self._file_format
+
+    @file_format.setter
+    def file_format(self, value: str) -> None:
+        allowed = self.available_file_formats
+        if value not in allowed:
+            raise TypeError(
+                f'bpy_struct: item.attr = val: enum "{value}" not found in '
+                f"({', '.join(repr(v) for v in allowed)})"
+            )
+        if self.reject_file_format == value:
+            raise TypeError(f"注入的格式拒绝：{value}")
+        self._file_format = value
+        # 真机行为：换格式会连带重置 color_mode / color_depth
+        mode, depth = self.FORMAT_DEFAULTS.get(value, ("RGB", "8"))
+        self._color_mode = mode
+        self._color_depth = depth
+
+    # -- color_mode / color_depth -----------------------------------------
+    @property
+    def color_mode(self) -> str:
+        return self._color_mode
+
+    @color_mode.setter
+    def color_mode(self, value: str) -> None:
+        if value not in self.COLOR_MODES:
+            raise TypeError(
+                f'bpy_struct: item.attr = val: enum "{value}" not found in '
+                f"({', '.join(repr(v) for v in self.COLOR_MODES)})"
+            )
+        self._color_mode = value
+
+    @property
+    def color_depth(self) -> str:
+        return self._color_depth
+
+    @color_depth.setter
+    def color_depth(self, value: str) -> None:
+        if value not in self.COLOR_DEPTHS:
+            raise TypeError(
+                f'bpy_struct: item.attr = val: enum "{value}" not found in '
+                f"({', '.join(repr(v) for v in self.COLOR_DEPTHS)})"
+            )
+        self._color_depth = value
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "media_type": self._media_type,
+            "file_format": self._file_format,
+            "color_mode": self._color_mode,
+            "color_depth": self._color_depth,
+        }
+
+    #: 真机里 ``bl_rna.properties[...].enum_items`` 返回的**静态全量**列表 ——
+    #: 影片态下它照样把 PNG 列出来，但赋值会抛错。这个陷阱值得单独钉一个测试。
+    STATIC_ENUM_ITEMS = {
+        "media_type": MEDIA_TYPES,
+        "file_format": IMAGE_FORMATS,
+        "color_mode": COLOR_MODES,
+        "color_depth": COLOR_DEPTHS,
+    }
+
+    def static_enum_items(self, prop: str) -> tuple[str, ...]:
+        return self.STATIC_ENUM_ITEMS[prop]
 
 
 class FakeRender:
@@ -642,6 +769,8 @@ class FakeObjects:
         return obj
 
     def remove(self, obj: FakeObject, do_unlink: bool = False) -> None:
+        if self._bpy.remove_object_error is not None:
+            raise RuntimeError(self._bpy.remove_object_error)
         if obj in self._items:
             self._items.remove(obj)
         scene = obj._scene
@@ -747,10 +876,22 @@ class FakeImage:
         self.saved_to: list[str] = []
         self.size = (int(size[0]), int(size[1]))
         self.colorspace_settings = SimpleNamespace(name=colorspace)
+        #: 测试注入：非 None 时 save_render 抛错（模拟存图失败）
+        self.save_error: str | None = None
+        #: 存图失败前先落盘的半成品字节（用于验证「失败路径不留残留文件」）
+        self.save_partial_bytes: bytes | None = None
+        #: 每次 save_render 时**场景**的输出格式 —— 真机的格式由场景决定、不看扩展名
+        self.saved_with_format: list[str | None] = []
 
     def save_render(self, filepath: str, scene: Any = None) -> None:
+        image_settings = getattr(getattr(scene, "render", None), "image_settings", None)
+        self.saved_with_format.append(getattr(image_settings, "file_format", None))
         path = Path(filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if self.save_partial_bytes is not None:
+            path.write_bytes(self.save_partial_bytes)
+        if self.save_error is not None:
+            raise RuntimeError(self.save_error)
         path.write_bytes(PNG_BYTES)
         self.saved_to.append(filepath)
 
@@ -818,6 +959,8 @@ class FakeOpsRender:
 
     def render(self, write_still: bool = True, **kwargs: Any) -> None:
         scene = self._bpy.context.scene
+        if self._bpy.render_error is not None:
+            raise RuntimeError(self._bpy.render_error)
         self._bpy.render_count += 1
         self._bpy.last_render_camera = scene.camera.name if scene.camera is not None else None
         self._bpy.last_render_resolution = (
@@ -943,6 +1086,10 @@ class FakeBpy:
         self.save_calls: list[dict[str, Any]] = []
         #: 测试注入：设置后任何保存都抛 RuntimeError（模拟磁盘/权限失败）
         self.save_error: str | None = None
+        #: 测试注入：设置后 render 抛 RuntimeError（模拟渲染失败）
+        self.render_error: str | None = None
+        #: 测试注入：设置后对象删除抛 RuntimeError（模拟临时相机清理失败）
+        self.remove_object_error: str | None = None
         self.build_default_scene()
 
     # -- 工程（.blend）状态 ------------------------------------------------
@@ -1115,6 +1262,9 @@ class FakeBpy:
             "camera_rotation": None if camera is None else tuple(camera.rotation_euler),
             "camera_lens": None if camera is None else camera.data.lens,
             "camera_shift": None if camera is None else (camera.data.shift_x, camera.data.shift_y),
+            # 输出设置（PNG 相关）也必须逐项还原 —— 放进来后，所有取景测试都顺带覆盖它
+            "output": scene.render.image_settings.snapshot(),
+            "output_filepath": scene.render.filepath,
         }
 
     def temp_camera_objects(self) -> list[FakeObject]:

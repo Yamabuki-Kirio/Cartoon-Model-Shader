@@ -211,8 +211,9 @@ class BlenderBinder:
         if isinstance(aborted, dict) and aborted.get("code"):
             code_ = str(aborted["code"])
             message = str(aborted.get("message") or "取景前置条件已变化，预览中止。")
-            if code_ == errors.FRAMING_STALE:
-                raise errors.ToonTunerError(errors.FRAMING_STALE, message)
+            # 中止码本身就是稳定错误码的直接投递（Blender 侧已保证零污染后才回这个标记）
+            if code_ in (errors.FRAMING_STALE, errors.PREVIEW_OUTPUT_UNAVAILABLE):
+                raise errors.ToonTunerError(code_, message)
             raise errors.ToonTunerError(
                 errors.PREVIEW_FAILED, message, details={"abort_code": code_}
             )

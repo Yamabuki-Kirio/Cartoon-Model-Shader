@@ -26,6 +26,8 @@ INVALID_DEPENDENT_ENUM = "INVALID_DEPENDENT_ENUM"
 # 取景（framing）
 FRAMING_STALE = "FRAMING_STALE"
 FRAMING_UNAVAILABLE = "FRAMING_UNAVAILABLE"
+#: 预览必须输出 PNG，但工程的输出设置无法被安全切换过来（例如影片输出 FFMPEG）
+PREVIEW_OUTPUT_UNAVAILABLE = "PREVIEW_OUTPUT_UNAVAILABLE"
 # 会话令牌（所有写接口）
 SESSION_TOKEN_INVALID = "SESSION_TOKEN_INVALID"
 # 保存 / 应用到工程
@@ -142,6 +144,12 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         409,
         True,
         "无法自动取景：请确认场景里有可见的角色网格（已排除刚体代理与描边壳）以及一台活动相机。",
+    ),
+    PREVIEW_OUTPUT_UNAVAILABLE: (
+        409,
+        False,
+        "预览只能输出 PNG，但当前工程的输出设置切不过去（常见原因：工程把渲染输出设为影片格式，"
+        "如 FFMPEG）。预览已中止，工程未被改动。请把「输出属性 → 输出」改为图片格式后重试。",
     ),
     PRESET_NOT_FOUND: (
         404,
