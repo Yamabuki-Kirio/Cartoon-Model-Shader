@@ -14,6 +14,7 @@ from src.server.app import create_app
 from src.server.config import AppConfig, BlenderMCPConfig, ServerConfig
 from tests.fake_bpy import PNG_BYTES, FakeBpy, run_generated_code
 from tests.fake_mcp_server import FakeMCPServer
+from tests.support import authed
 
 
 def make_app(server: FakeMCPServer):
@@ -69,7 +70,7 @@ def render_failing_executor(fake: FakeBpy):
 def tuner_client():
     fake = FakeBpy()
     with FakeMCPServer(executor=lambda code: run_generated_code(code, fake)) as server:
-        with TestClient(make_app(server)) as client:
+        with authed(make_app(server)) as client:
             yield client, fake
 
 
@@ -77,7 +78,7 @@ def tuner_client():
 def render_failing_client():
     fake = FakeBpy()
     with FakeMCPServer(executor=render_failing_executor(fake)) as server:
-        with TestClient(make_app(server)) as client:
+        with authed(make_app(server)) as client:
             yield client, fake
 
 
@@ -254,7 +255,7 @@ def test_disconnected_blender_yields_error_envelope() -> None:
         ),
         server=ServerConfig(),
     )
-    with TestClient(create_app(config)) as client:
+    with authed(create_app(config)) as client:
         assert client.post("/api/session/baseline").status_code in (503, 504)
 
 

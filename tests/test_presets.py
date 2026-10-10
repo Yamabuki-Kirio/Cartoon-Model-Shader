@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from src.server import errors, presets
 from src.server.app import create_app
 from src.server.config import AppConfig, BlenderMCPConfig, ServerConfig
+from tests.support import authed, unauthed
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -50,11 +51,31 @@ def store(tmp_path: Path) -> presets.PresetStore:
 
 @pytest.fixture()
 def client(store: presets.PresetStore) -> TestClient:
-    """预设接口**不需要** Blender：这里指向一个必然连不上的端口，证明这一点。"""
+    """预设接口**不需要** Blender：这里指向一个必然连不上的端口，证明这一点。
+
+    自 v3.1 起**所有写接口**统一要求 ``X-Toon-Tuner-Token``，因此这里经
+    ``tests.support.authed`` 构造客户端（令牌只在这一处注入）。
+    拒绝路径由 ``test_preset_writes_require_session_token`` 显式覆盖。
+    """
     config = AppConfig(blender_mcp=BlenderMCPConfig(port=1), server=ServerConfig())
     app = create_app(config, preset_store=store)
-    with TestClient(app) as test_client:
+    with authed(app) as test_client:
         yield test_client
+
+
+def test_preset_writes_require_session_token(store: presets.PresetStore) -> None:
+    """预设是写接口，必须和其余写接口一样受令牌闸门保护；只读接口不受影响。"""
+    config = AppConfig(blender_mcp=BlenderMCPConfig(port=1), server=ServerConfig())
+    app = create_app(config, preset_store=store)
+
+    with unauthed(app) as anon:
+        assert anon.post("/api/presets", json=body()).status_code == 401
+        assert anon.put("/api/presets/zzz", json=body()).status_code == 401
+        assert anon.post("/api/presets/zzz/rename", json={"name": "x"}).status_code == 401
+        assert anon.post("/api/presets/zzz/duplicate", json={}).status_code == 401
+        assert anon.delete("/api/presets/zzz").status_code == 401
+        # 只读接口保持开放
+        assert anon.get("/api/presets").status_code == 200
 
 
 def body(name: str = "测试预设", **overrides) -> dict:

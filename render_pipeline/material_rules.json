@@ -1,0 +1,154 @@
+{
+  "schema": "toon-material-rules/1",
+  "version": "3.1.0",
+  "updated": "2026-10-11",
+  "note": "本文件是【唯一规则源】。主脚本(一键卡通渲染.py)与预检器(pmx_material_probe.py)都必须从本文件读取规则，禁止任何副本。改动规则只需改这里。",
+  "changelog": {
+    "3.1.0": "① semantic_rules 新增可选排除词 unless：命中即本条规则不适用（修 F4：单字「眼」把「神之眼」误判成眼睛材质）。② unresolved_patterns 新增「神之眼」类饰品的反例提示。",
+    "3.0.0": "v3 分层决策 + 严格/诊断双政策。"
+  },
+
+  "class_to_group": {
+    "skin": "Cel_Skin",
+    "hair": "Cel_Hair",
+    "face": "RayToon_Face_Soft",
+    "eye": "RayToon_Eyes_Unlit",
+    "face_detail": "Cel_Eyes",
+    "emission": "Cel_Eyes",
+    "cloth": "Cel_Cloth",
+    "metal": "Cel_Dark",
+    "dark": "Cel_Dark",
+    "prop": "Cel_Dark"
+  },
+
+  "class_labels": {
+    "skin": "皮肤",
+    "hair": "头发/毛/尾/耳",
+    "face": "脸面",
+    "eye": "眼球/瞳孔",
+    "face_detail": "睫/眉/口/牙/舌（源工程走 Cel_Eyes）",
+    "emission": "自发光/能量件",
+    "cloth": "服装布料/鞋帽/袜",
+    "metal": "金属/配饰/镜片",
+    "dark": "阴影/其它硬表面",
+    "prop": "武器道具",
+    "ignore": "按设计不出图（指示器/描边/表情切换件）",
+    "unresolved": "无法确定"
+  },
+
+  "group_notes": {
+    "_why_not_more_groups": "方案里提到的 Cel_Metal / Cel_ClothLight / Cel_ClothDark / Cel_Transparent 等，源工程里【没有】对应的已调校节点组。凭空新建等于自造着色，会破坏'忠实复刻'口径。因此本版把'逻辑分类'与'Blender 节点组'分离：逻辑类保持语义清晰（用于报告与侧车映射），渲染仍落到源工程实有的 7 个节点组。见 docs/设计说明.md。"
+  },
+
+  "variant_map": {
+    "_note": "异体字/简繁/日文汉字 → 正字。只用于匹配，不修改原材质名。",
+    "顔": "颜", "顏": "颜", "臉": "脸",
+    "皮膚": "皮肤", "膚": "肤",
+    "髪": "发", "髮": "发", "髮型": "发型",
+    "頭": "头", "頸": "颈", "頸部": "颈部",
+    "體": "体", "身體": "身体",
+    "點": "点", "線": "线", "邊": "边", "緣": "缘",
+    "裝": "装", "飾": "饰", "帶": "带", "帯": "带",
+    "腳": "脚", "腳部": "脚部", "腕": "腕",
+    "齒": "齿", "歯": "齿", "舌": "舌",
+    "鏡": "镜", "環": "环", "門": "门", "畫": "画", "繪": "绘",
+    "圖": "图", "圖像": "图像", "顔面": "颜面",
+    "實": "实", "確": "确", "開": "开", "關": "关",
+    "學": "学", "園": "园", "樂": "乐", "聲": "声",
+    "斷": "断", "貫": "贯", "強": "强", "郎": "郎"
+  },
+
+  "exact_aliases": {
+    "_note": "L2 精确别名：对规范化 stem（去分隔符、去尾部数字）做【完全相等】匹配。键本身也必须写成已规范化的形式。",
+    "skin": ["皮肤", "肌", "素体", "body", "bodyskin", "skin", "hada", "腕", "手", "足", "脚", "腿", "首", "肩", "胸", "ひざ", "もも", "おてて", "おみあし", "上半身", "下半身"],
+    "hair": ["发", "头发", "前发", "后发", "毛", "尾", "尾巴", "耳", "耳毛", "耳朵", "兽耳", "绒毛", "羽", "翼", "アホ毛", "ahoge", "hair", "髪", "髮", "tail", "ear", "earsandtail"],
+    "face": ["颜", "面", "脸", "颜面", "脸面", "face"],
+    "eye": ["眼", "目", "瞳", "瞳孔", "眼球", "虹彩", "白目", "黒目", "ハイライト", "eye", "iris", "pupil", "eyes"],
+    "face_detail": ["口", "口线", "口腔", "口内", "口唇", "唇", "睫", "睫毛", "二重", "二重睫", "眉", "眉毛", "牙", "齿", "舌", "睫毛毛", "まつげ", "mouth", "teeth", "tongue", "lash", "lash2", "brow", "eyelash", "eyebrow"],
+    "emission": ["管道", "导管", "表盘", "发光", "光", "glow", "emission", "emissive", "pipe", "tube", "hika"],
+    "cloth": ["衣", "衣服", "服", "服装", "上着", "下着", "布", "外套", "裤子", "裙", "裙子", "蝴蝶结", "帽", "帽子", "瓶子", "包", "袋", "腰包", "腰带", "袜", "丝袜", "指甲", "鞋", "靴", "袖", "领", "领带", "围巾", "手套", "环", "腿环", "臂环", "スカート", "ブラウス", "シャツ", "ズボン", "ネクタイ", "ソックス", "スパッツ", "cloth", "skirt", "shirt", "dress", "tie", "sock", "boot", "glove", "blouse", "spats", "ribbon", "stocking", "pantyhose", "tights", "nails", "nail", "bag", "pouch", "belt", "strap", "garter"],
+    "metal": ["金属", "墨镜", "眼镜", "饰品", "首饰", "饰", "镜", "屏幕", "ガラス", "ピアス", "ネックレス", "headband", "護額", "护额", "額当て", "メタル", "lens", "glass", "screen", "metal", "steel", "ornament", "accessory"],
+    "dark": ["影", "阴影", "影子", "暗部", "shadow", "dark"],
+    "prop": ["武器", "枪", "炮", "锤", "箱子", "喇叭", "泡泡", "贴纸", "手机", "道具", "弓", "刀", "剑", "盾", "weapon", "prop", "rifle", "gun", "box", "speaker", "bubble", "sticker"],
+    "ignore": ["インジケータ", "インジケーター", "ガイド", "捩", "グルーブ", "グリップ", "操作", "ダミー", "outline", "描边", "mmdedge", "dotsstroke"]
+  },
+
+  "semantic_rules": [
+    {"id": "shadow", "pattern": "影|shadow", "class": "dark", "confidence": 0.80,
+     "note": "放在 hair 之前，避免 hairshadow 被当成头发"},
+    {"id": "face", "pattern": "face|颜|脸|面", "class": "face", "confidence": 0.80,
+     "note": "含简体 颜（旧版只有日文/繁体 顔，一字之差拖垮 7 个模型）"},
+    {"id": "eye", "pattern": "eye|目|眼|瞳|pupil|iris", "class": "eye", "confidence": 0.85,
+     "unless": "神之眼|神之瞳|神之心|眼镜|眼鏡|墨镜|眼罩|目隠し|まぶた|glasses|eyewear",
+     "note": "★ 必须带 unless：单个「眼/目」会命中「神之眼」这类饰品名与「眼镜」类配饰，把饰品判成眼球材质。排除词命中则本条不适用，继续下沉（最终多半落到 L6 待人工确认）。"},
+    {"id": "face_detail", "pattern": "teeth|齿|牙|tongue|舌|lash|睫毛|睫|brow|眉|まつげ|口|二重", "class": "face_detail", "confidence": 0.80,
+     "note": "源工程里牙/舌/睫/眉走 Cel_Eyes；口腔/口线/Mouth 同类"},
+    {"id": "emission", "pattern": "glow|光|emission|emissive|hika|管道|导管|表盘|pipe|tube", "class": "emission", "confidence": 0.75},
+    {"id": "head_hair", "pattern": "^头material\\d+|^頭material\\d+", "class": "hair", "confidence": 0.85,
+     "note": "对 compact 名匹配；旧版尾锚点 $ 被 Blender 的 .001 后缀打掉"},
+    {"id": "hair", "pattern": "hair|发|前髪|後髪|ahoge|毛|尾|tail|耳|ear", "class": "hair", "confidence": 0.75},
+    {"id": "cloth", "pattern": "cloth|服|衣|布|上着|下着|スカート|シャツ|ズボン|ネクタイ|靴|ソックス|手袋|袖|skirt|shirt|dress|tie|sock|boot|glove|blouse|spats|ribbon|袜|丝袜|stocking|pantyhose|tights|指甲|爪|nails|包|袋|bag|pouch|环|環|ring|garter|蝴蝶结|裙|帽|瓶子", "class": "cloth", "confidence": 0.75,
+     "note": "必须排在 skin 之前：像「腿环」会被 skin 规则的「腿」抢先吃成 Cel_Skin"},
+    {"id": "cloth2", "pattern": "內著|内着|内衣|鞋|帶|帯|带|belt|strap|sash|サッシュ|翼", "class": "cloth", "confidence": 0.70},
+    {"id": "body_shell", "pattern": "体", "class": "cloth", "confidence": 0.60,
+     "note": "源工程里「身_体」是躯干外壳/衣服本体，走 Cel_Cloth 不走 skin。置信度刻意压低，避免误吃含「体」的皮肤件"},
+    {"id": "skin", "pattern": "skin|肌|皮肤|肤|hada|body|腕|手|足|脚|腿|首|肩|胸", "class": "skin", "confidence": 0.75},
+    {"id": "metal", "pattern": "饰|metal|金属|screen|屏幕|accessory|ornament|lens|ガラス|glass|ピアス|ネックレス|headband|steel|護額|护额|額当て|メタル|墨镜|镜", "class": "metal", "confidence": 0.75},
+    {"id": "prop", "pattern": "武器|枪|炮|锤|箱子|喇叭|泡泡|贴纸|手机|道具|weapon|rifle|gun|box|speaker|bubble|sticker", "class": "prop", "confidence": 0.70}
+  ],
+
+  "ignore_patterns": [
+    "インジケータ", "インジケーター", "ガイド", "捩", "グルーブ", "グリップ",
+    "操作", "ダミー", "^Material$", "^Dots Stroke$", "^Outline", "描边",
+    "^mmd_edge"
+  ],
+
+  "unresolved_patterns": [
+    {"pattern": "神之眼|神之瞳|神之心", "hint": "★ 反例（F4）：「神之眼」一类神明造物饰品**不是**眼睛材质，只是名字里带「眼」。必须人工确认，绝不允许自动归入眼睛。多数情况应归金属/配饰（Cel_Dark）。"},
+    {"pattern": "表情", "hint": "疑似表情切换件（贴图多为 emotion/common_face）。MMD 中 morph 权重 0 时可能不可见，但也可能是默认脸——必须人工确认，不能静默忽略。"},
+    {"pattern": "emotion", "hint": "疑似表情切换件，同「表情」。"},
+    {"pattern": "新規", "hint": "作者随手命名的未命名材质。实测贴图可能是主体贴图（如 体.png），面数可达 1.5 万——绝不可忽略。"},
+    {"pattern": "^material\\d*$", "hint": "无语义命名（MaterialN）。方案要求：不根据名字猜测，必须人工分类。预检报告已给出序号/面数/贴图/颜色/透明度作为判断依据。"}
+  ],
+
+  "head_hair_patterns": ["^头material\\d+", "^頭material\\d+"],
+
+  "attribute_rules": {
+    "_note": "L5：名字没救时，用 PMX 结构特征做最后判断。置信度一律低于 semantic 层，默认会被 strict 拦下要求人工确认。",
+    "transparent_alpha_below": 0.999,
+    "rules": [
+      {"id": "attr_invisible", "when": {"alpha_below": 0.01}, "class": "ignore", "confidence": 0.90,
+       "note": "MMD alpha≈0：该材质渲染出来本来就不可见（表情切换备用件等）。这是结构确定判断，不算低置信度。"},
+      {"id": "attr_emissive_color", "when": {"diffuse_all_channels_high": true, "alpha_below": 0.9}, "class": "emission", "confidence": 0.40},
+      {"id": "attr_tiny_surface", "when": {"surface_count_below": 30}, "class": "dark", "confidence": 0.30,
+       "note": "极小面数常是内部件/接缝"}
+    ]
+  },
+
+  "confidence": {
+    "model_map": 1.0,
+    "exact_alias": 0.95,
+    "normalized_alias": 0.85,
+    "semantic_rule": 0.75,
+    "attribute_rule": 0.40,
+    "unresolved": 0.0,
+    "low_confidence_threshold": 0.60
+  },
+
+  "policy": {
+    "strict": {
+      "reject_on_unresolved": true,
+      "reject_on_low_confidence": true,
+      "reject_on_stale_map": true,
+      "reject_on_conflict": true,
+      "reject_on_missing_texture": true
+    },
+    "diagnostic": {
+      "unresolved_material_prefix": "DIAG_UNRESOLVED",
+      "unresolved_color": [1.0, 0.0, 1.0],
+      "low_confidence_color": [1.0, 0.55, 0.0],
+      "checker": true,
+      "watermark": "诊断预览"
+    }
+  }
+}

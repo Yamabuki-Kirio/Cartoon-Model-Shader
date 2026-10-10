@@ -18,7 +18,16 @@ from typing import Any
 
 # 合成器在 Blender 5.x 是「场景级节点组」，而非旧版的 scene.node_tree
 COMPOSITOR_GROUP_NAME = "AI_Compositor"
+
+#: 辉光节点的**期望名称**。注意：这只是「名字优先」那一档的偏好值 ——
+#: 真实工程里 一键卡通渲染.py::setup_compositor 建完 CompositorNodeGlare 之后
+#: **从不改名**，所以真实节点名是 Blender 的本地化默认名（中文 UI「眩光」、
+#: 英文 UI「Glare」）。只按名字找 = 真实工程永远找不到（缺陷 F3）。
+#: 因此定位一律走 GLARE_NODE_TYPE，见 blender_ops._glare_locator_lines()。
 GLARE_NODE_NAME = "Autocel_Glow"
+
+#: 辉光节点的 **bl_idname**。这是跨 UI 语言稳定的唯一标识。
+GLARE_NODE_TYPE = "CompositorNodeGlare"
 
 PARAM_SCHEMA_VERSION = "toon-l0-surface/1"
 
@@ -157,7 +166,7 @@ GLOW_PARAMS: tuple[ParamSpec, ...] = (
         group=GROUP_GLOW,
         label="辉光阈值",
         type="float",
-        target="AI_Compositor › Autocel_Glow › Threshold",
+        target="AI_Compositor › 辉光节点(CompositorNodeGlare) › Threshold",
         binding="glare.Threshold",
         minimum=0.0,
         maximum=5.0,
@@ -169,7 +178,7 @@ GLOW_PARAMS: tuple[ParamSpec, ...] = (
         group=GROUP_GLOW,
         label="辉光强度",
         type="float",
-        target="AI_Compositor › Autocel_Glow › Strength",
+        target="AI_Compositor › 辉光节点(CompositorNodeGlare) › Strength",
         binding="glare.Strength",
         minimum=0.0,
         maximum=10.0,
@@ -181,7 +190,7 @@ GLOW_PARAMS: tuple[ParamSpec, ...] = (
         group=GROUP_GLOW,
         label="辉光尺寸",
         type="float",
-        target="AI_Compositor › Autocel_Glow › Size",
+        target="AI_Compositor › 辉光节点(CompositorNodeGlare) › Size",
         binding="glare.Size",
         minimum=0.0,
         maximum=1.0,
@@ -193,7 +202,7 @@ GLOW_PARAMS: tuple[ParamSpec, ...] = (
         group=GROUP_GLOW,
         label="辉光类型",
         type="enum",
-        target="AI_Compositor › Autocel_Glow › Type",
+        target="AI_Compositor › 辉光节点(CompositorNodeGlare) › Type",
         binding="glare.Type",
         options=("Bloom", "Ghosts", "Streaks", "FogGlow", "SimpleStar"),
         note="辉光算法。Bloom 为源工程所用，视作风格基线，一般不建议改。",
@@ -203,7 +212,7 @@ GLOW_PARAMS: tuple[ParamSpec, ...] = (
         group=GROUP_GLOW,
         label="辉光质量",
         type="enum",
-        target="AI_Compositor › Autocel_Glow › Quality",
+        target="AI_Compositor › 辉光节点(CompositorNodeGlare) › Quality",
         binding="glare.Quality",
         options=("Low", "Medium", "High"),
         note="影响辉光柔度与耗时；High 明显变慢。与渲染采样数无关。",
@@ -213,7 +222,7 @@ GLOW_PARAMS: tuple[ParamSpec, ...] = (
         group=GROUP_GLOW,
         label="辉光平滑度",
         type="float",
-        target="AI_Compositor › Autocel_Glow › Smoothness",
+        target="AI_Compositor › 辉光节点(CompositorNodeGlare) › Smoothness",
         binding="glare.Smoothness",
         minimum=0.0,
         maximum=1.0,
