@@ -878,7 +878,7 @@ def test_api_job_payload_exposes_no_local_paths(tuner_client) -> None:
 
 
 # =============================================================================
-#  6. 前端契约（真实浏览器验收见 tests/browser_check.mjs）
+#  6. 前端契约
 # =============================================================================
 #
 # 本节原先读取旧前端 `src/web/index.html` / `src/web/app.js`，断言取景控件
@@ -896,4 +896,6 @@ def test_api_job_payload_exposes_no_local_paths(tuner_client) -> None:
 #   * `web/src/components/PreviewCanvas.tsx` —— 「是否入画」判据与占位；
 #   * `tests/test_framing.py`（本文件其余章节）—— 后端取景与失效错误码契约。
 #
-# 真实浏览器验收见 `tests/browser_check.mjs`。
+# 真实浏览器验收脚本 `tests/browser_check.mjs` 目前**仍锁定旧页面 DOM**，
+# 需按新工作台的 `data-testid` 重写后才能再用（它自己会前置守卫并直接报错，
+# 不会产出假绿灯）。

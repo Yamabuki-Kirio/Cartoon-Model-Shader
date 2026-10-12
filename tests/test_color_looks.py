@@ -717,4 +717,6 @@ def test_api_job_result_records_configured_effective_and_label() -> None:
 #                                     等价于原先的 `lookRequestToken`；
 #   * `tests/test_api_tuner.py`    —— 后端侧的联动与错误码契约。
 #
-# 真实浏览器验收见 `tests/browser_check.mjs`。
+# 真实浏览器验收脚本 `tests/browser_check.mjs` 目前**仍锁定旧页面 DOM**，
+# 需按新工作台的 `data-testid` 重写后才能再用（它自己会前置守卫并直接报错，
+# 不会产出假绿灯）。

@@ -1,10 +1,19 @@
 /**
  * 真实浏览器验收：用本机已安装的 Chrome/Edge（CDP 驱动）+ 真实 Blender。
  *
+ * ⚠️ **本脚本目前锁定的是「提交 5」之前删除的旧页面 DOM**（`#preview-img` /
+ * `#preview-status` / `#framing-bar` / Look 下拉框 …）。提交 5 把工作台切到 `/`
+ * 之后，这些元素已不存在，脚本会在第 1 步就失败。它在文件末尾加了一条**前置守卫**：
+ * 只要页面里没有旧页面元素就立刻抛错退出（exit 2），
+ * 因此**不会**产出「看起来跑过、其实什么都没验」的假绿灯。
+ *
+ * 重新启用需要：按 v4 工作台的 `data-testid` 重写下面的断言（真实工程 + 真实浏览器）。
+ * 在那之前，v4 的可验收结论以 `tests/`（pytest）与 `web/src/**`（Vitest）为准。
+ *
  * 只依赖 Node 内置能力（global fetch / global WebSocket / node:net），不需要 puppeteer、
  * 也不需要下载 Chromium。
  *
- * 覆盖验收点：
+ * 覆盖验收点（均为**旧页面**，待重写）：
  *   1. 建立基线后自动渲染首张预览（右侧出现画面）
  *   2. 图片 URL 带 job_id 防缓存
  *   3. 完成后状态为「基线已建立，可开始调参」
@@ -264,6 +273,29 @@ async function main() {
 
     await cdp.send("Page.navigate", { url: BASE_URL }, session);
     await sleep(500);
+
+    // ---- 前置守卫：本脚本只对旧页面有效 ----
+    // 提交 5 把工作台切到 `/` 并删除了旧页面，本脚本的断言对象已不存在。
+    // 这里必须显式停下：否则会在第 1 步以「首张预览未出现」收场，
+    // 让人误以为是渲染/基线的问题，而真实原因是旧 DOM 没了。
+    const served = await evaluate(
+      `({
+         hasLegacy: !!document.getElementById("preview-img"),
+         hasWorkbench: !!document.querySelector('[data-testid="action-open-save"]'),
+         title: document.title
+       })`
+    );
+    if (!served.hasLegacy) {
+      throw new Error(
+        [
+          "本脚本锁定的是「提交 5」已删除的旧页面 DOM，无法用于验收 v4 工作台。",
+          `当前页面：旧页面元素=${served.hasLegacy ? "有" : "无"}，` +
+            `工作台元素=${served.hasWorkbench ? "有" : "无"}，title=${JSON.stringify(served.title)}`,
+          "重新启用需按 v4 工作台的 data-testid 重写本脚本的断言（真实工程 + 真实浏览器）。",
+          "在那之前，v4 的结论以 tests/（pytest）与 web/src/**（Vitest）为准。",
+        ].join("\n")
+      );
+    }
 
     // ---- 1/2/3. 基线 → 首张预览 → 图片出现且 URL 带 job_id ----
     const waitImage = `new Promise((resolve) => {
