@@ -44,6 +44,15 @@ export interface SaveConfirmInfo {
   /** 预计的备份路径；`null` = 这次不会生成备份（目标文件不存在）。 */
   backupPath: string | null;
   warnings: string[];
+  /**
+   * 第一次 prepare 返回的确认单号。点「确认并覆盖」时随第二次 prepare 回传，
+   * 服务端据此**沿用这里展示的备份路径**签发令牌 —— 否则用户阅读路径超过 1 秒，
+   * 确认框里的路径与实际生成的备份路径就会对不上。
+   *
+   * 空字符串 = 服务端没给（契约对不上）；此时按旧行为确认，并在成功后以
+   * save-ok / 状态表里的真实路径为准。
+   */
+  confirmationId: string;
 }
 
 /** 一次保存的**终态**快照（成功或失败都可能有）。 */
@@ -159,7 +168,8 @@ export function confirmFromError(detail: ErrorDetail): SaveConfirmInfo | null {
   const warnings = Array.isArray(raw.warnings)
     ? raw.warnings.filter((item): item is string => typeof item === "string")
     : [];
-  return { mode, targetPath, backupPath, warnings };
+  const confirmationId = typeof raw.confirmation_id === "string" ? raw.confirmation_id : "";
+  return { mode, targetPath, backupPath, warnings, confirmationId };
 }
 
 /** 从 prepare 成功的响应里取出同形的确认信息（覆盖路径已带备份）。 */
@@ -168,12 +178,14 @@ export function confirmFromPrepared(prepared: {
   target_path: string;
   backup_path: string | null;
   warnings: string[];
+  confirmation_id?: string;
 }): SaveConfirmInfo {
   return {
     mode: prepared.mode === "overwrite" ? "overwrite" : "save_as",
     targetPath: prepared.target_path,
     backupPath: prepared.backup_path,
     warnings: [...prepared.warnings],
+    confirmationId: prepared.confirmation_id ?? "",
   };
 }
 

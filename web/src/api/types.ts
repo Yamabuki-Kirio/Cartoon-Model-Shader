@@ -289,6 +289,12 @@ export interface CommitPrepareBody {
   target_path?: string | null;
   /** 覆盖已有文件必须为 `true`（先看清绝对路径与备份位置再确认）。 */
   confirm?: boolean;
+  /**
+   * 第一次 prepare 返回的确认单号。第二次确认（`confirm: true`）**必须**原样携带：
+   * 服务端据此沿用第一次已展示的备份路径（两步之间跨过整秒边界也不会漂移），
+   * 并复核基线 / 草稿 / 模式 / 目标都没变。第一次调用不要带。
+   */
+  confirmation_id?: string | null;
   surface_draft?: Record<string, unknown> | null;
   structure_hash?: string | null;
 }
@@ -316,6 +322,11 @@ export interface CommitPrepareResponse {
   expires_at: string;
   expires_in_seconds: number;
   confirmation_required: boolean;
+  /**
+   * 本次准备的确认单号：确认覆盖时必须随第二次 prepare 回传，服务端据此
+   * 沿用已展示的备份路径并复核各项未变。不需要确认的流程同样会给出。
+   */
+  confirmation_id: string;
 }
 
 /** `POST /api/session/commit` 的请求体（令牌 + 与 prepare 逐项一致的内容）。 */

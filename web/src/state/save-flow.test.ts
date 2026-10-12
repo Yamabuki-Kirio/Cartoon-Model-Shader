@@ -5,6 +5,8 @@ import { makeTestWorkspace, settle } from "../testing/endpoints";
 
 const TARGET = "D:\\项目\\角色-调参.blend";
 const BACKUP = "D:\\项目\\角色-调参.backup-20261009.blend";
+/** 第一次 prepare 冻结的确认单号：第二次确认必须原样回传。 */
+const CONFIRMATION = "cf0000000001";
 
 async function makeWorkspace(overrides: Record<string, unknown> = {}) {
   const { workspace, endpoints } = makeTestWorkspace(overrides);
@@ -28,6 +30,7 @@ function confirmError() {
         target_path: TARGET,
         backup_path: BACKUP,
         warnings: ["目标文件已存在"],
+        confirmation_id: CONFIRMATION,
       },
     },
     409
@@ -130,6 +133,8 @@ describe("保存闭环：覆盖需要二次确认", () => {
     expect(state.save.confirm?.targetPath).toBe(TARGET);
     expect(state.save.confirm?.backupPath).toBe(BACKUP);
     expect(state.save.confirm?.warnings).toEqual(["目标文件已存在"]);
+    // 确认单号一并收下：点确认时要原样回传，服务端才能沿用这条备份路径
+    expect(state.save.confirm?.confirmationId).toBe(CONFIRMATION);
     expect(endpoints.commitApply).not.toHaveBeenCalled();
   });
 
@@ -153,6 +158,10 @@ describe("保存闭环：覆盖需要二次确认", () => {
     expect(confirmed).toBe(true);
     expect(endpoints.commitPrepare).toHaveBeenCalledTimes(2);
     expect(endpoints.commitPrepare.mock.calls[1][0].confirm).toBe(true);
+    // 第二次确认必须回传第一次拿到的确认单号：服务端据此沿用已展示的备份路径
+    expect(endpoints.commitPrepare.mock.calls[1][0].confirmation_id).toBe(CONFIRMATION);
+    // 第一次不带（那时还没有单号）
+    expect(endpoints.commitPrepare.mock.calls[0][0].confirmation_id ?? null).toBeNull();
     expect(workspace.store.getState().save.phase).toBe("saved");
   });
 

@@ -71,6 +71,7 @@ describe("二次确认信息", () => {
           target_path: "D:\\项目\\角色.blend",
           backup_path: "D:\\项目\\角色.backup-20261009.blend",
           warnings: ["目标文件已存在", "当前工程有未保存修改"],
+          confirmation_id: "cf0000000001",
         },
       })
     );
@@ -79,9 +80,20 @@ describe("二次确认信息", () => {
       targetPath: "D:\\项目\\角色.blend",
       backupPath: "D:\\项目\\角色.backup-20261009.blend",
       warnings: ["目标文件已存在", "当前工程有未保存修改"],
+      confirmationId: "cf0000000001",
     });
     // 别的错误码不是「待确认」
     expect(confirmFromError(detail({ code: "SAVE_FAILED" }))).toBeNull();
+  });
+
+  it("details 里没有 confirmation_id 时降级为空串（旧服务端兼容），不编一个", () => {
+    const info = confirmFromError(
+      detail({
+        code: "SAVE_CONFIRM_REQUIRED",
+        details: { target_path: "D:\\a.blend", backup_path: null, warnings: [] },
+      })
+    );
+    expect(info?.confirmationId).toBe("");
   });
 
   it("details 形状对不上时返回 null —— 绝不编一条路径出来让用户确认", () => {
@@ -102,6 +114,14 @@ describe("二次确认信息", () => {
       })
     );
     expect(info?.warnings).toEqual(["ok"]);
+  });
+
+  it("prepare 成功响应也带出确认单号（确认时必须回传同一条）", () => {
+    expect(confirmFromPrepared(commitPreparedPayload()).confirmationId).toBe("cf0000000001");
+    expect(
+      confirmFromPrepared({ ...commitPreparedPayload(), confirmation_id: undefined })
+        .confirmationId
+    ).toBe("");
   });
 
   it("overwrite 模式归一；未知模式一律当 save_as", () => {

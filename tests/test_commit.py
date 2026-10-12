@@ -25,9 +25,12 @@ from typing import Any, Iterator
 
 import pytest
 
+from src.server import commit as commit_module
 from src.server import project_ops
 from src.server.app import create_app
 from src.server.blender_ops import JSON_MARKER
+from src.server.commit import CommitService
+from src.server.session import _restore_suffix
 from tests.fake_bpy import BLEND_BYTES, FakeBpy, run_generated_code
 from tests.fake_mcp_server import FakeMCPServer
 from tests.support import authed, make_config, unauthed
@@ -734,7 +737,9 @@ def test_commit_refuses_when_target_vanishes_after_confirmation(
     assert status["applied"] is False, "前提复核应在写场景之前"
     assert status["rollback"]["attempted"] is False
     assert "无需回滚" in status["rollback"]["reason"]
-    assert "无需回滚" in error["message"]
+    # 文案统一走 _rollback_suffix：没写进场景 = 无需恢复，绝不是「未能恢复」
+    assert "无需恢复" in error["message"]
+    assert "未能恢复" not in error["message"]
     assert len(env.fake.save_calls) == 0
 
 
@@ -757,6 +762,218 @@ def test_commit_requires_reconfirm_when_target_appears_after_confirmation(
     status = error["details"]["status"]
     assert status["applied"] is False
     assert status["rollback"]["attempted"] is False
+    assert len(env.fake.save_calls) == 0
+
+
+# -- 确认上下文：两次 prepare 之间备份路径不得漂移（F12）----------------------
+
+
+def test_second_prepare_reuses_confirmed_backup_path(
+    env: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """用户在两步之间停留超过一秒：确认框展示的路径必须与实际签发票据的路径一致。
+
+    这正是 F12 的判定条件：两次 prepare 用**不同时间**计算备份路径（时钟每次跳 1 小时），
+    若服务端不沿用第一次冻结的那条，展示名字与真实生成的名字就会对不上。
+    """
+    clock = FrozenClock(datetime(2026, 10, 9, 17, 0, 0))
+    monkeypatch.setattr(project_ops, "_dt", SimpleNamespace(datetime=clock))
+    env.project.write_bytes(OLD_CONTENT)
+
+    # 第一次：不确认 → 只展示路径 + 确认单号
+    refused = _prepare(env.client, mode="overwrite")
+    assert refused.status_code == 409
+    details = refused.json()["error"]["details"]
+    shown = details["backup_path"]
+    confirmation_id = details["confirmation_id"]
+    assert confirmation_id, "第一次 prepare 必须给出确认单号"
+    assert clock.calls == 1, f"第一次只应计算一次备份路径，实际 {clock.calls} 次"
+
+    # 第二次：用户读路径花了很久（时钟已跳到 1 小时后）→ 携带单号确认
+    prepared = _prepare(
+        env.client, mode="overwrite", confirm=True, confirmation_id=confirmation_id
+    ).json()
+    assert prepared["backup_path"] == shown, "确认框展示的备份路径必须被沿用"
+    assert clock.calls == 1, f"带确认单号的确认不得重算备份路径，实际算了 {clock.calls} 次"
+    assert prepared["confirmation_id"] == confirmation_id
+
+    # 真正落盘的备份就是展示过的那一条，目录里不得出现按新时间算出来的第二条
+    result = _commit(env.client, prepared["token"], mode="overwrite").json()
+    assert result["saved"] is True
+    assert result["backup_path"] == shown
+    assert Path(shown).is_file()
+    backups = sorted(env.project.parent.glob("*.bak-*.blend"))
+    assert [path.name for path in backups] == [Path(shown).name]
+
+
+def test_confirmation_id_rejects_forged_value(env: SimpleNamespace) -> None:
+    """伪造 / 乱填的确认单号一律拒绝，不给「自选路径」留门。"""
+    env.project.write_bytes(OLD_CONTENT)
+    forged = _prepare(
+        env.client, mode="overwrite", confirm=True, confirmation_id="forged-id-0001"
+    )
+    assert forged.status_code == 409
+    assert forged.json()["error"]["code"] == "COMMIT_TOKEN_INVALID"
+    assert len(env.fake.save_calls) == 0
+
+
+def test_confirmation_cannot_be_reused(env: SimpleNamespace) -> None:
+    """确认上下文一次性：确认成功后同一单号再确认即拒。"""
+    env.project.write_bytes(OLD_CONTENT)
+    refused = _prepare(env.client, mode="overwrite")
+    confirmation_id = refused.json()["error"]["details"]["confirmation_id"]
+
+    first = _prepare(
+        env.client, mode="overwrite", confirm=True, confirmation_id=confirmation_id
+    )
+    assert first.status_code == 200
+
+    again = _prepare(
+        env.client, mode="overwrite", confirm=True, confirmation_id=confirmation_id
+    )
+    assert again.status_code == 409
+    assert again.json()["error"]["code"] == "COMMIT_TOKEN_USED"
+
+
+def test_confirmation_expires(env: SimpleNamespace) -> None:
+    """确认上下文短效：用户搁置不管，再确认时要求重新准备。"""
+    env.project.write_bytes(OLD_CONTENT)
+    refused = _prepare(env.client, mode="overwrite")
+    confirmation_id = refused.json()["error"]["details"]["confirmation_id"]
+
+    # 直接把该上下文的过期时刻拨到过去（等价于用户搁置超过有效期）
+    stored = env.app.state.commit._confirmations[confirmation_id]
+    stored.expires_at = time.monotonic() - 1.0
+
+    late = _prepare(
+        env.client, mode="overwrite", confirm=True, confirmation_id=confirmation_id
+    )
+    assert late.status_code == 409
+    assert late.json()["error"]["code"] == "COMMIT_TOKEN_EXPIRED"
+    # 过期后上下文被清掉，同一个单号再也不会被接受
+    assert confirmation_id not in env.app.state.commit._confirmations
+
+
+def test_confirmation_rejects_changed_draft(env: SimpleNamespace) -> None:
+    """确认时草稿与准备阶段不一致 → 拒绝（令牌只绑定确认过的那一份）。"""
+    env.project.write_bytes(OLD_CONTENT)
+    refused = _prepare(env.client, mode="overwrite")
+    confirmation_id = refused.json()["error"]["details"]["confirmation_id"]
+
+    tampered = _prepare(
+        env.client,
+        mode="overwrite",
+        confirm=True,
+        confirmation_id=confirmation_id,
+        # 合法但不同的取值（越界值会先被参数校验拦下，测不到草稿比对那一层）
+        draft={"color.exposure": 0.9, "glow.threshold": 1.6},
+    )
+    assert tampered.status_code == 409
+    assert tampered.json()["error"]["code"] == "COMMIT_TOKEN_MISMATCH"
+    assert len(env.fake.save_calls) == 0
+
+
+def test_confirmation_rejects_changed_mode(env: SimpleNamespace) -> None:
+    """确认时保存模式与准备阶段不一致 → 拒绝。"""
+    env.project.write_bytes(OLD_CONTENT)
+    refused = _prepare(env.client, mode="overwrite")
+    confirmation_id = refused.json()["error"]["details"]["confirmation_id"]
+
+    switched = _prepare(
+        env.client,
+        mode="save_as",
+        target_path=str(_target(env, "switched.blend")),
+        confirm=True,
+        confirmation_id=confirmation_id,
+    )
+    assert switched.status_code == 409
+    assert switched.json()["error"]["code"] == "COMMIT_TOKEN_MISMATCH"
+
+
+def test_confirmation_rejects_when_target_vanishes(env: SimpleNamespace) -> None:
+    """确认之前原文件被删：会不会生成备份的前提变了 → 拒绝，要求重新确认。"""
+    env.project.write_bytes(OLD_CONTENT)
+    refused = _prepare(env.client, mode="overwrite")
+    confirmation_id = refused.json()["error"]["details"]["confirmation_id"]
+
+    env.project.unlink()
+    late = _prepare(
+        env.client, mode="overwrite", confirm=True, confirmation_id=confirmation_id
+    )
+    assert late.status_code == 409
+    error = late.json()["error"]
+    assert error["code"] == "COMMIT_TOKEN_MISMATCH"
+    assert "存在性" in error["message"]
+    assert len(env.fake.save_calls) == 0
+
+
+def test_prepare_rejects_client_supplied_backup_path(env: SimpleNamespace) -> None:
+    """备份路径只由服务端在准备阶段算出并冻结：客户端自带一律 422。
+
+    「禁止由浏览器提交或修改备份路径」的守门测试：用户要确认的必须是服务端
+    真的会写到的那条，不能是请求里带来的另一条。
+    """
+    response = env.client.post(
+        "/api/session/commit/prepare",
+        json={
+            "mode": "save_as",
+            "draft": DRAFT,
+            "target_path": str(_target(env)),
+            "backup_path": "D:\\evil\\evil.blend",
+        },
+    )
+    assert response.status_code == 422
+
+
+# -- F11：恢复文案三态，不误报 ------------------------------------------------
+
+
+def test_restore_suffix_reports_three_states_honestly() -> None:
+    """attempted=False ≠ 「未能恢复」：没写进场景就谈不上没恢复成。"""
+    untouched = _restore_suffix({"attempted": False})
+    assert "无需恢复" in untouched
+    assert "未能恢复" not in untouched
+
+    restored = _restore_suffix({"attempted": True, "verified": True})
+    assert "已恢复" in restored
+
+    failed = _restore_suffix({"attempted": True, "verified": False, "code": "ROLLBACK_FAILED"})
+    assert "请人工确认" in failed
+
+    unavailable = _restore_suffix(
+        {"attempted": False, "code": "NO_BASELINE", "reason": "基线已丢失，无法恢复。"}
+    )
+    assert "未能恢复" in unavailable, "恢复机制不可用才是真正的未能恢复"
+    assert "请人工确认" in unavailable
+
+    # commit 侧同源逻辑（静态方法，无需实例）
+    assert "无需恢复" in CommitService._rollback_suffix({"attempted": False})
+    assert "未能恢复" not in CommitService._rollback_suffix({"attempted": False})
+    assert "已恢复" in CommitService._rollback_suffix({"attempted": True, "verified": True})
+    assert "请人工确认" in CommitService._rollback_suffix(
+        {"attempted": True, "verified": False, "code": "ROLLBACK_FAILED"}
+    )
+    assert "未能恢复" in CommitService._rollback_suffix(
+        {"attempted": False, "code": "NO_BASELINE", "reason": "基线已丢失"}
+    )
+
+
+def test_failure_before_any_write_does_not_claim_restore_failure(
+    env: SimpleNamespace,
+) -> None:
+    """F11 端到端：还没写场景就失败 → 明说「无需恢复」，绝不误报「未能恢复基线」。"""
+    env.project.write_bytes(OLD_CONTENT)
+    prepared = _prepare(env.client, mode="overwrite", confirm=True).json()
+    env.project.unlink()
+
+    response = _commit(env.client, prepared["token"], mode="overwrite")
+
+    assert response.status_code == 500
+    error = response.json()["error"]
+    assert error["code"] == "BACKUP_FAILED"
+    assert "尚未写入场景" in error["message"]
+    assert "无需恢复" in error["message"]
+    assert "未能恢复" not in error["message"]
     assert len(env.fake.save_calls) == 0
 
 

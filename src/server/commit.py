@@ -32,6 +32,22 @@
 展示给用户并绑进确认令牌的那条备份路径，就是 commit 阶段真正使用的那条 ——
 不再按当前时间重算。否则跨过时间边界（哪怕只差 1 秒）实际备份位置就会与用户确认过的不一致。
 连带的后果是：确认之后目标文件凭空出现或消失，「会不会有备份」的前提已变，一律拒绝并要求重新确认。
+连带的后果是：确认之后目标文件凭空出现或消失，「会不会有备份」的前提已变，一律拒绝并要求重新确认。
+
+确认上下文：两次 prepare 之间路径不得漂移
+----------------------------------------
+「先看清再确认」天然是**两次**请求：第一次（``confirm=false``）只把绝对路径与备份路径
+摊开给用户，第二次（``confirm=true``）才签发令牌。若第二次按当前时间**重算**备份路径，
+用户阅读路径只要超过 1 秒，展示的名字与实际生成的名字就会对不上 —— 用户确认的
+并不是真正会用的那一条。
+
+因此引入**确认上下文**（``SaveConfirmation``）：
+
+1. 第一次 prepare 生成 ``confirmation_id``，连同**当次算出的** ``backup_path`` 一并冻结；
+2. 第二次 prepare **必须携带** ``confirmation_id``，服务端复核基线 / 草稿 / 保存模式 /
+   目标路径 / 目标存在性都没变，然后**沿用冻结的备份路径**签发令牌；
+3. 确认上下文一次性（复用即拒）、短效（过期即拒）；服务端不接受客户端自带备份路径
+   （请求模型 ``extra="forbid"``，落盘路径只认票据里那一条）。
 """
 
 from __future__ import annotations
@@ -56,6 +72,11 @@ from .surface import param_values, verify_ops
 TOKEN_TTL_SECONDS = 120
 #: 同时最多保留的待确认令牌数
 MAX_PENDING_TOKENS = 32
+#: 确认上下文有效期（秒）：与令牌一致，刻意很短。
+#: 它只覆盖「用户读完路径到点下确认」这一小段时间。
+CONFIRMATION_TTL_SECONDS = TOKEN_TTL_SECONDS
+#: 同时最多保留的待确认上下文数（每个覆盖流程只应有一个）
+MAX_PENDING_CONFIRMATIONS = 16
 
 WARNING_DIRTY = (
     "Blender 里存在未保存的改动：本次备份只包含磁盘上「上一次保存的版本」，"
@@ -118,6 +139,34 @@ class CommitTicket:
         }
 
 
+@dataclass
+class SaveConfirmation:
+    """「先看清再确认」那一步冻结的上下文（第一次 prepare 创建，第二次沿用）。
+
+    字段与票据一一对应，但存在时间更短、且**不签发令牌**：它只回答一个问题 ——
+    「用户第二次点确认时，他看过的那条备份路径还能不能作数」。
+    """
+
+    confirmation_id: str
+    baseline_id: str
+    draft_hash: str
+    mode: str
+    target_path: str
+    backup_path: str | None
+    #: 第一次 prepare 时目标文件是否存在（= 会不会生成备份）。确认时前提必须没变。
+    needs_backup: bool
+    warnings: list[str]
+    surface_bound: bool
+    structure_hash: str | None
+    issued_at: float
+    expires_at: float
+    used: bool = False
+
+    @property
+    def expired(self) -> bool:
+        return time.monotonic() >= self.expires_at
+
+
 class CommitService:
     """保存流程的唯一权威。"""
 
@@ -125,6 +174,7 @@ class CommitService:
         self._binder = binder
         self._preview = preview
         self._tickets: dict[str, CommitTicket] = {}
+        self._confirmations: dict[str, SaveConfirmation] = {}
 
     # -- 准备 -------------------------------------------------------------
     async def prepare(
@@ -136,6 +186,41 @@ class CommitService:
         confirm: bool = False,
         surface_draft: Any = None,
         structure_hash: Any = None,
+        confirmation_id: Any = None,
+    ) -> dict[str, Any]:
+        """准备保存。
+
+        带 ``confirmation_id`` = **第二段**（用户看过路径后点确认）：服务端沿用第一次
+        冻结的备份路径签发令牌，并复核基线 / 草稿 / 模式 / 目标都没变。
+        不带 = **第一段**：创建确认上下文；需要覆盖时只展示路径、不签发令牌。
+        """
+        if confirmation_id is not None and str(confirmation_id).strip():
+            return await self._prepare_confirmed(
+                confirmation_id=str(confirmation_id).strip(),
+                mode=mode,
+                draft=draft,
+                target_path=target_path,
+                surface_draft=surface_draft,
+                structure_hash=structure_hash,
+            )
+        return await self._prepare_first(
+            mode=mode,
+            draft=draft,
+            target_path=target_path,
+            confirm=confirm,
+            surface_draft=surface_draft,
+            structure_hash=structure_hash,
+        )
+
+    async def _prepare_first(
+        self,
+        *,
+        mode: Any,
+        draft: Any,
+        target_path: Any,
+        confirm: bool,
+        surface_draft: Any,
+        structure_hash: Any,
     ) -> dict[str, Any]:
         normalised_mode = self._normalise_mode(mode)
         baseline = self._require_baseline()
@@ -163,6 +248,24 @@ class CommitService:
         #   预计路径，也用于绑进票据。两处各算一次的话，跨过整秒边界就会得到两个名字，
         #   「用户看到的位置」与「实际会写的位置」立刻就对不上了。
         planned_backup = project_ops.backup_path_for(target) if needs_backup else None
+        draft_hash = (
+            draft_fingerprint(coerced)
+            if surface_values is None
+            else draft_fingerprint({"l0": coerced, "surface": surface_values})
+        )
+
+        # 冻结确认上下文：备份路径**就在这一刻定死**，第二次确认只能沿用这一条。
+        confirmation = self._open_confirmation(
+            baseline_id=baseline.baseline_id,
+            draft_hash=draft_hash,
+            mode=normalised_mode,
+            target_path=target,
+            backup_path=planned_backup,
+            needs_backup=needs_backup,
+            warnings=warnings,
+            surface_bound=surface_values is not None,
+            structure_hash=token_structure,
+        )
 
         # 覆盖（含「另存为」落到已存在文件）必须二次确认：第一次调用只把
         # 绝对路径与备份路径摊开给用户看，**不签发令牌**。
@@ -176,16 +279,16 @@ class CommitService:
                     "backup_path": str(planned_backup),
                     "warnings": warnings,
                     "confirm_required": True,
+                    "confirmation_id": confirmation.confirmation_id,
                 },
             )
 
+        # 不需要覆盖（目标不存在）或旧客户端直接 confirm=True：当场签发票据。
+        # 旧客户端不带 confirmation_id，路径就是本次算出的这条 —— 行为与从前一致。
+        confirmation.used = True
         ticket = self._issue(
             baseline_id=baseline.baseline_id,
-            draft_hash=(
-                draft_fingerprint(coerced)
-                if surface_values is None
-                else draft_fingerprint({"l0": coerced, "surface": surface_values})
-            ),
+            draft_hash=draft_hash,
             mode=normalised_mode,
             target_path=target,
             backup_path=planned_backup,
@@ -202,9 +305,191 @@ class CommitService:
                 "surface_parameter_count": len(surface_values or {}),
                 "normalized": notes,
                 "draft_hash": ticket.draft_hash,
+                "confirmation_id": confirmation.confirmation_id,
             }
         )
         return payload
+
+    async def _prepare_confirmed(
+        self,
+        *,
+        confirmation_id: str,
+        mode: Any,
+        draft: Any,
+        target_path: Any,
+        surface_draft: Any,
+        structure_hash: Any,
+    ) -> dict[str, Any]:
+        """第二段：用户看过路径后确认。**沿用第一次冻结的备份路径**签发令牌。"""
+        confirmation = self._load_confirmation(confirmation_id)
+        baseline = self._require_baseline()
+        if not hmac.compare_digest(baseline.baseline_id, confirmation.baseline_id):
+            raise errors.ToonTunerError(
+                errors.BASELINE_STALE,
+                "基线已变化（被刷新或重新采集），确认失效，请重新准备。",
+                details={
+                    "token_baseline_id": confirmation.baseline_id,
+                    "current_baseline_id": baseline.baseline_id,
+                },
+            )
+
+        normalised_mode = self._normalise_mode(mode)
+        coerced = validate_draft(draft, baseline)
+        effective, notes = session_module.normalize_values(
+            {**baseline.values, **coerced}, baseline.look_map
+        )
+
+        surface_plan: list[Any] | None = None
+        surface_values: dict[str, Any] | None = None
+        token_structure: str | None = None
+        if surface_draft is not None or structure_hash is not None:
+            token_structure = self._require_structure_match(structure_hash)
+            surface_plan = self._surface().plan(surface_draft or {})
+            surface_values = param_values(surface_plan)
+        elif confirmation.surface_bound:
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_MISMATCH,
+                "准备阶段绑定了参数面草稿，确认时必须原样带上。请重新准备。",
+            )
+
+        draft_hash = (
+            draft_fingerprint(coerced)
+            if surface_values is None
+            else draft_fingerprint({"l0": coerced, "surface": surface_values})
+        )
+        if not hmac.compare_digest(draft_hash, confirmation.draft_hash):
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_MISMATCH,
+                "草稿与准备阶段不一致（确认冻结了完整草稿，不允许中途改动）。",
+            )
+        if (surface_values is not None) != confirmation.surface_bound:
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_MISMATCH,
+                "参数面草稿的绑定情况与准备阶段不一致。请重新准备。",
+            )
+        if (token_structure or None) != (confirmation.structure_hash or None):
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_MISMATCH,
+                "结构指纹与准备阶段不一致。请刷新基线后重新准备。",
+            )
+        if normalised_mode != confirmation.mode:
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_MISMATCH,
+                f"保存模式与准备阶段不一致：{normalised_mode!r} ≠ {confirmation.mode!r}。",
+            )
+
+        # 目标复核：save_as 允许客户端不传（以冻结值为准）；overwrite 一律现读 Blender。
+        supplied_target = target_path
+        if (
+            supplied_target is None
+            or (isinstance(supplied_target, str) and not supplied_target.strip())
+        ) and normalised_mode == MODE_SAVE_AS:
+            supplied_target = confirmation.target_path
+        target, _warnings, needs_backup = await self._resolve_target(
+            normalised_mode, supplied_target
+        )
+        if str(target) != confirmation.target_path:
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_MISMATCH,
+                "目标路径与准备阶段不一致。",
+                details={"expected": confirmation.target_path, "received": str(target)},
+            )
+        if needs_backup != confirmation.needs_backup:
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_MISMATCH,
+                "确认之后目标文件的存在性已变化（会不会生成备份与确认时不符），请重新确认。",
+                details={
+                    "needs_backup_at_prepare": confirmation.needs_backup,
+                    "needs_backup_now": needs_backup,
+                },
+            )
+
+        confirmation.used = True
+        ticket = self._issue(
+            baseline_id=baseline.baseline_id,
+            draft_hash=confirmation.draft_hash,
+            mode=confirmation.mode,
+            target_path=target,
+            # ★ 沿用第一次展示给用户的那条备份路径，绝不按当前时间重算：
+            #   两步之间哪怕只差 1 秒，重算出来的名字也会与用户确认过的不一致。
+            backup_path=Path(confirmation.backup_path) if confirmation.backup_path else None,
+            warnings=confirmation.warnings,
+            surface_bound=confirmation.surface_bound,
+            structure_hash=confirmation.structure_hash,
+        )
+        payload = dict(ticket.to_public())
+        payload.update(
+            {
+                "ok": True,
+                "baseline_id": baseline.baseline_id,
+                "parameter_count": len(effective),
+                "surface_parameter_count": len(surface_values or {}),
+                "normalized": notes,
+                "draft_hash": ticket.draft_hash,
+                "confirmation_id": confirmation.confirmation_id,
+            }
+        )
+        return payload
+
+    # -- 确认上下文 -------------------------------------------------------
+    def _open_confirmation(
+        self,
+        *,
+        baseline_id: str,
+        draft_hash: str,
+        mode: str,
+        target_path: Path,
+        backup_path: Path | None,
+        needs_backup: bool,
+        warnings: list[str],
+        surface_bound: bool,
+        structure_hash: str | None,
+    ) -> SaveConfirmation:
+        now = time.monotonic()
+        confirmation = SaveConfirmation(
+            confirmation_id=secrets.token_urlsafe(18),
+            baseline_id=baseline_id,
+            draft_hash=draft_hash,
+            mode=mode,
+            target_path=str(target_path),
+            backup_path=str(backup_path) if backup_path is not None else None,
+            needs_backup=needs_backup,
+            warnings=list(warnings),
+            surface_bound=surface_bound,
+            structure_hash=structure_hash,
+            issued_at=now,
+            expires_at=now + CONFIRMATION_TTL_SECONDS,
+        )
+        self._confirmations[confirmation.confirmation_id] = confirmation
+        self._trim_confirmations()
+        return confirmation
+
+    def _load_confirmation(self, confirmation_id: str) -> SaveConfirmation:
+        confirmation = self._confirmations.get(confirmation_id)
+        if confirmation is None:
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_INVALID,
+                "确认上下文不存在（可能已过期，或从未经过第一次准备）。请重新准备一次。",
+            )
+        if confirmation.used:
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_USED,
+                "该确认已使用过，不能重复确认。请重新准备。",
+            )
+        if confirmation.expired:
+            self._confirmations.pop(confirmation_id, None)
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_EXPIRED,
+                "确认已过期（有效期很短）。请重新准备一次并尽快确认。",
+            )
+        return confirmation
+
+    def _trim_confirmations(self) -> None:
+        for key in [k for k, item in self._confirmations.items() if item.expired]:
+            self._confirmations.pop(key, None)
+        while len(self._confirmations) > MAX_PENDING_CONFIRMATIONS:
+            oldest = min(self._confirmations.items(), key=lambda pair: pair[1].issued_at)[0]
+            self._confirmations.pop(oldest, None)
 
     # -- v4 结构绑定 -------------------------------------------------------
     def _surface(self):
@@ -578,7 +863,17 @@ class CommitService:
                 "**恢复到基线后回读不一致或恢复失败**（rollback.code = "
                 f"{rollback.get('code')}）：Blender 里的取值可能仍不是提交前的状态，请人工确认。"
             )
-        return "**未能恢复基线**：Blender 里的取值可能仍不是提交前的状态，请人工确认。"
+        if rollback.get("error") or rollback.get("code"):
+            # 没来得及尝试（例如基线已丢失），但恢复机制本身不可用 —— 这才是真正的
+            # 「未能恢复」，必须明说；与「尚未写入场景，无需恢复」是两回事。
+            return (
+                "**未能恢复基线**（未执行恢复："
+                f"{rollback.get('reason') or rollback.get('code') or '原因未知'}）："
+                "Blender 里的取值可能仍不是提交前的状态，请人工确认。"
+            )
+        # attempted=False 且无 error：草稿还没写进场景，根本不存在「没恢复成」这回事。
+        # 这里绝不能写成「未能恢复基线」——那是一条与事实相反的告警。
+        return "（尚未写入场景，无需恢复。）"
 
     async def _abort(
         self,
@@ -596,6 +891,8 @@ class CommitService:
         返回异常对象而不是直接抛，调用方写 ``raise await self._abort(...)``：
         这样「一定会抛」在调用点可见，也便于把内层错误的 details 合并进来。
         """
+        if scene_touched:
+            rollback = await self._rollback_to_baseline(surface_ops)
         if scene_touched:
             rollback = await self._rollback_to_baseline(surface_ops)
             suffix = self._rollback_suffix(rollback)
@@ -624,7 +921,9 @@ class CommitService:
                     "reason": "尚未写入场景，无需回滚。",
                 },
             }
-            suffix = "（尚未写入场景，无需回滚。）"
+            # 文案一律走 _rollback_suffix：三态判定只有一个出处，
+            # 不在这里另写一句 —— 两处各写一份，迟早会说岔。
+            suffix = self._rollback_suffix(rollback)
 
         status["rollback"] = rollback
         details: dict[str, Any] = {"status": status, "steps": list(steps)}

@@ -214,7 +214,18 @@ def _empty_restore(reason: str | None = None) -> dict[str, Any]:
 
 
 def _restore_suffix(restore: dict[str, Any]) -> str:
-    """把恢复结果说清楚：成功就断言成功，失败就直说没恢复成。"""
+    """把恢复结果说清楚：成功就断言成功，失败就直说没恢复成。
+
+    三态，缺一不可：
+
+    * ``verified`` → 已恢复（有回读校验作依据）；
+    * ``attempted && not verified`` → 尝试过但没能确认恢复成，明说可能仍不是提交前的状态；
+    * ``not attempted`` → 还没写进场景，**不存在「没恢复成」这回事**。
+      早年这里笼统写成「未能恢复基线」，与事实相反，纯属误报。
+
+    例外：``attempted=False`` 却带了 ``error`` / ``code``，说明恢复机制本身不可用
+    （例如基线已丢失）—— 那才是真正的「未能恢复」，必须明说。
+    """
     if restore.get("verified"):
         return "已恢复到提交前的基线（L0 与 Cel 均回读校验通过）。"
     if restore.get("attempted"):
@@ -222,7 +233,13 @@ def _restore_suffix(restore: dict[str, Any]) -> str:
             "**恢复基线后回读不一致或恢复失败**（rollback.code = "
             f"{restore.get('code')}）：Blender 里的取值可能仍不是提交前的状态，请人工确认。"
         )
-    return "**未能恢复基线**：Blender 里的取值可能仍不是提交前的状态，请人工确认。"
+    if restore.get("error") or restore.get("code"):
+        return (
+            "**未能恢复基线**（未执行恢复："
+            f"{restore.get('reason') or restore.get('code') or '原因未知'}）："
+            "Blender 里的取值可能仍不是提交前的状态，请人工确认。"
+        )
+    return "尚未写入场景，无需恢复。"
 
 
 def _surface_error_payload(

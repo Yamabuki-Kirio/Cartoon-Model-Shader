@@ -553,6 +553,7 @@ export function commitPreparedPayload(overrides: Record<string, unknown> = {}) {
     expires_at: "2026-10-09T18:05:00+08:00",
     expires_in_seconds: 300,
     confirmation_required: false,
+    confirmation_id: "cf0000000001",
     ...overrides,
   };
 }

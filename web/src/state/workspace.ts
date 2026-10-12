@@ -1031,6 +1031,11 @@ export function createWorkspace(options: WorkspaceOptions) {
     }
 
     const payload = savePayload(mode, targetPath);
+    // 第二次确认必须带上第一次拿到的确认单号：服务端据此沿用**已展示给用户**的
+    // 备份路径签发令牌（两步之间跨过整秒边界，展示路径也不会与实际生成的对不上），
+    // 并复核基线 / 草稿 / 模式 / 目标都没变。`state` 是本函数开头取的快照，
+    // 下面 patchSave 清空 save.confirm 不影响这里读到的值。
+    const confirmationId = confirm ? state.save.confirm?.confirmationId || null : null;
     patchSave({
       phase: "preparing",
       error: null,
@@ -1045,6 +1050,7 @@ export function createWorkspace(options: WorkspaceOptions) {
         draft: payload.l0,
         target_path: payload.targetPath,
         confirm,
+        confirmation_id: confirmationId,
         surface_draft: payload.surface,
         structure_hash: payload.structureHash,
       });

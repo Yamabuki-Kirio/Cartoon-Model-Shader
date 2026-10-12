@@ -399,7 +399,12 @@ class PresetDeleteResponse(BaseModel):
 
 
 class CommitPrepareRequest(BaseModel):
-    """准备保存：只校验，不写盘。默认「另存为」。"""
+    """准备保存：只校验，不写盘。默认「另存为」。
+
+    ``extra="forbid"``：备份路径等落盘细节**只由服务端**在准备阶段算出并冻结，
+    客户端提交 ``backup_path`` 一律 422 拒绝 —— 用户要确认的必须是服务端真的
+    会写到的那条路径，不能是请求里带来的另一条。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -412,6 +417,10 @@ class CommitPrepareRequest(BaseModel):
     confirm: bool = Field(
         default=False, description="覆盖已有文件必须为 True（先看清绝对路径与备份路径再确认）"
     )
+    #: v4（可选）：第一次 prepare 返回的确认单号。第二次确认**必须**原样携带：
+    #: 服务端据此沿用第一次已展示给用户的备份路径（两步之间跨过整秒边界也不会漂移），
+    #: 并复核基线 / 草稿 / 模式 / 目标都没变。缺失或对不上即拒绝。
+    confirmation_id: str | None = None
     #: v4（可选）：参数面草稿。传了就一并绑进确认令牌，篡改即拒绝。
     surface_draft: dict[str, Any] | None = None
     #: v4（可选）：客户端持有的结构指纹。与基线不一致时在 prepare 阶段就拒绝。
@@ -436,6 +445,9 @@ class CommitPrepareResponse(BaseModel):
     expires_at: str
     expires_in_seconds: int
     confirmation_required: bool = False
+    #: 本次准备的确认单号。确认覆盖时必须随第二次 prepare 回传，服务端据此
+    #: 沿用已展示的备份路径并复核各项未变。不需要确认的流程也会给出（值为当次单号）。
+    confirmation_id: str = ""
 
 
 class CommitRequest(BaseModel):

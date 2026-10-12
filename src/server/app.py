@@ -573,7 +573,9 @@ def create_app(
         """校验基线 / 草稿 / 保存模式 / 目标路径，签发**一次性短效**确认令牌。
 
         覆盖已有文件时**不传 confirm 不签发令牌**，而是回 ``SAVE_CONFIRM_REQUIRED``，
-        其 details 里带着目标绝对路径与预计备份路径 —— 这正是「先看清再确认」那一步。
+        其 details 里带着目标绝对路径、预计备份路径与**确认单号** ——
+        这正是「先看清再确认」那一步。第二次确认必须带回该单号，服务端据此
+        沿用已展示的备份路径（两步之间跨过整秒边界也不会漂移）并复核各项未变。
         """
         return await commit.prepare(
             mode=body.mode,
@@ -582,6 +584,7 @@ def create_app(
             confirm=body.confirm,
             surface_draft=body.surface_draft,
             structure_hash=body.structure_hash,
+            confirmation_id=body.confirmation_id,
         )
 
     @app.post(
