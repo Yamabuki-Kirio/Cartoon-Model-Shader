@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>材质确认</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f1f1f;--mut:#6b6b6b;--line:#e3e3e3;--acc:#2f6feb;--warn:#b45309;--ok:#15803d;--bad:#b91c1c;--card:#fafafa}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.hdr{position:sticky;top:0;background:#fff;border-bottom:1px solid var(--line);padding:12px 20px;display:flex;align-items:center;gap:16px;flex-wrap:wrap;z-index:6}
+.hdr h1{font-size:16px;margin:0;font-weight:600}
+.prog{font-size:13px;color:var(--mut)}
+.prog b{color:var(--fg)}
+.runbar{position:sticky;top:57px;background:#f7f9ff;border-bottom:1px solid var(--line);padding:10px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;z-index:5}
+.chip{font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid var(--line);background:#fff;color:var(--mut);white-space:nowrap}
+.chip.ready{color:var(--acc);border-color:#bcd4fb;background:#f0f5ff}
+.chip.waiting{color:var(--warn);border-color:#f0cfa0;background:#fff8ec}
+.chip.rendering{color:#7c3aed;border-color:#ddd0fb;background:#f7f3ff}
+.chip.success{color:var(--ok);border-color:#b3e0c2;background:#f0fbf4}
+.chip.rejected,.chip.diagnostic{color:var(--warn);border-color:#f0cfa0;background:#fff8ec}
+.chip.failed{color:var(--bad);border-color:#f5c2c2;background:#fdf0f0}
+.steps{display:flex;gap:6px;align-items:center;font-size:12px;color:var(--mut);flex-wrap:wrap}
+.steps i{font-style:normal;padding:2px 8px;border-radius:6px;border:1px dashed var(--line);background:#fff}
+.steps i.on{border-style:solid;border-color:var(--acc);color:var(--acc);font-weight:600}
+.steps i.pass{color:var(--mut);background:#f2f2f2;border-color:#e3e3e3}
+#rmsg{font-size:13px;color:var(--mut)}
+#rmsg.err{color:var(--bad)}
+#rmsg.ok{color:var(--ok)}
+#rbtn{margin-left:auto}
+button.r{font:inherit;padding:8px 18px;border-radius:8px;border:1px solid var(--acc);background:var(--acc);color:#fff;cursor:pointer;font-weight:600}
+button.r:disabled{background:#e7e7e7;border-color:#e7e7e7;color:#9a9a9a;cursor:not-allowed;font-weight:400}
+button.r.sec{background:#fff;color:var(--acc)}
+table.res{border-collapse:collapse;font-size:12px;margin:0 20px 10px;background:#fff;border:1px solid var(--line);border-radius:8px}
+table.res th,table.res td{padding:5px 10px;border-bottom:1px solid #f0f0f0;text-align:left;vertical-align:top}
+table.res th{background:var(--card);color:var(--mut);font-weight:600}
+table.res td.s{font-weight:600}
+table.res td.s.SUCCESS{color:var(--ok)}
+table.res td.s.FAILED{color:var(--bad)}
+table.res td.s.REJECTED,table.res td.s.DIAGNOSTIC{color:var(--warn)}
+.wrap{max-width:1180px;margin:0 auto;padding:20px}
+.grp{font-size:15px;font-weight:600;margin:26px 0 10px;padding-bottom:6px;border-bottom:2px solid var(--line)}
+.grp .prog{font-weight:400;font-size:13px;color:var(--mut);margin-left:8px}
+.card{border:1px solid var(--line);border-radius:10px;margin-bottom:22px;overflow:hidden;background:#fff}
+.card.done{opacity:.55}
+.card.busy{outline:2px solid var(--acc)}
+.chead{padding:12px 16px;background:var(--card);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.chead h2{margin:0;font-size:15px;font-weight:600}
+.badge{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--mut)}
+.badge.SUGGESTED{color:var(--warn);border-color:#f0cfa0;background:#fff8ec}
+.badge.UNRESOLVED{color:#a12a2a;border-color:#f0b4b4;background:#fdf0f0}
+.badge.AUTO{color:var(--ok);border-color:#b3e0c2;background:#f0fbf4}
+.badge.MODEL_MAP{color:var(--acc);border-color:#bcd4fb;background:#f0f5ff}
+.imgs{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line)}
+figure{margin:0;background:#fff}
+figure img{width:100%;display:block;background:#fff;cursor:zoom-in}
+figcaption{font-size:12px;color:var(--mut);padding:6px 10px;border-top:1px solid var(--line)}
+.meta{padding:12px 16px}
+.meta table{border-collapse:collapse;width:100%;font-size:13px}
+.meta td{padding:3px 8px 3px 0;vertical-align:top;border-bottom:1px solid #f2f2f2}
+.meta td:first-child{color:var(--mut);width:130px;white-space:nowrap}
+.reasons{margin:10px 0 0;padding-left:18px;font-size:13px;color:#333}
+.reasons li{margin:2px 0}
+.btns{padding:12px 16px;border-top:1px solid var(--line);display:flex;flex-wrap:wrap;gap:8px;background:#fff}
+button{font:inherit;padding:7px 13px;border:1px solid var(--line);border-radius:8px;background:#fff;cursor:pointer}
+button:hover{border-color:#bbb;background:#f7f7f7}
+button.sel{background:var(--acc);color:#fff;border-color:var(--acc)}
+.doneTip{margin-left:auto;color:var(--ok);font-size:13px;align-self:center}
+.foot{max-width:1180px;margin:0 auto;padding:0 20px 60px;color:var(--mut);font-size:13px}
+.zoom{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;z-index:20}
+.zoom img{max-width:96vw;max-height:96vh}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <h1 id="title">材质确认</h1>
+  <span class="prog">已确认 <b id="done">0</b> / <b id="total">0</b></span>
+  <span class="prog" id="hint" style="margin-left:auto"></span>
+</div>
+
+<div class="runbar">
+  <span class="chip" id="rstate">…</span>
+  <span class="steps" id="rsteps"></span>
+  <span id="rmsg"></span>
+  <button class="r" id="rbtn" disabled>…</button>
+</div>
+<div id="reswrap"></div>
+
+<div class="wrap" id="cards"></div>
+<div class="foot" id="foot"></div>
+<div class="zoom" id="zoom"><img id="zoomimg" alt=""></div>
+<script>
+let S=null, SID=null, answered={}, totalItems=0;
+let busy=false, polling=false, last=null, timer=null;
+
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+async function jget(u){const r=await fetch(u,{cache:'no-store'});return r.json();}
+async function jpost(u,b){
+  const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+  let j={}; try{j=await r.json();}catch(e){}
+  return {code:r.status, body:j};
+}
+
+/* ------------------------------------------------------------------ 卡片 */
+function badges(it){
+  const st=it.stage, cls=(st==='AUTO_CONFIRMED')?'AUTO':st;
+  return `<span class="badge ${cls}">${st}</span>`;
+}
+function card(it){
+  const ev=it.evidence||{}, m=it.material;
+  const imgs=[
+    ['mask_only','① 仅目标材质（遮罩）'],
+    ['overview_highlighted','② 整体 · 目标高亮（其余透视）'],
+    ['proposed_group','③ 推荐分类效果']
+  ].map(([k,cap])=>`<figure><img src="${it.previews[k]}" loading="lazy" alt="${esc(m)} ${cap}"><figcaption>${cap}</figcaption></figure>`).join('');
+  const rules=(it.structure_rules||[]).length?('　结构规则：'+it.structure_rules.join('、')):'';
+  const reasons=(it.reasons||[]).map(r=>`<li>${esc(r)}</li>`).join('');
+  const btns=(it.choices||[]).map(c=>
+     `<button data-m="${esc(m)}" data-fp="${esc(it.model_fingerprint||'')}" data-c="${esc(c.class)}">${esc(c.label)}</button>`).join('');
+  const doneMark = it.confirmed ? `<span class="badge AUTO">已确认：${esc(it.confirmed_group||'')}</span>` : '';
+  return `<div class="card${it.confirmed?' done':''}" id="c${esc(it.model_fingerprint)}_${it.index}" data-idx="${it.index}">
+    <div class="chead"><h2>${esc(m)}</h2>${badges(it)}
+      <span class="badge">推荐：${esc(it.proposed_class||'—')}</span>${rules}
+      <span class="badge">序号 ${it.index}</span>${doneMark}</div>
+    <div class="imgs">${imgs}</div>
+    <div class="meta">
+      <h3 style="font-size:13px;margin:2px 0 8px">推荐分类与「为什么只是建议」</h3>
+      <ul class="reasons">${reasons}</ul>
+      <table>
+        <tr><td>原材质名</td><td><code>${esc(m)}</code></td></tr>
+        <tr><td>主要骨骼</td><td>${esc((ev.top_bones||[]).join('、')||'—')}　<small>骨骼高度 ${esc(ev.bone_y_center)}</small></td></tr>
+        <tr><td>贴图</td><td><code>${esc(ev.texture||'—')}</code></td></tr>
+        <tr><td>morph 行为</td><td>顶点驱动率 ${esc(ev.morph_vertex_ratio)}；最大位移 ${esc(ev.morph_max_displacement)}× 对角线；material morph 引用 ${esc((ev.material_morph_refs||[]).length)} 处</td></tr>
+        <tr><td>规模</td><td>${esc(ev.triangles)} 三角面；alpha ${esc(ev.alpha)}；双面 ${ev.double_sided?'是':'否'}</td></tr>
+      </table>
+    </div>
+    <div class="btns">${btns}<span class="doneTip"></span></div>
+  </div>`;
+}
+
+/* ------------------------------------------------------------------ 顶部流程条 */
+const STEP_KEYS=['waiting','ready','rendering','done'];
+function stepsHTML(st){
+  const idx = st.state==='waiting'?0 : st.state==='ready'?1 : st.state==='rendering'?2 : 3;
+  const names=['等待确认','可渲染','渲染中', st.state==='success'?'成品 SUCCESS'
+        : st.state==='rejected'?'REJECTED'
+        : st.state==='diagnostic'?'DIAGNOSTIC'
+        : st.state==='failed'?'FAILED':'终态'];
+  return names.map((n,i)=>{
+    let cls = i===idx ? 'on' : (i<idx ? 'pass' : '');
+    return `<i class="${cls}">${esc(n)}</i>`;
+  }).join('<span>→</span>');
+}
+
+function resultsHTML(st){
+  const rs=st.results||[];
+  if(!rs.length) return '';
+  return `<table class="res"><tr><th>模型</th><th>终态</th><th>输出目录</th></tr>`+
+    rs.map(r=>`<tr><td>${esc(r.label||'')}</td>
+      <td class="s ${esc(r.outcome||'')}">${esc(r.outcome||'')}${r.outcome==='SUCCESS'?' ✓':''}</td>
+      <td><code>${esc(r.out_dir||'')}</code></td></tr>`).join('')+`</table>`;
+}
+
+function paint(st){
+  last=st;
+  document.getElementById('rstate').textContent=st.state_label||st.state;
+  document.getElementById('rstate').className='chip '+(st.state||'');
+  document.getElementById('rsteps').innerHTML=stepsHTML(st);
+  document.getElementById('reswrap').innerHTML=
+    (st.self_test?'<div id="rmsg" style="padding:6px 20px;color:#b45309">自检模式：不启动 Blender，结果恒为 FAILED（用于验证流程状态机）</div>':'')
+    + resultsHTML(st);
+
+  const msg=document.getElementById('rmsg'), btn=document.getElementById('rbtn');
+  msg.className='';
+  let label='', disabled=true, action='render', retry=false;
+
+  if(st.state==='waiting'){
+    label='还需确认 '+st.pending+' 项'; disabled=true;
+    msg.textContent = st.auto_render
+      ? '确认完全部项目后会自动继续渲染'
+      : '确认完全部项目后即可开始渲染';
+  }else if(st.state==='ready'){
+    if(st.auto_render){ label='正在继续渲染…'; disabled=true; msg.textContent='已全部确认，服务端正在启动渲染'; }
+    else { label='开始渲染'; disabled=false; msg.textContent='全部已确认'; }
+  }else if(st.state==='rendering'){
+    label='渲染中…'; disabled=true;
+    msg.textContent='第 '+st.attempt+' 次尝试，已开始 '+esc(st.started_at||'');
+    msg.className='';
+  }else if(st.state==='success'){
+    label='打开输出目录'; disabled=false; action='open';
+    msg.textContent='成品完成 ✓　（SUCCESS）'; msg.className='ok';
+  }else{
+    label='重试渲染'; disabled=false; action='render'; retry=true;
+    msg.textContent='终态 '+(st.outcome||'')+'：'+(st.error||'')+
+      '　—— 确认结果已保留，重试不需要重新标注';
+    msg.className='err';
+  }
+  // 通道未就绪时提前预警（渲染唯一通路是常驻 Blender 的 9876）
+  if(st.blender_channel===false && (st.state==='waiting'||st.state==='ready')){
+    msg.textContent='⚠ 常驻 Blender 通道（127.0.0.1:9876）未就绪 —— 现在点渲染会失败。请先在 Blender 里开启 MCP 监听。';
+    msg.className='err';
+  }
+  // 渲染中/忙时，绝不允许再点
+  btn.textContent=label;
+  btn.dataset.action=action;
+  btn.dataset.retry=retry?'1':'0';
+  btn.disabled = disabled || busy;
+}
+
+async function refreshStatus(){
+  if(!SID) return;
+  try{ paint(await jget('/api/session/'+SID+'/status')); }catch(e){}
+}
+
+/* ------------------------------------------------------------------ 交互 */
+function bindCards(){
+  document.querySelectorAll('.btns button').forEach(b=>{
+    b.addEventListener('click', async ()=>{
+      if(busy) return;
+      const m=b.dataset.m, c=b.dataset.c, fp=b.dataset.fp;
+      const cardEl=b.closest('.card');
+      cardEl.querySelectorAll('button').forEach(x=>x.classList.remove('sel'));
+      b.classList.add('sel'); cardEl.classList.add('busy');
+      try{
+        const {body}=await jpost('/api/answer',{model_fingerprint:fp,material:m,class:c});
+        if(!body.ok) throw new Error(body.error||'写回失败');
+        cardEl.classList.add('done'); cardEl.classList.remove('busy');
+        cardEl.querySelector('.doneTip').textContent='已保存 · '+body.saved_to;
+        answered[fp+'/'+m]=c; refreshCount();
+        if(body.render) paint(body.render);
+        if(body.auto_start && body.auto_start.started){
+          document.getElementById('rmsg').textContent='全部确认完成 —— 已自动开始渲染';
+        }
+        setTimeout(refreshStatus,400);
+      }catch(e){
+        cardEl.classList.remove('busy');
+        alert('保存失败：'+e.message);
+      }
+    });
+  });
+  document.querySelectorAll('figure img').forEach(img=>{
+    img.addEventListener('click',()=>{
+      document.getElementById('zoomimg').src=img.src;
+      document.getElementById('zoom').style.display='flex';
+    });
+  });
+  document.getElementById('zoom').addEventListener('click',()=>{
+    document.getElementById('zoom').style.display='none';
+  });
+}
+
+function refreshCount(){
+  const d=Object.keys(answered).length;
+  document.getElementById('done').textContent=d;
+  document.getElementById('hint').textContent = (d>=totalItems)
+    ? '全部已确认' : `还需确认 ${totalItems-d} 项`;
+}
+
+document.getElementById('rbtn').addEventListener('click', async ()=>{
+  if(busy) return;                       // ② 立即锁定，双击/重复请求都被挡住
+  const btn=document.getElementById('rbtn');
+  const action=btn.dataset.action, retry=btn.dataset.retry==='1';
+  busy=true; btn.disabled=true;
+  const keep=btn.textContent;
+  try{
+    if(action==='open'){
+      btn.textContent='正在打开…';
+      const {body}=await jpost('/api/session/'+SID+'/open-output',{});
+      if(!body.ok) throw new Error(body.error||'打开失败');
+      if(body.opened===false){
+        alert('系统未能自动打开，请手动打开：\n'+body.path);
+      }
+      btn.textContent='打开输出目录';
+    }else{
+      btn.textContent='已提交，等待渲染…';
+      const {code,body}=await jpost('/api/session/'+SID+'/render',{retry:retry});
+      if(code!==200){ throw new Error(body.error||('HTTP '+code)); }
+      if(body.started===false && body.already===true){
+        // 重复请求：服务端返回的是同一个任务，不新起进程
+        document.getElementById('rmsg').textContent=
+          '该任务已在处理中（'+body.reason+'），未重复启动';
+      }
+      paint(body);
+    }
+  }catch(e){
+    btn.textContent=keep;
+    const m=document.getElementById('rmsg'); m.className='err'; m.textContent='操作失败：'+e.message;
+  }finally{
+    busy=false;
+    refreshStatus();
+  }
+});
+
+/* ------------------------------------------------------------------ 启动 */
+(async function(){
+  const r=await jget('/api/session'); S=r; SID=r.session_id;
+  const models=S.models||[];
+  totalItems=models.reduce((a,mo)=>a+mo.items.length,0);
+  models.forEach(mo=>mo.items.forEach(i=>{ if(i.confirmed) answered[mo.fingerprint+'/'+i.material]=i.confirmed_group; }));
+  document.getElementById('title').textContent='材质确认 · '+models.length+' 个模型';
+  let html='';
+  models.forEach(mo=>{
+    html += `<h2 class="grp">${esc(mo.file)}　<span class="prog">${mo.items.filter(i=>!i.confirmed).length} 项待确认</span></h2>`;
+    html += mo.items.map(card).join('');
+  });
+  document.getElementById('cards').innerHTML=html;
+  document.getElementById('foot').textContent=
+    '确认即写入模型侧车映射（按 PMX 文件指纹命名），下次同一模型不再询问。本次共 '+totalItems+' 项。'
+    +'　渲染任务由服务端统一持有：页面上的按钮与「确认后自动续跑」走同一条通道，永远只会有一个渲染在跑。';
+  document.getElementById('total').textContent=totalItems;
+  refreshCount(); bindCards();
+  if(r.render) paint(r.render);
+
+  // 轮询状态。刷新页面只会重新 GET，不会重新触发渲染。
+  timer=setInterval(async ()=>{
+    if(polling||busy) return;
+    polling=true;
+    try{ await refreshStatus(); }catch(e){}finally{ polling=false; }
+  }, 2000);
+})();
+</script>
+</body>
+</html>

@@ -13,7 +13,7 @@ from typing import Any
 
 from . import errors
 from .blender_mcp import BlenderMCPClient
-from .redact import redact
+from .redact import display_path, redact
 
 PROBE_MARKER = "__TOON_TUNER_SCENE_PROBE__"
 PROBE_SCHEMA = "toon-tuner-scene-probe/1"
@@ -168,7 +168,9 @@ def normalize_probe(payload: dict[str, Any]) -> dict[str, Any]:
         "blender": {
             "version": _as_str(blender_raw.get("version"), "unknown"),
             "file_name": _basename(file_path),
-            "file_path": file_path,
+            # ★ O4：对外只给逻辑路径（`%LOCALAPPDATA%\…` / 纯文件名）。
+            #   服务端不需要这个绝对路径做任何判定 —— 它纯粹是给人看的。
+            "file_path": display_path(file_path),
             "is_saved": bool(blender_raw.get("is_saved")),
         },
         "scene": {

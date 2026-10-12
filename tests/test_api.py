@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -10,9 +12,12 @@ from src.server.app import create_app
 from src.server.config import AppConfig, BlenderMCPConfig, ServerConfig
 from src.server.scene_probe import PROBE_SCHEMA
 from tests.fake_mcp_server import FAKE_PROBE_PAYLOAD, FakeMCPServer, find_free_port
+from tests.support import TOKEN_HEADER, authed, unauthed, write_fake_dist
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def make_config(port: int, *, response_timeout: float = 0.6) -> AppConfig:
+def make_config(port: int, *, response_timeout: float = 0.6, web_dir: Path | None = None) -> AppConfig:
     return AppConfig(
         blender_mcp=BlenderMCPConfig(
             host="127.0.0.1",
@@ -21,11 +26,13 @@ def make_config(port: int, *, response_timeout: float = 0.6) -> AppConfig:
             response_timeout_seconds=response_timeout,
         ),
         server=ServerConfig(host="127.0.0.1", port=8765),
+        web_dir=web_dir,
     )
 
 
 def make_client(port: int, *, response_timeout: float = 0.6) -> TestClient:
-    return TestClient(create_app(make_config(port, response_timeout=response_timeout)))
+    """带会话令牌的客户端。写接口一律需要 ``X-Toon-Tuner-Token``。"""
+    return authed(create_app(make_config(port, response_timeout=response_timeout)))
 
 
 # -- 基础 ---------------------------------------------------------------
@@ -37,11 +44,22 @@ def test_health() -> None:
     assert body == {"ok": True, "service": "toon-tuner", "version": "0.1.0"}
 
 
-def test_index_serves_html() -> None:
+def test_index_serves_html(tmp_path: Path) -> None:
+    """首页给出工作台页面（200 + HTML）。
+
+    dist 用 `write_fake_dist` 伪造而不是读仓库里的 `web/dist`：CI 的 Python job
+    不跑 npm（见 `.github/workflows/test.yml` 的边界约定），读真实产物会让这个
+    用例在那里稳定 503。页面内容 / 令牌注入 / 缓存头等细节由
+    `test_frontend_hosting.py` 用同一机制守，这里只做基础可达性冒烟。
+    """
+    web_dir = tmp_path / "web"
+    write_fake_dist(web_dir)
     with FakeMCPServer("ok") as server:
-        response = make_client(server.port).get("/")
+        client = authed(create_app(make_config(server.port, web_dir=web_dir)))
+        response = client.get("/")
     assert response.status_code == 200
-    assert "Cartoon-Model-Shader" in response.text
+    assert response.headers["content-type"].startswith("text/html")
+    assert 'id="app"' in response.text
 
 
 @pytest.mark.parametrize("path", ["/execute", "/eval", "/api/execute", "/api/blender/execute"])
@@ -148,3 +166,66 @@ def test_error_envelope_shape_is_stable() -> None:
     assert set(body.keys()) == {"ok", "error"}
     assert set(body["error"].keys()) >= {"code", "message", "retryable", "hint"}
     assert body["ok"] is False
+
+
+# -- 会话令牌 -----------------------------------------------------------
+def test_write_endpoints_reject_missing_token() -> None:
+    """没有令牌的写请求一律 401，且不得产生任何副作用。"""
+    with FakeMCPServer("ok") as server:
+        app = create_app(make_config(server.port))
+        response = unauthed(app).post("/api/blender/reconnect")
+        assert response.status_code == 401
+        body = response.json()
+        assert body["ok"] is False
+        assert body["error"]["code"] == errors.SESSION_TOKEN_INVALID
+        assert body["error"]["details"]["reason"] == "missing"
+
+
+def test_write_endpoints_reject_wrong_token() -> None:
+    with FakeMCPServer("ok") as server:
+        app = create_app(make_config(server.port))
+        client = unauthed(app)
+        response = client.post(
+            "/api/blender/reconnect", headers={TOKEN_HEADER: "not-the-real-token"}
+        )
+        assert response.status_code == 401
+        body = response.json()
+        assert body["error"]["code"] == errors.SESSION_TOKEN_INVALID
+        assert body["error"]["details"]["reason"] == "mismatch"
+        # 错误信息里绝不能回显令牌内容
+        assert "not-the-real-token" not in response.text
+
+
+def test_read_endpoints_do_not_require_token() -> None:
+    """只读接口不需要令牌，否则用户直接打开页面就什么都看不到。"""
+    with FakeMCPServer("ok") as server:
+        client = unauthed(create_app(make_config(server.port)))
+        assert client.get("/api/health").status_code == 200
+        assert client.get("/api/blender/status").status_code == 200
+
+
+def test_index_injects_token_without_touching_static_file(tmp_path: Path) -> None:
+    """令牌只在响应里注入；磁盘上的源模板与构建产物里都不得出现令牌。
+
+    用临时 `web/dist` 而不是仓库里那份：**pytest 不依赖 Node**，CI 的 Python job
+    里根本没有 `dist/`（未构建的诊断由 `test_frontend_hosting.py` 覆盖）。
+    """
+    web_dir = tmp_path / "web"
+    write_fake_dist(web_dir)
+    with FakeMCPServer("ok") as server:
+        app = create_app(make_config(server.port, web_dir=web_dir))
+        token = app.state.session_token
+        html = unauthed(app).get("/").text
+        assert token in html
+        assert "window.__TOON_TUNER_TOKEN__" in html
+
+        # 源模板（Vite 的 web/index.html）：只有占位注释
+        source = (REPO_ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        assert token not in source
+        assert "<!--TOON_TUNER_TOKEN-->" in source
+        assert "window.__TOON_TUNER_TOKEN__ = " not in source
+
+        # 构建产物：同样只有占位注释
+        built = (web_dir / "dist" / "index.html").read_text(encoding="utf-8")
+        assert token not in built
+        assert "<!--TOON_TUNER_TOKEN-->" in built

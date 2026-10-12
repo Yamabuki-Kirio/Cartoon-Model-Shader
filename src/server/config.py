@@ -54,6 +54,13 @@ class ServerConfig:
 class AppConfig:
     blender_mcp: BlenderMCPConfig
     server: ServerConfig
+    #: 预设落盘目录。``None`` 表示用默认位置（``%LOCALAPPDATA%\CartoonModelShader\presets``，
+    #: 与环境变量 ``TOON_TUNER_PRESET_DIR`` 的优先级见 ``presets.presets_dir()``）。
+    #: 这个值**只影响服务端自己**：接口层从不接受任何路径参数，客户端无法指定目录。
+    presets_dir: Path | None = None
+    #: v4 前端构建产物目录（``web`` 的上一级 + ``dist``）。
+    #: ``None`` 表示用默认位置（``<仓库根>/web``）。同样只影响服务端自己。
+    web_dir: Path | None = None
 
 
 def _read_json(path: Path) -> dict:
@@ -109,8 +116,19 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
 
     mcp_raw = merged.get("blender_mcp", {}) or {}
     server_raw = merged.get("server", {}) or {}
+    presets_raw = merged.get("presets", {}) or {}
+    web_raw = merged.get("web", {}) or {}
     if not isinstance(mcp_raw, dict) or not isinstance(server_raw, dict):
         raise ConfigError("配置文件的 blender_mcp / server 必须是对象")
+    if not isinstance(presets_raw, dict):
+        raise ConfigError("配置文件的 presets 必须是对象")
+    if not isinstance(web_raw, dict):
+        raise ConfigError("配置文件的 web 必须是对象")
+
+    raw_presets_dir = _env("PRESETS_DIR") or presets_raw.get("dir")
+    presets_dir = Path(str(raw_presets_dir)).expanduser() if raw_presets_dir else None
+    raw_web_dir = _env("WEB_DIR") or web_raw.get("dir")
+    web_dir = Path(str(raw_web_dir)).expanduser() if raw_web_dir else None
 
     mcp = BlenderMCPConfig(
         host=str(_env("MCP_HOST") or mcp_raw.get("host", MCP_DEFAULT_HOST)),
@@ -133,4 +151,6 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
 
     _validate_loopback(mcp.host, "blender_mcp.host")
     _validate_loopback(server.host, "server.host")
-    return AppConfig(blender_mcp=mcp, server=server)
+    return AppConfig(
+        blender_mcp=mcp, server=server, presets_dir=presets_dir, web_dir=web_dir
+    )

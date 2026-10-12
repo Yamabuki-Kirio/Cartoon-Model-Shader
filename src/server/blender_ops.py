@@ -76,6 +76,50 @@ def _stage_of(binding: str) -> str:
 # -- 只读 ---------------------------------------------------------------
 
 
+def _glare_locator_lines() -> list[str]:
+    """生成「按类型定位辉光节点」的代码（缺陷 F3）。
+
+    为什么不能只按名字找
+    --------------------
+    ``一键卡通渲染.py::setup_compositor`` 里是
+    ``tree.nodes.clear()`` 之后 ``nodes.new("CompositorNodeGlare")``，
+    **从不改名**。于是真实工程的节点名是 Blender 的**本地化默认名**：
+    中文 UI 叫「眩光」、英文 UI 叫「Glare」。旧实现写死
+    ``nodes.get("Autocel_Glow")``，在真实工程里永远取不到 → 6 项辉光参数
+    全部报「合成器节点组缺少 Autocel_Glow」。那个名字只存在于本工具自己的
+    测试桩里，所以这个缺陷长期没被真实 Blender 暴露出来。
+
+    取法：**名字优先、类型回退**。名字优先是为了兼容既有的、
+    已经显式命名过的工程；类型回退（``bl_idname``）才是在真实工程里生效的那条，
+    而且 ``bl_idname`` 跨 UI 语言稳定。
+
+    生成后会在调用方作用域里留下 ``glare``（可能是 ``None``）。
+    """
+    return [
+        "def _find_glare_node():",
+        "    if ng is None:",
+        "        return None",
+        f"    node = ng.nodes.get({params.GLARE_NODE_NAME!r})",
+        "    if node is not None:",
+        "        return node",
+        "    for _n in ng.nodes:",
+        f"        if getattr(_n, 'bl_idname', '') == {params.GLARE_NODE_TYPE!r}:",
+        "            return _n",
+        "    return None",
+        "",
+        "",
+        "glare = _find_glare_node()",
+    ]
+
+
+def _glare_missing_message() -> str:
+    """缺辉光节点时的可读说明 —— 同时点出类型与期望名称，便于排查。"""
+    return (
+        f"合成器节点组缺少辉光节点（{params.GLARE_NODE_TYPE}；"
+        f"期望名称 {params.GLARE_NODE_NAME}）"
+    )
+
+
 def build_read_code() -> str:
     """读取曝光/辉光现值 + ``view_transform`` 候选 + 渲染设置。
 
@@ -84,13 +128,14 @@ def build_read_code() -> str:
     正是旧实现报 ``BLENDER_SCRIPT_ERROR`` 的根因。look 候选一律改由
     ``color_looks`` 的按视图探测提供。
     """
+    locator = "\n".join(_glare_locator_lines())
     return f"""
 import bpy, json
 
 scene = bpy.context.scene
 vs = scene.view_settings
 ng = bpy.data.node_groups.get({params.COMPOSITOR_GROUP_NAME!r})
-glare = ng.nodes.get({params.GLARE_NODE_NAME!r}) if ng is not None else None
+{locator}
 
 
 def _ocio_views():
@@ -224,13 +269,13 @@ def build_set_code(values: dict[str, Any]) -> str:
         "scene = bpy.context.scene",
         "vs = scene.view_settings",
         f"ng = bpy.data.node_groups.get({params.COMPOSITOR_GROUP_NAME!r})",
-        f"glare = ng.nodes.get({params.GLARE_NODE_NAME!r}) if ng is not None else None",
+        *_glare_locator_lines(),
         "",
         color_looks.LOOK_HELPERS,
         "",
         "def _glare_set(name, value):",
         "    if glare is None:",
-        f"        raise RuntimeError('合成器节点组缺少 {params.GLARE_NODE_NAME}（辉光节点）')",
+        f"        raise RuntimeError({_glare_missing_message()!r})",
         "    socket = glare.inputs.get(name)",
         "    if socket is None:",
         "        raise RuntimeError('辉光节点缺少插座：' + str(name))",

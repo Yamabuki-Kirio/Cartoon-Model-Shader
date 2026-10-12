@@ -1,0 +1,370 @@
+import { cleanup, fireEvent, render } from "@testing-library/preact";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { App } from "./App";
+import { AppError } from "../api/types";
+import { makeTestWorkspace, settle, settleTimers } from "../testing/endpoints";
+import { groupNode, jobPayload, materialNode, schemaPayload } from "../testing/fixtures";
+import type { JobState } from "../api/types";
+
+afterEach(cleanup);
+
+async function setup(overrides: Record<string, unknown> = {}) {
+  const { workspace, endpoints } = makeTestWorkspace(overrides);
+  await workspace.actions.bootstrap();
+  return { workspace, endpoints };
+}
+
+describe("工作台整体", () => {
+  it("渲染顶部状态栏 / 三栏 / 底部操作栏", async () => {
+    const { workspace } = await setup();
+    const { getByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    expect(getByTestId("status-bar")).toBeTruthy();
+    expect(getByTestId("nav-panel")).toBeTruthy();
+    expect(getByTestId("preview-pane")).toBeTruthy();
+    expect(getByTestId("inspector")).toBeTruthy();
+    expect(getByTestId("action-bar")).toBeTruthy();
+  });
+
+  it("状态栏显示连接、基线、结构与草稿数量", async () => {
+    const { workspace } = await setup();
+    const { getByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    expect(getByTestId("status-blender").textContent).toContain("已连接");
+    expect(getByTestId("status-baseline").textContent).toContain("bl0000000001");
+    expect(getByTestId("status-structure").textContent).toContain("ffffffff");
+    expect(getByTestId("status-dirty").textContent).toContain("0 项已改");
+  });
+
+  it("导航列出 Cel 分组，不生成伪控件", async () => {
+    const { workspace } = await setup();
+    const { getByTestId, queryByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    expect(getByTestId("nav-cel.Cel_Skin")).toBeTruthy();
+    expect(getByTestId("nav-cel.Cel_Hair")).toBeTruthy();
+    expect(getByTestId("nav-cel.Sakura_Hair_Reference")).toBeTruthy();
+    // 未接入的参数族不该出现
+    expect(queryByTestId("nav-cel.照明")).toBeNull();
+  });
+
+  it("选中材质分组时检查器切到逐材质编辑器，选中 Cel 分组时切回 Cel 编辑器", async () => {
+    const { workspace } = await setup({
+      surfaceSchema: async () =>
+        schemaPayload({
+          groups: [
+            // 默认 children 带一条色带，Cel 编辑器才会真的渲染出来
+            groupNode("Cel_Skin"),
+            materialNode({ material: "皮肤_脸", users: ["model_mesh"] }),
+          ],
+        }),
+    });
+    const { getByTestId, queryByTestId } = render(
+      <App workspace={workspace} autoBootstrap={false} />
+    );
+
+    // 默认选中第一个可用分组（Cel）
+    expect(getByTestId("cel-editor-cel.Cel_Skin")).toBeTruthy();
+    expect(queryByTestId("material-editor-皮肤_脸")).toBeNull();
+
+    // 点导航里的材质条目 → 切到逐材质编辑器
+    fireEvent.click(getByTestId("nav-material.皮肤_脸"));
+    await settle(2);
+    expect(getByTestId("material-editor-皮肤_脸")).toBeTruthy();
+    expect(queryByTestId("cel-editor-cel.Cel_Skin")).toBeNull();
+
+    // 切回 Cel 分组
+    fireEvent.click(getByTestId("nav-cel.Cel_Skin"));
+    await settle(2);
+    expect(getByTestId("cel-editor-cel.Cel_Skin")).toBeTruthy();
+    expect(queryByTestId("material-editor-皮肤_脸")).toBeNull();
+  });
+
+  it("导航的「仅已修改」筛选生效", async () => {
+    const { workspace } = await setup();
+    const { getByText, getByTestId, queryByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    fireEvent.click(getByText("仅已修改"));
+    expect(queryByTestId("nav-cel.Cel_Skin")).toBeNull();
+
+    workspace.actions.setValue("cel.Cel_Skin.ramp", { elements: [], interpolation: "EASE" });
+    await settle(2);
+    expect(getByTestId("nav-cel.Cel_Skin")).toBeTruthy();
+  });
+
+  it("结构失效时禁用「应用并预览」并显示横幅", async () => {
+    const { workspace } = await setup();
+    const { getByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    workspace.actions.applyStructureFatal({ code: "STRUCTURE_CHANGED", message: "结构变了", retryable: true });
+    await settle(2);
+    expect(getByTestId("banner-structure")).toBeTruthy();
+    expect((getByTestId("action-apply-preview") as HTMLButtonElement).disabled).toBe(true);
+    expect(getByTestId("status-structure").textContent).toContain("已失效");
+  });
+
+  it("「保存完整预设」「应用到工程」打开面板但不自行发请求；「正式渲染」仍占位", async () => {
+    const { workspace, endpoints } = await setup();
+    const { getByTestId, queryByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+
+    // 点按钮只**打开面板**：不该顺手渲染，也不该顺手签发令牌。
+    fireEvent.click(getByTestId("action-open-presets"));
+    fireEvent.click(getByTestId("action-open-save"));
+    await settle(2);
+    expect(getByTestId("preset-panel")).toBeTruthy();
+    expect(getByTestId("save-dialog")).toBeTruthy();
+    expect(endpoints.submitPreview).not.toHaveBeenCalled();
+    expect(endpoints.commitPrepare).not.toHaveBeenCalled();
+
+    // 打开预设面板会拉一次列表（读接口，不带令牌），这是它唯一主动做的事。
+    expect(endpoints.listPresets).toHaveBeenCalledTimes(1);
+
+    // 尚未开放的按钮必须**禁用**，而不是发一个必然 422 的请求。
+    expect((getByTestId("action-final-render") as HTMLButtonElement).disabled).toBe(true);
+    expect(queryByTestId("action-final-render")?.getAttribute("title")).toContain("后续提交开放");
+  });
+
+  it("预览图 URL 带防缓存参数", async () => {
+    const { workspace } = await setup();
+    const { container } = render(<App workspace={workspace} autoBootstrap={false} />);
+    await workspace.actions.applyAndPreview();
+    await settle();
+    const image = container.querySelector("img.preview-image") as HTMLImageElement;
+    expect(image.src).toContain("v=job0000000000001");
+  });
+
+  it("图片加载失败显示错误但不清空画面（保留最后成功预览）", async () => {
+    const { workspace } = await setup();
+    const { container, getByTestId, queryByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    await workspace.actions.applyAndPreview();
+    await settle();
+    const image = container.querySelector("img.preview-image") as HTMLImageElement;
+    expect(image).toBeTruthy();
+
+    fireEvent.error(image);
+    await settle(2);
+    expect(getByTestId("preview-image-error")).toBeTruthy();
+    // 画面仍在（同一张 URL 还挂着）
+    expect((container.querySelector("img.preview-image") as HTMLImageElement).src).toContain(
+      "v=job0000000000001"
+    );
+    expect(queryByTestId("preview-job-status")?.textContent).toContain("done");
+  });
+
+  it("失败任务：横幅显示错误，画面保留", async () => {
+    const failing = jobPayload({
+      status: "failed",
+      result: null,
+      error: {
+        code: "SURFACE_APPLY_FAILED",
+        message: "参数写入失败（本次写入已被回滚）。",
+        retryable: true,
+        hint: "确认对象仍然存在",
+        details: { restore: { attempted: true, verified: true } },
+      },
+    }) as unknown as JobState;
+    let mode: "ok" | "fail" = "ok";
+    const { workspace } = await setup({
+      job: vi.fn(async () => (mode === "ok" ? (jobPayload() as unknown as JobState) : failing)),
+    });
+    const { container, getByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    await workspace.actions.applyAndPreview();
+    await settle();
+    expect(container.querySelector("img.preview-image")).toBeTruthy();
+
+    mode = "fail";
+    await workspace.actions.applyAndPreview();
+    await settle();
+    expect(getByTestId("banner-error").textContent).toContain("SURFACE_APPLY_FAILED");
+    expect(getByTestId("status-rollback").textContent).toContain("已恢复");
+    // 画面还在
+    expect(container.querySelector("img.preview-image")).toBeTruthy();
+  });
+
+  it("外部改动横幅列出被改过的取值", async () => {
+    const external = [{ id: "cel.Cel_Skin.ramp[0].position" }];
+    const { workspace } = await setup({
+      job: vi.fn(async () =>
+        jobPayload({
+          external_changes: external,
+          result: { ...jobPayload().result, external_changes: external },
+        }) as unknown as JobState
+      ),
+    });
+    const { getByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    await workspace.actions.applyAndPreview();
+    await settle();
+    expect(getByTestId("banner-external").textContent).toContain("cel.Cel_Skin.ramp[0].position");
+  });
+
+  it("工程原本干净、预览后变脏 ⇒ 横幅说明「工程未被保存」（O3）", async () => {
+    const { workspace } = await setup({
+      job: vi.fn(async () =>
+        jobPayload({
+          result: {
+            ...jobPayload().result,
+            project: {
+              dirty_at_baseline: false,
+              dirty_after_preview: true,
+              dirty_flagged: true,
+              file_name: "一个工程.blend",
+            },
+          },
+        }) as unknown as JobState
+      ),
+    });
+    const { getByTestId, queryByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    expect(queryByTestId("banner-project-dirty")).toBeNull();
+
+    await workspace.actions.applyAndPreview();
+    await settle();
+
+    const banner = getByTestId("banner-project-dirty");
+    expect(banner.textContent).toContain("工程未被保存");
+    expect(banner.textContent).toContain("不会保存或覆盖");
+
+    // 可关闭 —— 用户读过后不该常驻
+    fireEvent.click(banner.querySelector(".banner-dismiss") as Element);
+    await settle(2);
+    expect(queryByTestId("banner-project-dirty")).toBeNull();
+  });
+
+  it("工程本来就脏时不给「未被保存」横幅（O3）", async () => {
+    const { workspace } = await setup({
+      job: vi.fn(async () =>
+        jobPayload({
+          result: {
+            ...jobPayload().result,
+            project: { dirty_at_baseline: true, dirty_after_preview: true, dirty_flagged: false },
+          },
+        }) as unknown as JobState
+      ),
+    });
+    const { queryByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    await workspace.actions.applyAndPreview();
+    await settle();
+    expect(queryByTestId("banner-project-dirty")).toBeNull();
+  });
+
+  it("底部提示区分「未预览 / 已预览 / 画面过期 / 一致」", async () => {
+    const { workspace } = await setup();
+    const { getByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    const hint = () => getByTestId("pending-hint").textContent ?? "";
+    expect(hint()).toContain("一致");
+
+    workspace.actions.setValue("cel.Cel_Skin.ramp", { elements: [], interpolation: "EASE" });
+    await settle(2);
+    // 还没渲染过 ⇒ 是「有未预览的修改」，不是「画面过期」
+    expect(hint()).toContain("1 项已改");
+    expect(hint()).toContain("未预览");
+    expect(getByTestId("status-dirty").textContent).not.toContain("画面已过期");
+
+    await workspace.actions.applyAndPreview();
+    await settle();
+    expect(hint()).toContain("已预览");
+
+    // 预览之后又改（换成**不同**的值才算改）⇒ 画面过期
+    workspace.actions.setValue("cel.Cel_Skin.ramp", { elements: [], interpolation: "CONSTANT" });
+    await settle(2);
+    expect(hint()).toContain("有待预览的 L1 修改");
+    expect(getByTestId("status-dirty").textContent).toContain("画面已过期");
+
+    workspace.actions.resetAllDraft();
+    await settle(2);
+    expect(hint()).toContain("一致");
+  });
+
+  it("建立基线：任务完成前不挂图，完成并切到基线图后才展示", async () => {
+    const statuses = ["queued", "running", "done"];
+    let poll = 0;
+    const { workspace } = await setup({
+      job: vi.fn(async (jobId: string) => {
+        const status = statuses[Math.min(poll, statuses.length - 1)];
+        poll += 1;
+        return jobPayload({ job_id: jobId, status }) as unknown as JobState;
+      }),
+    });
+    const { getByText, getByTestId, container } = render(
+      <App workspace={workspace} autoBootstrap={false} />
+    );
+
+    // 走真实流程：点「刷新基线」（POST 会带回基线首张预览的 job_id）
+    const started = workspace.actions.refreshBaseline();
+    await settleTimers(2);
+
+    // 任务还没结束：只有「正在生成基线预览…」，**没有** img（文件尚未落盘）
+    expect(getByTestId("preview-pending")).toBeTruthy();
+    expect(container.querySelector("img.preview-image")).toBeNull();
+    // 基线图按钮此刻不可用，并标明还在生成
+    const baselineChip = getByText(/^基线图/) as HTMLButtonElement;
+    expect(baselineChip.disabled).toBe(true);
+    expect(baselineChip.textContent).toContain("生成中");
+
+    await settleTimers(10);
+    await started;
+
+    // 完成后基线图可用，切过去能看到带防缓存参数的图
+    fireEvent.click(getByText(/^基线图/));
+    await settleTimers(2);
+    const image = container.querySelector("img.preview-image") as HTMLImageElement;
+    expect(image.src).toContain("/api/preview/base0");
+    expect(image.src).toContain("v=base0");
+    // 终态任务不再占着「活动任务」位：状态栏显示空闲 + 上次结果
+    expect(getByTestId("status-job").getAttribute("data-active")).toBe("false");
+    expect(getByTestId("status-job").textContent).toContain("空闲");
+    expect(getByTestId("status-job").textContent).toContain("已完成");
+  });
+
+  it("基线任务失败：给出明确提示，不谎称画面正在生成", async () => {
+    const { workspace } = await setup({
+      job: vi.fn(async (jobId: string) =>
+        jobPayload({
+          job_id: jobId,
+          status: "failed",
+          result: null,
+          error: { code: "PREVIEW_FAILED", message: "渲染失败", retryable: true },
+        }) as unknown as JobState
+      ),
+    });
+    const { getByTestId, queryByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    await workspace.actions.refreshBaseline();
+    await settleTimers(4);
+
+    expect(queryByTestId("preview-pending")).toBeNull();
+    expect(getByTestId("baseline-preview-failed").textContent).toContain("基线已建立");
+    expect(getByTestId("status-job").getAttribute("data-active")).toBe("false");
+    // 基线本身是建立了的（调参照常可用）
+    expect(getByTestId("status-baseline").textContent).toContain("bl0000000001");
+  });
+
+  it("A/B 与热力图只预留入口（禁用）", async () => {
+    const { workspace } = await setup();
+    const { getByText } = render(<App workspace={workspace} autoBootstrap={false} />);
+    expect((getByText("A/B") as HTMLButtonElement).disabled).toBe(true);
+    expect((getByText("热力图") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("卸载时停止轮询（dispose 打断在途任务）", async () => {
+    const { workspace } = await setup();
+    const { unmount } = render(<App workspace={workspace} />);
+    await settle(2);
+    const generation = workspace.runner.currentGeneration;
+    unmount();
+    // App 的清理函数会 dispose：代次前移，在途结果被丢弃
+    expect(workspace.runner.currentGeneration).toBeGreaterThan(generation);
+  });
+
+  it("未构建前端时的 503 会给出构建指引", async () => {
+    const { workspace } = await setup();
+    const { getByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+    workspace.actions.handleError(
+      new AppError(
+        {
+          code: "FRONTEND_NOT_BUILT",
+          message: "前端尚未构建，无法提供页面。",
+          retryable: false,
+          hint: "请在 web/ 目录执行 npm ci 与 npm run build 后重试。",
+        },
+        503
+      )
+    );
+    await settle(2);
+    const banner = getByTestId("banner-error");
+    expect(banner.textContent).toContain("FRONTEND_NOT_BUILT");
+    expect(banner.textContent).toContain("npm run build");
+  });
+});

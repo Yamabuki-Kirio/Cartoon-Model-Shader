@@ -1,0 +1,33 @@
+{
+  "schema": "toon-material-map/1",
+  "model": {
+    "display_name": "示例模型（虚构，请勿用于真实模型）",
+    "fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "assignments": {
+    "示例材质_皮肤": {
+      "group": "Cel_Skin",
+      "class": "skin",
+      "source": "user_confirmed",
+      "hint": "虚构示例；请勿用于真实模型"
+    },
+    "示例材质_头发": {
+      "group": "Cel_Hair",
+      "class": "hair",
+      "source": "user_confirmed",
+      "hint": "虚构示例；请勿用于真实模型"
+    },
+    "示例材质_脸面": {
+      "group": "RayToon_Face_Soft",
+      "class": "face",
+      "source": "user_confirmed",
+      "hint": "虚构示例；请勿用于真实模型"
+    },
+    "示例材质_服装": {
+      "group": "Cel_Cloth",
+      "class": "cloth",
+      "source": "user_confirmed",
+      "hint": "虚构示例；请勿用于真实模型"
+    }
+  }
+}
