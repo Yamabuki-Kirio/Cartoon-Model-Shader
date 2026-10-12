@@ -44,11 +44,22 @@ def test_health() -> None:
     assert body == {"ok": True, "service": "toon-tuner", "version": "0.1.0"}
 
 
-def test_index_serves_html() -> None:
+def test_index_serves_html(tmp_path: Path) -> None:
+    """首页给出工作台页面（200 + HTML）。
+
+    dist 用 `write_fake_dist` 伪造而不是读仓库里的 `web/dist`：CI 的 Python job
+    不跑 npm（见 `.github/workflows/test.yml` 的边界约定），读真实产物会让这个
+    用例在那里稳定 503。页面内容 / 令牌注入 / 缓存头等细节由
+    `test_frontend_hosting.py` 用同一机制守，这里只做基础可达性冒烟。
+    """
+    web_dir = tmp_path / "web"
+    write_fake_dist(web_dir)
     with FakeMCPServer("ok") as server:
-        response = make_client(server.port).get("/")
+        client = authed(create_app(make_config(server.port, web_dir=web_dir)))
+        response = client.get("/")
     assert response.status_code == 200
-    assert "Cartoon-Model-Shader" in response.text
+    assert response.headers["content-type"].startswith("text/html")
+    assert 'id="app"' in response.text
 
 
 @pytest.mark.parametrize("path", ["/execute", "/eval", "/api/execute", "/api/blender/execute"])
