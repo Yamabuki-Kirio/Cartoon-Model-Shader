@@ -1,16 +1,20 @@
 import { useWorkspace } from "../app/useWorkspace";
 import { baselineValue, nodeValue } from "../state/draft";
+import { isMaterialGroup } from "../schema/material";
 import { flatten } from "../schema/parse";
 import { rgbaToCss } from "../schema/ramp";
 import type { SurfaceNode } from "../schema/types";
 import type { Workspace } from "../state/workspace";
 import { CelEditor } from "../features/cel/CelEditor";
+import { MaterialEditor } from "../features/material/MaterialEditor";
 import { Chip, reasonLabel } from "./chips";
 
 export function Inspector({ workspace }: { workspace: Workspace }) {
   const state = useWorkspace(workspace);
   const groupId = state.activeGroupId;
   const group = state.schema && groupId ? flatten(state.schema.groups).get(groupId) : undefined;
+  // 提前取出分组 id：后面 `isMaterialGroup` 的类型谓词会把否定分支收窄成 never。
+  const activeId = group?.id ?? "";
 
   return (
     <aside class="inspector" data-testid="inspector">
@@ -25,8 +29,15 @@ export function Inspector({ workspace }: { workspace: Workspace }) {
         <p class="muted pad">请在左侧选择一个分组。</p>
       ) : group.kind === "group" ? (
         <div class="inspector-body">
-          <CelEditor workspace={workspace} groupId={group.id} />
-          <NodeDetails workspace={workspace} groupId={group.id} />
+          {/* 逐材质分组与 Cel 分组是**两套参数**：前者没有色带，后者没有材质槽。
+              按分组身份分派，而不是让 Cel 编辑器去猜「没有色带 = 也许是个材质」。
+              先把 id 取出来：`isMaterialGroup` 是类型谓词，否定分支会被收窄成 never。 */}
+          {isMaterialGroup(group) ? (
+            <MaterialEditor workspace={workspace} groupId={activeId} />
+          ) : (
+            <CelEditor workspace={workspace} groupId={activeId} />
+          )}
+          <NodeDetails workspace={workspace} groupId={activeId} />
         </div>
       ) : null}
     </aside>

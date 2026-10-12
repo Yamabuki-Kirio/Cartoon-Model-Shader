@@ -144,6 +144,16 @@ body {
 .nav-item-main { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .nav-item-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nav-item-meta { display: flex; align-items: center; gap: 6px; }
+/* 逐材质条目多一行（分类 · 使用对象 · 可调项数）：换行而不是挤掉主行。 */
+.nav-item-tall { flex-wrap: wrap; height: auto; min-height: 56px; align-items: flex-start; }
+.nav-item-sub {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .badge { font-size: 11px; padding: 1px 6px; border-radius: 999px; }
 .badge-dirty { background: var(--accent); color: #fff; }
@@ -216,6 +226,34 @@ body {
 .cel-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 8px; }
 .copy-row { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 .copy-notes { list-style: none; margin: 8px 0 0; padding: 0; font-size: 12px; }
+
+/* 逐材质编辑器 */
+.material-scope {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 6px 14px;
+  margin: 10px 0;
+  font-size: 12px;
+}
+.material-scope dt { color: var(--muted); }
+.material-scope dd { margin: 2px 0 0; word-break: break-word; }
+.material-params { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
+.material-param { display: flex; flex-direction: column; gap: 2px; }
+.material-param > label { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.material-param-label { font-size: 12px; }
+.material-param-inputs { display: inline-flex; align-items: center; gap: 8px; }
+.material-param input[type="number"] { width: 96px; padding: 2px 4px; }
+.material-param input[type="color"] { width: 48px; height: 24px; padding: 0; border: 1px solid var(--border); background: none; }
+.material-isolation-report {
+  margin-top: 10px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
 
 .details-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .details-table th, .details-table td { border-bottom: 1px solid var(--border); padding: 6px 4px; text-align: left; vertical-align: top; }

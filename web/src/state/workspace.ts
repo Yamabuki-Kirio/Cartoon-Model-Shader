@@ -21,6 +21,8 @@ import type {
   ErrorDetail,
   ExternalChange,
   FramingContext,
+  FramingSubmitOptions,
+  IsolationSummary,
   JobError,
   JobResult,
   JobState,
@@ -55,6 +57,8 @@ export interface PreviewState {
   restoreVerified: boolean;
   externalChanges: ExternalChange[];
   framing: Record<string, unknown> | null;
+  /** 隔离预览结果（没请求隔离时为 null）。 */
+  isolation: IsolationSummary | null;
   renderResolution: number[] | null;
   at: number;
 }
@@ -125,6 +129,13 @@ export interface WorkspaceState {
 export interface FramingChoice {
   mode: string;
   margin: number;
+  /**
+   * 隔离预览的材质名。`null` = 不隔离（显示全部材质）。
+   *
+   * 它和「当前选中的材质」是**两件事**：选中材质只决定编辑哪个分组，
+   * 隔离则真的改变渲染结果。因此用户可以选中 A 材质却仍然看整体画面。
+   */
+  isolateMaterial: string | null;
 }
 
 export interface WorkspaceEndpoints {
@@ -139,7 +150,7 @@ export interface WorkspaceEndpoints {
   }>;
   surfaceBaseline(options?: { signal?: AbortSignal }): Promise<SurfaceBaselinePublic & { ok: true }>;
   createBaseline(
-    body?: { framing?: FramingChoice },
+    body?: { framing?: FramingSubmitOptions },
     options?: { signal?: AbortSignal }
   ): Promise<BaselineResponse & { ok: true }>;
   submitPreview(
@@ -175,7 +186,26 @@ const IDLE_CONNECTION: ConnectionState = {
   message: null,
 };
 
-const DEFAULT_FRAMING: FramingChoice = { mode: "current_camera", margin: 0.15 };
+const DEFAULT_FRAMING: FramingChoice = {
+  mode: "current_camera",
+  margin: 0.15,
+  isolateMaterial: null,
+};
+
+/**
+ * 把界面上的取景选择翻成请求载荷。
+ *
+ * 不隔离时**不带** `isolate_material` 字段（而不是带一个 `null`）——
+ * 服务端的 framing 契约是 `extra="forbid"`，少发一个字段永远比发一个语义待定的
+ * 字段安全；`null` 与空串服务端虽然也接受，但没必要依赖那条归一化。
+ */
+export function framingPayload(choice: FramingChoice): FramingSubmitOptions {
+  const payload: FramingSubmitOptions = { mode: choice.mode, margin: choice.margin };
+  if (choice.isolateMaterial) {
+    payload.isolate_material = choice.isolateMaterial;
+  }
+  return payload;
+}
 
 export function createWorkspace(options: WorkspaceOptions) {
   const { endpoints } = options;
@@ -291,6 +321,7 @@ export function createWorkspace(options: WorkspaceOptions) {
       restoreVerified: Boolean(result.surface_restore_verified ?? result.restore_verified),
       externalChanges: external,
       framing: (result.framing as Record<string, unknown>) ?? null,
+      isolation: (result.isolation as IsolationSummary | undefined) ?? null,
       renderResolution: (result.render_resolution as number[]) ?? null,
       at: now(),
     };
@@ -426,8 +457,8 @@ export function createWorkspace(options: WorkspaceOptions) {
       : "基线已建立，但首张预览未能生成；可点「刷新基线」重试。";
   }
 
-  async function refreshBaseline(choice?: FramingChoice): Promise<boolean> {
-    const framing = choice ?? store.getState().framingChoice;
+  async function refreshBaseline(choice?: Partial<FramingChoice>): Promise<boolean> {
+    const framing: FramingChoice = { ...store.getState().framingChoice, ...(choice ?? {}) };
     // 上一次的基线预览若还挂着，这次刷新同样会取代它 —— 先如实改判，别让它停在 pending。
     baselineJobId = null;
     store.setState({
@@ -440,7 +471,9 @@ export function createWorkspace(options: WorkspaceOptions) {
     });
     let created: Awaited<ReturnType<WorkspaceEndpoints["createBaseline"]>>;
     try {
-      created = await endpoints.createBaseline({ framing });
+      // 基线的首张预览同样尊重当前的隔离选择：否则「开关显示隔离中、图却是全体」
+      // 这种自相矛盾的状态会让用户以为隔离没生效。
+      created = await endpoints.createBaseline({ framing: framingPayload(framing) });
     } catch (error) {
       store.setState({
         error: toDetail(error),
@@ -585,6 +618,18 @@ export function createWorkspace(options: WorkspaceOptions) {
       actions.applyStructureFatal(detail, patch);
       return;
     }
+    // 隔离的材质在工程里找不到：**当场关掉隔离**，否则用户点几次「应用并预览」都会
+    // 撞同一堵墙。关掉这件事必须说出来 —— 静默改掉用户的开关比报错更糟。
+    if (detail.code === "ISOLATE_MATERIAL_MISSING") {
+      store.setState({
+        ...patch,
+        error: detail,
+        loading: false,
+        framingChoice: { ...store.getState().framingChoice, isolateMaterial: null },
+        notice: "隔离预览已关闭（该材质在当前工程里找不到），下次预览将显示全部材质。",
+      });
+      return;
+    }
     store.setState({ ...patch, error: detail, loading: false });
   }
 
@@ -598,8 +643,18 @@ export function createWorkspace(options: WorkspaceOptions) {
     setActiveGroup(groupId: string | null): void {
       store.setState({ activeGroupId: groupId });
     },
-    setFramingChoice(choice: FramingChoice): void {
-      store.setState({ framingChoice: choice });
+    setFramingChoice(choice: Partial<FramingChoice>): void {
+      store.setState({ framingChoice: { ...store.getState().framingChoice, ...choice } });
+    },
+    /**
+     * 切换隔离预览的材质并立即重新渲染。
+     *
+     * 传 `null` = 回到「显示全部材质」。隔离**必须重新渲染**才生效 ——
+     * 它改的是渲染时的可见性，不是已落盘的那张图；所以这里不只是一个状态切换。
+     * 结构失效（`historyBlocked`）时交给 `applyAndPreview` 统一拒绝。
+     */
+    isolateMaterial(name: string | null): Promise<boolean> {
+      return actions.applyAndPreview({ isolateMaterial: name });
     },
     clearNotice(): void {
       store.setState({ notice: null });
@@ -766,7 +821,7 @@ export function createWorkspace(options: WorkspaceOptions) {
       store.setState({ notice: `已重做：${step.command.label}` });
     },
 
-    async applyAndPreview(choice?: FramingChoice): Promise<boolean> {
+    async applyAndPreview(choice?: Partial<FramingChoice>): Promise<boolean> {
       const state = store.getState();
       if (!state.schema) {
         store.setState({
@@ -784,7 +839,7 @@ export function createWorkspace(options: WorkspaceOptions) {
         });
         return false;
       }
-      const framing = choice ?? state.framingChoice;
+      const framing: FramingChoice = { ...state.framingChoice, ...(choice ?? {}) };
       const draft = sanitizeDraft(state.schema, state.draft);
       previewedVersionForSubmit = draftVersion;
       store.setState({ loading: true, error: null, notice: null, framingChoice: framing });
@@ -792,7 +847,7 @@ export function createWorkspace(options: WorkspaceOptions) {
       abandonPendingBaselinePreview();
       const payload: JobSubmitPayload = {
         draft,
-        framing,
+        framing: framingPayload(framing),
         ...(state.structureHash ? { expected_structure_hash: state.structureHash } : {}),
       };
       const ok = await runner.start(payload);

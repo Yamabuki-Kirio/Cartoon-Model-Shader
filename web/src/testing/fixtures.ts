@@ -94,6 +94,196 @@ export function groupNode(
   };
 }
 
+// -- 逐材质分组 ------------------------------
+
+/** 材质分组里的只读展示项：分类 / 目标 Cel 组 / 使用对象数。 */
+function materialReadonlyChild(
+  id: string,
+  kind: "enum" | "int",
+  value: string | number | null,
+  options: { label?: string; optionsList?: Array<{ value: string; label: string }> } = {}
+) {
+  return {
+    id,
+    kind,
+    group: "material",
+    cost: "L1",
+    label: options.label ?? id,
+    supported: true,
+    editable: false,
+    active: true,
+    readonly_reason: "structural",
+    value_source: "scene",
+    structural: false,
+    value,
+    baseline: value,
+    effective: value,
+    ...(kind === "enum"
+      ? { options: options.optionsList ?? [], depends_on: null }
+      : { minimum: 0 }),
+  };
+}
+
+/** 材质分组里的一个可写参数（颜色或标量）。 */
+export function materialParamNode(
+  material: string,
+  field: string,
+  kind: "color" | "float",
+  value: unknown,
+  options: {
+    editable?: boolean;
+    supported?: boolean;
+    readonlyReason?: string | null;
+    reason?: string;
+    note?: string;
+    socket?: string;
+    shader?: string;
+    minimum?: number;
+    maximum?: number;
+    step?: number;
+  } = {}
+) {
+  const editable = options.editable ?? true;
+  const supported = options.supported ?? true;
+  const shader = options.shader ?? "Principled BSDF";
+  const socket = options.socket ?? field;
+  return {
+    id: `material.${material}.${field}`,
+    kind,
+    group: "material",
+    cost: "L1",
+    label: field,
+    supported,
+    editable,
+    active: supported,
+    readonly_reason: options.readonlyReason ?? (editable ? null : "structural"),
+    value_source: supported ? "scene" : "unsupported",
+    structural: false,
+    ...(editable && supported
+      ? {
+          binding: {
+            object_type: "MATERIAL",
+            object_id: `${material}/${shader}/${socket}`,
+            field,
+          },
+        }
+      : {}),
+    value,
+    baseline: value,
+    effective: value,
+    ...(kind === "float"
+      ? {
+          minimum: options.minimum ?? 0,
+          maximum: options.maximum ?? 1,
+          step: options.step ?? 0.01,
+        }
+      : {}),
+    ...(options.reason ? { reason: options.reason } : {}),
+    ...(options.note ? { note: options.note } : {}),
+  };
+}
+
+export interface MaterialFixtureOptions {
+  material?: string;
+  classification?: string | null;
+  classificationLabel?: string | null;
+  targetGroup?: string | null;
+  users?: string[];
+  nodeCount?: number;
+  blendMethod?: string;
+  editable?: boolean;
+  supported?: boolean;
+  label?: string;
+  /** 覆盖某几个参数（`field -> options`）；未覆盖的用默认可写值。 */
+  params?: Record<string, Record<string, unknown>>;
+  /** 只生成这些字段（默认 6 个全生成，与后端「固定集合」一致）。 */
+  only?: string[];
+}
+
+/**
+ * 逐材质分组夹具。形状与后端 `material.build_material_group` 的 `to_public()` 对齐：
+ * 三个只读展示节点 + 固定 6 个安全参数（探不到的以只读占位出现）。
+ */
+export function materialNode(options: MaterialFixtureOptions = {}) {
+  const material = options.material ?? "皮肤_脸";
+  const editable = options.editable ?? true;
+  const supported = options.supported ?? true;
+  const classification = options.classification === undefined ? "skin" : options.classification;
+  const targetGroup = options.targetGroup === undefined ? "Cel_Skin" : options.targetGroup;
+  const users = options.users ?? ["model_mesh"];
+
+  const defaults: Record<string, { kind: "color" | "float"; value: unknown }> = {
+    base_color: { kind: "color", value: [0.8, 0.8, 0.8, 1.0] },
+    metallic: { kind: "float", value: 0.0 },
+    roughness: { kind: "float", value: 0.5 },
+    emission_color: { kind: "color", value: [0.0, 0.0, 0.0, 1.0] },
+    emission_strength: { kind: "float", value: 0.0 },
+    specular: { kind: "float", value: 0.5 },
+  };
+  const fields = options.only ?? Object.keys(defaults);
+
+  const children: unknown[] = [
+    materialReadonlyChild(
+      `material.${material}.classification`,
+      "enum",
+      // 判不出分类时后端给的是 `null`（不是空串）—— 夹具必须同形，
+      // 否则「空串 vs null」这类差异会被夹具悄悄抹平。
+      classification,
+      {
+        label: "分类",
+        optionsList: classification
+          ? [{ value: classification, label: options.classificationLabel ?? classification }]
+          : [],
+      }
+    ),
+    materialReadonlyChild(
+      `material.${material}.target_group`,
+      "enum",
+      targetGroup,
+      {
+        label: "目标 Cel 组",
+        optionsList: targetGroup ? [{ value: targetGroup, label: targetGroup }] : [],
+      }
+    ),
+    materialReadonlyChild(`material.${material}.users.count`, "int", users.length, {
+      label: "使用对象数",
+    }),
+    ...fields.map((field) => {
+      const spec = defaults[field];
+      if (!spec) {
+        throw new Error(`未知的材质参数夹具字段：${field}`);
+      }
+      const override = options.params?.[field] ?? {};
+      // `value` 在覆盖里单独取：它替换的是夹具的默认值，而不是一个「选项」。
+      const value = "value" in override ? override["value"] : spec.value;
+      return materialParamNode(material, field, spec.kind, value, override);
+    }),
+  ];
+
+  return {
+    id: `material.${material}`,
+    kind: "group",
+    group: "material",
+    cost: "L1",
+    label: options.label ?? material,
+    supported,
+    editable,
+    active: supported,
+    readonly_reason: supported ? (editable ? null : "structural") : "not_found",
+    value_source: supported ? "scene" : "unsupported",
+    structural: false,
+    impact: {
+      users,
+      slot_count: users.length,
+      classification,
+      target_group: targetGroup,
+      node_count: options.nodeCount ?? 2,
+      blend_method: options.blendMethod ?? "OPAQUE",
+    },
+    children,
+  };
+}
+
 /** 只读展示项（不带 binding）。 */
 export function readonlyEnum(id: string, value: string, reason = "structural") {
   return {

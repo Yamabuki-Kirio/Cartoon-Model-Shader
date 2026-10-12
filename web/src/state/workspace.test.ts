@@ -573,6 +573,120 @@ describe("建立基线：轮询首张预览任务", () => {
   });
 });
 
+describe("隔离预览（逐材质）", () => {
+  it("isolateMaterial 把 isolate_material 放进 framing 载荷；传 null 时不带该字段", async () => {
+    const { workspace, endpoints } = makeWorkspace();
+    await workspace.actions.bootstrap();
+
+    await workspace.actions.isolateMaterial("皮肤_脸");
+    await settle();
+    expect(endpoints.submitPreview.mock.calls[0][0].framing).toEqual({
+      mode: "current_camera",
+      margin: 0.15,
+      isolate_material: "皮肤_脸",
+    });
+    expect(workspace.store.getState().framingChoice.isolateMaterial).toBe("皮肤_脸");
+
+    await workspace.actions.isolateMaterial(null);
+    await settle();
+    // 服务端的 framing 契约是 extra=forbid：不隔离就**不发送**这个字段
+    expect(endpoints.submitPreview.mock.calls[1][0].framing).toEqual({
+      mode: "current_camera",
+      margin: 0.15,
+    });
+    expect(workspace.store.getState().framingChoice.isolateMaterial).toBeNull();
+  });
+
+  it("隔离选择随「应用并预览」一起提交，且不污染草稿", async () => {
+    const { workspace, endpoints } = makeWorkspace();
+    await workspace.actions.bootstrap();
+
+    workspace.actions.setValue("cel.Cel_Skin.ramp", {
+      elements: [
+        { position: 0, color: [0, 0, 0, 1] },
+        { position: 1, color: [1, 1, 1, 1] },
+      ],
+      interpolation: "LINEAR",
+    });
+    const draftBefore = workspace.store.getState().draft;
+
+    await workspace.actions.applyAndPreview({ isolateMaterial: "皮肤_脸" });
+    await settle();
+
+    expect(endpoints.submitPreview.mock.calls[0][0].framing.isolate_material).toBe("皮肤_脸");
+    expect(endpoints.submitPreview.mock.calls[0][0].draft).toEqual(draftBefore);
+    expect(workspace.store.getState().draft).toEqual(draftBefore);
+  });
+
+  it("ISOLATE_MATERIAL_MISSING 会关掉隔离并说明原因（否则每次预览都撞同一堵墙）", async () => {
+    const { workspace, endpoints } = makeWorkspace({
+      job: vi.fn(
+        async () =>
+          jobPayload({
+            status: "failed",
+            result: null,
+            error: {
+              code: "ISOLATE_MATERIAL_MISSING",
+              message: "隔离预览已中止：当前工程里没有名为 '并不存在的材质' 的材质。",
+              retryable: true,
+            },
+          }) as unknown as JobState
+      ),
+    });
+    await workspace.actions.bootstrap();
+    await workspace.actions.isolateMaterial("并不存在的材质");
+    await settle();
+
+    const state = workspace.store.getState();
+    expect(state.error?.code).toBe("ISOLATE_MATERIAL_MISSING");
+    expect(state.framingChoice.isolateMaterial).toBeNull();
+    expect(state.notice).toContain("隔离预览已关闭");
+    // 这不是结构失效：草稿与撤销栈都必须保住
+    expect(state.historyBlocked).toBe(false);
+
+    // 关掉之后重试不再带隔离字段
+    endpoints.submitPreview.mockClear();
+    await workspace.actions.applyAndPreview();
+    await settle();
+    expect(endpoints.submitPreview.mock.calls[0][0].framing).toEqual({
+      mode: "current_camera",
+      margin: 0.15,
+    });
+  });
+
+  it("隔离结果进入 lastSuccessfulPreview，失败时不覆盖上一张", async () => {
+    const { workspace } = makeWorkspace({
+      job: vi.fn(
+        async (jobId: string) =>
+          jobPayload({
+            job_id: jobId,
+            result: {
+              ...jobPayload().result,
+              isolation: {
+                requested: true,
+                material: "皮肤_脸",
+                applied: true,
+                reason: null,
+                objects_kept: ["model_mesh"],
+                objects_hidden: ["model_mesh_outline"],
+                restored_ok: true,
+                mismatches: {},
+              },
+            },
+          }) as unknown as JobState
+      ),
+    });
+    await workspace.actions.bootstrap();
+    await workspace.actions.isolateMaterial("皮肤_脸");
+    await settle();
+
+    const isolation = workspace.store.getState().lastSuccessfulPreview?.isolation;
+    expect(isolation?.applied).toBe(true);
+    expect(isolation?.objects_kept).toEqual(["model_mesh"]);
+    expect(isolation?.restored_ok).toBe(true);
+  });
+});
+
 describe("分组 id 反推", () => {
   it("从参数 id 推出分组节点 id", () => {
     expect(ownerGroupId("cel.Cel_Skin.ramp")).toBe("cel.Cel_Skin");

@@ -5,6 +5,7 @@ import type {
   BaselineResponse,
   BlenderStatus,
   FramingContext,
+  FramingSubmitOptions,
   JobState,
   SurfaceBaselinePublic,
 } from "./types";
@@ -30,7 +31,7 @@ export interface SubmitPreviewResponse {
 
 export interface PreviewSubmitPayload {
   draft: Record<string, unknown>;
-  framing?: { mode: string; margin: number };
+  framing?: FramingSubmitOptions;
   expected_structure_hash?: string;
 }
 
@@ -67,7 +68,7 @@ export class Endpoints {
 
   /** 建立 / 刷新内存基线（写接口；同时采集 v4 拓扑）。 */
   createBaseline(
-    body?: { framing?: { mode: string; margin: number } },
+    body?: { framing?: FramingSubmitOptions },
     options: Omit<RequestOptions, "method" | "body"> = {}
   ): Promise<BaselineResponse & { ok: true }> {
     return this.client.post("/api/session/baseline", body ?? {}, options);

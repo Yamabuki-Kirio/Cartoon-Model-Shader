@@ -13,11 +13,18 @@
  * 本模块只负责把终态如实分发出去。
  */
 
-import { isAbortError, AppError, type JobError, type JobResult, type JobState } from "../api/types";
+import {
+  isAbortError,
+  AppError,
+  type FramingSubmitOptions,
+  type JobError,
+  type JobResult,
+  type JobState,
+} from "../api/types";
 
 export interface JobSubmitPayload {
   draft: Record<string, unknown>;
-  framing?: { mode: string; margin: number };
+  framing?: FramingSubmitOptions;
   expected_structure_hash?: string;
 }
 

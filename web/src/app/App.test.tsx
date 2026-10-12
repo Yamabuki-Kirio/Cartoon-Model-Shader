@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { AppError } from "../api/types";
 import { makeTestWorkspace, settle, settleTimers } from "../testing/endpoints";
-import { jobPayload } from "../testing/fixtures";
+import { groupNode, jobPayload, materialNode, schemaPayload } from "../testing/fixtures";
 import type { JobState } from "../api/types";
 
 afterEach(cleanup);
@@ -34,7 +34,7 @@ describe("工作台整体", () => {
     expect(getByTestId("status-dirty").textContent).toContain("0 项已改");
   });
 
-  it("导航只列 Cel 分组，不生成伪控件", async () => {
+  it("导航列出 Cel 分组，不生成伪控件", async () => {
     const { workspace } = await setup();
     const { getByTestId, queryByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
     expect(getByTestId("nav-cel.Cel_Skin")).toBeTruthy();
@@ -42,6 +42,38 @@ describe("工作台整体", () => {
     expect(getByTestId("nav-cel.Sakura_Hair_Reference")).toBeTruthy();
     // 未接入的参数族不该出现
     expect(queryByTestId("nav-cel.照明")).toBeNull();
+  });
+
+  it("选中材质分组时检查器切到逐材质编辑器，选中 Cel 分组时切回 Cel 编辑器", async () => {
+    const { workspace } = await setup({
+      surfaceSchema: async () =>
+        schemaPayload({
+          groups: [
+            // 默认 children 带一条色带，Cel 编辑器才会真的渲染出来
+            groupNode("Cel_Skin"),
+            materialNode({ material: "皮肤_脸", users: ["model_mesh"] }),
+          ],
+        }),
+    });
+    const { getByTestId, queryByTestId } = render(
+      <App workspace={workspace} autoBootstrap={false} />
+    );
+
+    // 默认选中第一个可用分组（Cel）
+    expect(getByTestId("cel-editor-cel.Cel_Skin")).toBeTruthy();
+    expect(queryByTestId("material-editor-皮肤_脸")).toBeNull();
+
+    // 点导航里的材质条目 → 切到逐材质编辑器
+    fireEvent.click(getByTestId("nav-material.皮肤_脸"));
+    await settle(2);
+    expect(getByTestId("material-editor-皮肤_脸")).toBeTruthy();
+    expect(queryByTestId("cel-editor-cel.Cel_Skin")).toBeNull();
+
+    // 切回 Cel 分组
+    fireEvent.click(getByTestId("nav-cel.Cel_Skin"));
+    await settle(2);
+    expect(getByTestId("cel-editor-cel.Cel_Skin")).toBeTruthy();
+    expect(queryByTestId("material-editor-皮肤_脸")).toBeNull();
   });
 
   it("导航的「仅已修改」筛选生效", async () => {

@@ -82,8 +82,39 @@ export interface JobResult {
   surface_restore_mismatches?: Array<Record<string, unknown>>;
   external_changes?: ExternalChange[];
   framing?: Record<string, unknown>;
+  /** 隔离预览结果：隐藏了哪些对象、有没有完整写回。 */
+  isolation?: IsolationSummary | null;
   project?: ProjectStateSummary | null;
   [key: string]: unknown;
+}
+
+/**
+ * 提交给服务端的取景选项。
+ *
+ * `isolate_material` 给出材质名时做**隔离预览**：渲染时临时隐藏不使用该材质的网格对象，
+ * 渲染后逐个写回原值。`null` / 缺省 / 空串都表示不隔离 —— 服务端把空串归一成「未指定」。
+ */
+export interface FramingSubmitOptions {
+  mode: string;
+  margin: number;
+  isolate_material?: string | null;
+}
+
+/**
+ * 隔离预览的结果。
+ *
+ * `restored_ok` 只在服务端确实回读了每个被隐藏对象、且逐项一致时才是 `true`；
+ * 拿不到证据一律 `null`（未知）—— 与输出设置同一条准则，**不报假绿**。
+ */
+export interface IsolationSummary {
+  requested: boolean;
+  material: string | null;
+  applied: boolean | null;
+  reason: string | null;
+  objects_kept: string[];
+  objects_hidden: string[];
+  restored_ok: boolean | null;
+  mismatches: Record<string, unknown>;
 }
 
 /** 值层外部改动：只提示，不作废草稿。 */
