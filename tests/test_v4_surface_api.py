@@ -732,6 +732,108 @@ def test_commit_rejects_tampered_surface_draft(tmp_path: Path) -> None:
         assert not target.exists()
 
 
+def test_commit_saves_mixed_l0_and_cel_draft_end_to_end(tmp_path: Path) -> None:
+    """正向端到端：L0 + Cel **混合草稿**走完 prepare → commit → 应用 → 回读 → 保存。
+
+    与上面几条互补：那些只证明「绑定与拒绝是真的」，本条证明**成功路径**也真的成立 ——
+    必须报 ``saved: true``，且保存后**重新读取**工程，取值与完整草稿逐项一致。
+
+    为什么单列一条：``tests/test_commit.py`` 的 31 条用例全部只带 L0 草稿，
+    ``surface_draft`` 在那里一次都没出现过；而带 ``surface_draft`` 的用例又只覆盖
+    「拒绝」。于是「混合草稿到底能不能存下去」这一条正向链此前**没有任何用例**。
+    """
+    with running_env(tmp_path) as env:
+        body = take_baseline(env)
+        structure_hash = body["surface"]["structure_hash"]
+        target = env.tmp_path / "out" / "mixed.blend"
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        # L0：曝光（走既有 L0 通道）
+        l0_draft = {"color.exposure": 0.35}
+        # Cel：色带整体替换（位置 + 颜色 + 插值一起写，才原子）
+        elements = [
+            {"position": 0.0, "color": [0.10, 0.20, 0.30, 1.0]},
+            {"position": 0.5, "color": [0.60, 0.55, 0.50, 1.0]},
+            {"position": 1.0, "color": [0.95, 0.93, 0.90, 1.0]},
+        ]
+        surface_draft = {RAMP_ID: {"elements": elements, "interpolation": "CONSTANT"}}
+
+        prepared = env.client.post(
+            "/api/session/commit/prepare",
+            json={
+                "mode": "save_as",
+                "draft": l0_draft,
+                "target_path": str(target),
+                "surface_draft": surface_draft,
+                "structure_hash": structure_hash,
+            },
+        )
+        assert prepared.status_code == 200, prepared.text
+        prepared_body = prepared.json()
+        assert prepared_body["structure_hash"] == structure_hash
+        assert prepared_body["surface_parameter_count"] > 0
+        assert prepared_body["token"]
+
+        applied = env.client.post(
+            "/api/session/commit",
+            json={
+                "token": prepared_body["token"],
+                "mode": "save_as",
+                "draft": l0_draft,
+                "target_path": str(target),
+                "surface_draft": surface_draft,
+                "structure_hash": structure_hash,
+            },
+        )
+        assert applied.status_code == 200, applied.text
+        result = applied.json()
+
+        # —— 正向断言：必须报告保存成功 ——
+        assert result["saved"] is True
+        status = result["status"]
+        assert status["applied"] is True
+        assert status["readback_verified"] is True
+        assert status["mismatches"] == []
+        assert status["saved"] is True
+        # L0 与 Cel 两条都要通过回读
+        assert status["surface_readback_verified"] is True
+        assert status["surface_mismatches"] == []
+        # 保存成功不得触发回滚
+        assert status["rollback"]["attempted"] is False
+        # 另存为到新路径：无需备份
+        assert status["backup"]["required"] is False
+        assert status["backup"]["created"] is False
+        # 两条草稿都出现在「应用了什么」里
+        assert status["applied_values"]["color.exposure"] == pytest.approx(0.35)
+        assert RAMP_ID in status["applied_surface"]
+        # 步骤轨迹要能看出 Cel 那一段真的跑了
+        assert "应用完整草稿" in result["steps"]
+        assert "应用 Cel 草稿" in result["steps"]
+        assert "保存工程" in result["steps"]
+        assert result["baseline_refreshed"] is True
+
+        # —— 真的写盘 ——
+        assert target.is_file()
+        assert env.fake.data.filepath == str(target)
+
+        # —— 保存后重新读取：参数与完整草稿一致 ——
+        refreshed = env.client.get("/api/v4/session/baseline").json()
+        # 色标数量没变 ⇒ 结构指纹不该变（值层改动不进结构哈希）
+        assert refreshed["structure_hash"] == structure_hash
+        reread = refreshed["values"][RAMP_ID]
+        assert [item["position"] for item in reread] == [0.0, 0.5, 1.0]
+        for got, want in zip(reread, elements):
+            assert list(got["color"]) == pytest.approx(want["color"])
+
+        # 直接问桩：L0 与 Cel 都落在了真实 datablock 上
+        assert env.fake.view_settings.exposure == pytest.approx(0.35)
+        ramp = env.fake.node_groups[CEL_GROUP].nodes.get("ColorRamp").color_ramp
+        assert ramp.interpolation == "CONSTANT"
+        assert [round(position, 4) for position, _ in ramp_values(env.fake)] == [0.0, 0.5, 1.0]
+        # 元素数不变 ⇒ 写入路径没有偷偷做结构性改动
+        assert len(ramp_values(env.fake)) == len(elements)
+
+
 def test_commit_without_surface_keeps_legacy_behaviour(tmp_path: Path) -> None:
     """旧客户端不传 ``surface_draft`` / ``structure_hash`` 时行为完全不变。"""
     with running_env(tmp_path) as env:
