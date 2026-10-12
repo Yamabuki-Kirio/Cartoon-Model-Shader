@@ -11,8 +11,9 @@ const BACKEND_ORIGIN = process.env.TOON_TUNER_BACKEND ?? "http://127.0.0.1:8765"
 
 export default defineConfig({
   root: here,
-  // 构建产物由 FastAPI 挂在 /next 下，因此资源引用也必须带这个前缀。
-  base: "/next/",
+  // 工作台由 FastAPI 挂在 `/` 下，因此资源引用就是根路径的 `/assets/*`。
+  // 生产入口始终是 FastAPI；`npm run dev` 走 Vite dev server，两者路径一致。
+  base: "/",
   plugins: [
     tokenPlaceholderPlugin(),
     // 仅开发：把 FastAPI 运行时注入的令牌转交给 dev server 上的页面，

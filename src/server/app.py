@@ -1,9 +1,8 @@
 """FastAPI 应用：本地卡通渲染调参台。
 
 路由：
-* ``GET  /``                       旧单页界面（原生 HTML/CSS/JS，行为不变）
-* ``GET  /next``                   v4 工作台（构建产物；未构建 ⇒ 503 FRONTEND_NOT_BUILT）
-* ``GET  /next/assets/{path}``     v4 构建资源（内容哈希命名，长缓存；越界 ⇒ 404）
+* ``GET  /``                        工作台页面（`web/dist` 构建产物；未构建 ⇒ 503 FRONTEND_NOT_BUILT）
+* ``GET  /assets/{path}``           构建资源（内容哈希命名，长缓存；越界 ⇒ 404）
 * ``GET  /api/health``             仅检查本地控制服务
 * ``GET  /api/blender/status``     快速探测端口与协议
 * ``GET  /api/blender/scene``      执行完整只读场景探针
@@ -45,8 +44,9 @@
   非法组合返回稳定错误 ``INVALID_DEPENDENT_ENUM``，不退化成 ``BLENDER_SCRIPT_ERROR``。
 * 预设存在 ``%LOCALAPPDATA%`` 下（不进仓库），写入前扫描并**拒绝**任何本机路径、
   模型/贴图路径与凭据；接口只回可展示位置，不回本机绝对路径。
-* ``/next`` 的前端构建产物由本服务托管；**令牌只注入 HTML**，静态资源逐字节直出，
+* ``/`` 的前端构建产物由本服务托管；**令牌只注入 HTML**，静态资源逐字节直出，
   且 ``index.html`` 明确 ``no-store``（它含本次进程的会话令牌）；资源路径越界一律 404。
+  未构建时明确报 503 与构建步骤，**不回退**任何占位页面 —— 那会让人以为「就这样」。
 """
 
 from __future__ import annotations
@@ -56,12 +56,10 @@ import datetime as _dt
 import logging
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from . import (
     SERVICE_NAME,
@@ -111,8 +109,6 @@ from .redact import redact
 from .session import PreviewService, preview_url_for, validate_draft
 from .surface_service import SurfaceService
 from . import config as config_module
-
-WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
 logger = logging.getLogger("toon_tuner")
 
@@ -697,39 +693,18 @@ def create_app(
             raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
         return job.to_public()
 
-    # -- 静态页面 ---------------------------------------------------------
-    index_file = WEB_DIR / "index.html"
-    if WEB_DIR.is_dir():
-        app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
-
-    @app.get("/", include_in_schema=False)
-    async def index() -> Any:
-        """旧单页界面（原生 HTML/CSS/JS）。
-
-        令牌在**响应时**注入：磁盘上的 ``index.html`` 只有占位注释，
-        因此令牌永远不会出现在静态文件、构建产物或日志里。
-        """
-        if index_file.is_file():
-            html = index_file.read_text(encoding="utf-8")
-            return HTMLResponse(security.inject_token(html, guard.token))
-        return JSONResponse(
-            status_code=500,
-            content=errors.ToonTunerError(
-                errors.INTERNAL_ERROR, "前端页面缺失（src/web/index.html）"
-            ).to_payload(),
-        )
-
-    # -- v4 工作台（/next）------------------------------------------------
+    # -- 工作台页面（构建产物，挂在 /）------------------------------------
     #: 构建产物目录：`web/dist`。只影响服务端自己；接口层不接受任何路径参数。
     web_root = cfg.web_dir or (config_module.REPO_ROOT / "web")
 
-    @app.get("/next", include_in_schema=False, response_class=HTMLResponse)
-    async def next_index() -> Any:
-        """v4 工作台页面。
+    @app.get("/", include_in_schema=False, response_class=HTMLResponse)
+    async def index() -> Any:
+        """工作台页面。
 
-        未构建时**明确报 503 FRONTEND_NOT_BUILT 与构建步骤**，
-        绝不回退到旧页面 —— 那会让人以为「新工作台就是这样」。
-        页面含会话令牌，因此 ``no-store``。
+        未构建时**明确报 503 FRONTEND_NOT_BUILT 与构建步骤**，绝不回退到任何占位
+        页面 —— 那会让人以为「工作台就是这样」。页面含会话令牌，因此 ``no-store``。
+        令牌在**响应时**注入：磁盘上的 ``index.html`` 只有占位注释，
+        因此令牌永远不会出现在静态文件、构建产物或日志里。
         """
         html = frontend.read_index(web_root)
         response = HTMLResponse(security.inject_token(html, guard.token))
@@ -737,13 +712,13 @@ def create_app(
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
-    @app.get("/next/assets/{asset_path:path}", include_in_schema=False)
-    async def next_asset(asset_path: str) -> Any:
-        """v4 构建资源。
+    @app.get("/assets/{asset_path:path}", include_in_schema=False)
+    async def asset(asset_path: str) -> Any:
+        """构建资源。
 
         * **逐字节直出**：不做任何令牌注入（令牌必须只出现在 HTML 里）；
         * 文件名带内容哈希 ⇒ 长缓存；
-        * 路径越界与不存在一律 404。
+        * 路径越界与不存在一律 404（不区分两者，免得漏出「外部有这个文件」）。
         """
         path = frontend.resolve_asset(web_root, asset_path)
         response = FileResponse(path, media_type=frontend.content_type_for(path))

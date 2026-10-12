@@ -25,6 +25,7 @@ __all__ = [
     "make_config",
     "session_token",
     "unauthed",
+    "write_fake_dist",
 ]
 
 
@@ -71,3 +72,39 @@ def authed(app: FastAPI) -> TestClient:
 def unauthed(app: FastAPI) -> TestClient:
     """不带任何令牌的 TestClient（只用于校验拒绝路径）。"""
     return TestClient(app)
+
+
+#: 伪造构建产物里 `index.html` 的令牌占位（与 `src/server/security.py` 同一份约定）。
+TOKEN_PLACEHOLDER = "<!--TOON_TUNER_TOKEN-->"
+
+
+def write_fake_dist(web_dir: Path) -> Path:
+    """在临时目录里伪造一份 `web/dist`，返回该目录。
+
+    为什么所有托管类用例都该用它，而不是读仓库里的 `web/dist`：
+
+    * **pytest 不依赖 Node**（见 `.github/workflows/test.yml`）—— CI 的 Python job
+      里根本没有 `dist/`，读真实产物会让用例在那里直接失败；
+    * 断言「资源逐字节直出」需要一个我们**确切知道**内容的文件，真实产物的内容
+      随构建而变；
+    * 令牌注入用例需要一个**确定**的占位注释与一条**确定的**资源引用。
+
+    形状与真实产物一致：`dist/index.html` + `dist/assets/{index-<hash>.js,.css,logo.svg}`。
+    """
+    dist = web_dir / "dist"
+    assets = dist / "assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    (dist / "index.html").write_text(
+        "<!DOCTYPE html><html><head>"
+        f"{TOKEN_PLACEHOLDER}"
+        '<script type="module" crossorigin src="/assets/index-abc123.js"></script>'
+        '<link rel="stylesheet" crossorigin href="/assets/index-abc123.css">'
+        '</head><body><div id="app"></div></body></html>',
+        encoding="utf-8",
+    )
+    (assets / "index-abc123.js").write_text(
+        "window.__TOON_TUNER_TOKEN__;export const x = 1;", encoding="utf-8"
+    )
+    (assets / "index-abc123.css").write_text("body{margin:0}", encoding="utf-8")
+    (assets / "logo.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'/>", encoding="utf-8")
+    return dist

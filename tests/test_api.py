@@ -12,10 +12,12 @@ from src.server.app import create_app
 from src.server.config import AppConfig, BlenderMCPConfig, ServerConfig
 from src.server.scene_probe import PROBE_SCHEMA
 from tests.fake_mcp_server import FAKE_PROBE_PAYLOAD, FakeMCPServer, find_free_port
-from tests.support import TOKEN_HEADER, authed, unauthed
+from tests.support import TOKEN_HEADER, authed, unauthed, write_fake_dist
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def make_config(port: int, *, response_timeout: float = 0.6) -> AppConfig:
+def make_config(port: int, *, response_timeout: float = 0.6, web_dir: Path | None = None) -> AppConfig:
     return AppConfig(
         blender_mcp=BlenderMCPConfig(
             host="127.0.0.1",
@@ -24,6 +26,7 @@ def make_config(port: int, *, response_timeout: float = 0.6) -> AppConfig:
             response_timeout_seconds=response_timeout,
         ),
         server=ServerConfig(host="127.0.0.1", port=8765),
+        web_dir=web_dir,
     )
 
 
@@ -190,15 +193,28 @@ def test_read_endpoints_do_not_require_token() -> None:
         assert client.get("/api/blender/status").status_code == 200
 
 
-def test_index_injects_token_without_touching_static_file() -> None:
-    """令牌只在响应里注入；磁盘上的静态文件里不得出现令牌。"""
+def test_index_injects_token_without_touching_static_file(tmp_path: Path) -> None:
+    """令牌只在响应里注入；磁盘上的源模板与构建产物里都不得出现令牌。
+
+    用临时 `web/dist` 而不是仓库里那份：**pytest 不依赖 Node**，CI 的 Python job
+    里根本没有 `dist/`（未构建的诊断由 `test_frontend_hosting.py` 覆盖）。
+    """
+    web_dir = tmp_path / "web"
+    write_fake_dist(web_dir)
     with FakeMCPServer("ok") as server:
-        app = create_app(make_config(server.port))
+        app = create_app(make_config(server.port, web_dir=web_dir))
         token = app.state.session_token
         html = unauthed(app).get("/").text
         assert token in html
         assert "window.__TOON_TUNER_TOKEN__" in html
 
-        source = Path("src/web/index.html").read_text(encoding="utf-8")
+        # 源模板（Vite 的 web/index.html）：只有占位注释
+        source = (REPO_ROOT / "web" / "index.html").read_text(encoding="utf-8")
         assert token not in source
+        assert "<!--TOON_TUNER_TOKEN-->" in source
         assert "window.__TOON_TUNER_TOKEN__ = " not in source
+
+        # 构建产物：同样只有占位注释
+        built = (web_dir / "dist" / "index.html").read_text(encoding="utf-8")
+        assert token not in built
+        assert "<!--TOON_TUNER_TOKEN-->" in built

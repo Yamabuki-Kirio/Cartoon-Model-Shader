@@ -59,8 +59,8 @@ if (html) {
   if (occurrences !== 1) {
     problems.push(`dist/index.html 里令牌占位应恰好出现 1 次，实际 ${occurrences} 次`);
   }
-  if (!html.includes('src="/next/assets/') || !html.includes('href="/next/assets/')) {
-    problems.push("dist/index.html 的资源引用没有 /next/ 前缀（FastAPI 挂在 /next 下）");
+  if (!html.includes('src="/assets/') || !html.includes('href="/assets/')) {
+    problems.push("dist/index.html 的资源引用不是根路径 /assets/（FastAPI 把工作台挂在 / 下）");
   }
 }
 

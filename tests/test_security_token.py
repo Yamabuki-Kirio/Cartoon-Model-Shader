@@ -23,7 +23,9 @@ from src.server.app import create_app
 from src.server.security import TOKEN_HEADER, generate_session_token
 from tests.fake_bpy import FakeBpy, run_generated_code
 from tests.fake_mcp_server import FakeMCPServer
-from tests.support import authed, make_config, unauthed
+from tests.support import authed, make_config, unauthed, write_fake_dist
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: 全部写接口 + 一份「结构合法」的请求体（令牌缺失时不应走到业务校验）
 WRITE_ENDPOINTS: list[tuple[str, dict[str, Any] | None]] = [
@@ -48,7 +50,17 @@ def running(tmp_path: Path):
         return run_generated_code(code, fake)
 
     with FakeMCPServer(executor=executor) as server:
-        app = create_app(make_config(server.port, presets_dir=tmp_path / "presets"))
+        # web_dir 指向临时目录：`/` 的页面托管与令牌注入在 `test_frontend_hosting.py`
+        # 里单独覆盖；这里只关心「令牌不出现在磁盘上」。
+        # 注意 `write_fake_dist()` 返回的是 `dist/`，而 `web_dir` 要的是它的父目录。
+        web_dir = write_fake_dist(tmp_path / "web").parent
+        app = create_app(
+            make_config(
+                server.port,
+                presets_dir=tmp_path / "presets",
+                web_dir=web_dir,
+            )
+        )
         with authed(app) as client:
             yield {"client": client, "app": app, "fake": fake, "server": server,
                    "codes": codes, "tmp_path": tmp_path}
@@ -151,9 +163,15 @@ def test_token_is_injected_only_into_runtime_response(running) -> None:
     html = unauthed(running["app"]).get("/").text
     assert f'window.__TOON_TUNER_TOKEN__ = "{token}"' in html
 
-    source = Path("src/web/index.html").read_text(encoding="utf-8")
+    # 源模板（Vite 的 web/index.html）：只有占位注释，没有令牌
+    source = (REPO_ROOT / "web" / "index.html").read_text(encoding="utf-8")
     assert token not in source
-    assert "<!--TOON_TUNER_TOKEN-->" in source, "占位注释必须留在静态文件里"
+    assert "<!--TOON_TUNER_TOKEN-->" in source, "占位注释必须留在源模板里"
+
+    # 构建产物同样只有占位注释（令牌只在响应时注入）
+    built = (running["tmp_path"] / "web" / "dist" / "index.html").read_text(encoding="utf-8")
+    assert token not in built
+    assert "<!--TOON_TUNER_TOKEN-->" in built
 
 
 # -- 不可注入 ---------------------------------------------------------------

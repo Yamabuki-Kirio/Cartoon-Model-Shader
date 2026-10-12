@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -703,46 +702,19 @@ def test_api_job_result_records_configured_effective_and_label() -> None:
 # =============================================================================
 #  7. 前端契约
 # =============================================================================
-
-
-def _app_js() -> str:
-    return Path("src/web/app.js").read_text(encoding="utf-8")
-
-
-def test_frontend_separates_value_from_label() -> None:
-    js = _app_js()
-    assert "function optionValue(" in js and "function optionLabel(" in js
-    # 写进 select 的 value 必须是 option.value，显示文本才是 label
-    assert "opt.value = optionValue(option);" in js
-    assert "opt.textContent = optionLabel(option);" in js
-    # 收集草稿时取的是 select.value（即 value）
-    assert 'draft[paramId] = entry.spec.type === "float" ? Number(entry.input.value) : entry.input.value;' in js
-    # 依赖声明要用于界面提示
-    assert "spec.depends_on" in js
-
-
-def test_frontend_refreshes_look_list_on_view_transform_change() -> None:
-    js = _app_js()
-    assert "VIEW_TRANSFORM_PARAM_ID" in js and "LOOK_PARAM_ID" in js
-    assert "function onViewTransformChange(" in js
-    assert "function refreshLookOptions(" in js
-    assert "function normalizeLook(" in js
-    # 切换视图变换时必须先走联动分支，再触发预览
-    assert "onViewTransformChange();" in js
-    # 不能把旧值直接送去 Blender
-    assert "function setSelectOptions(" in js
-
-
-def test_frontend_guards_against_stale_look_requests() -> None:
-    """快速连续切换视图时，旧候选请求不得覆盖新列表。"""
-    js = _app_js()
-    assert "var lookRequestToken = 0;" in js
-    assert "var token = ++lookRequestToken;" in js
-    assert "if (token !== lookRequestToken) {" in js
-
-
-def test_frontend_surfaces_invalid_dependent_enum_details() -> None:
-    js = _app_js()
-    assert "INVALID_DEPENDENT_ENUM" in js
-    assert "depends_on" in js
-    assert "allowed" in js
+#
+# 本节原先直接断言旧前端 `src/web/app.js` 里的函数名与字符串字面量
+# （`optionValue` / `optionLabel` / `onViewTransformChange` /
+# `refreshLookOptions` / `lookRequestToken` / `INVALID_DEPENDENT_ENUM` …）。
+#
+# 「提交 5」把工作台整体换成 `web/`（Vite + Preact + TypeScript）并删除了
+# `src/web/`，旧文件已不存在，这些静态断言不再可用作覆盖面。等价的约束改由
+# 以下位置承担：
+#
+#   * `web/src/api/client.ts`      —— 值/标签分离、`INVALID_DEPENDENT_ENUM` 详情透传；
+#   * `web/src/state/workspace.ts` —— 视图变换联动、候选刷新、失效枚举提示；
+#   * `web/src/state/jobs.ts`      —— 请求代际守卫（`isCurrent(generation)`），
+#                                     等价于原先的 `lookRequestToken`；
+#   * `tests/test_api_tuner.py`    —— 后端侧的联动与错误码契约。
+#
+# 真实浏览器验收见 `tests/browser_check.mjs`。

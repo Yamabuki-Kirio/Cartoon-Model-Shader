@@ -1,10 +1,10 @@
-"""v4 前端构建产物的托管（`/next`）。
+"""工作台前端构建产物的托管（挂在 ``/``）。
 
 分工
 ----
 * **构建**由 `web/`（Vite + Preact）负责，产物在 `web/dist/`，**不入库**；
-* **托管**由本模块负责：`GET /next` 给出注入了会话令牌的 `index.html`，
-  `GET /next/assets/*` 给出内容哈希命名的静态资源。
+* **托管**由本模块负责：``GET /`` 给出注入了会话令牌的 `index.html`，
+  ``GET /assets/*`` 给出内容哈希命名的静态资源。
 
 为什么自己写而不是 `StaticFiles`
 --------------------------------
@@ -95,7 +95,7 @@ def read_index(web_dir: Path) -> str:
 def not_built_error() -> errors.ToonTunerError:
     return errors.ToonTunerError(
         errors.FRONTEND_NOT_BUILT,
-        "前端尚未构建，无法提供 /next 页面。",
+        "前端尚未构建，无法提供工作台页面。",
         details={
             "steps": ["cd web", "npm ci", "npm run build"],
             "hint": "构建后 FastAPI 会自动托管 web/dist；开发时也可用 npm run dev 并让 /api 代理到本服务。",

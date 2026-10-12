@@ -68,7 +68,7 @@ PRESET_INCOMPATIBLE = "PRESET_INCOMPATIBLE"
 FRONTEND_NOT_BUILT = "FRONTEND_NOT_BUILT"
 #: v4 通用执行器在 Blender 侧写入失败（该次写入已被执行器自己回滚）。
 SURFACE_APPLY_FAILED = "SURFACE_APPLY_FAILED"
-#: `/next` 的静态资源不存在（含路径越界；两种情况刻意不区分）。
+#: `/assets/*` 的静态资源不存在（含路径越界；两种情况刻意不区分）。
 ASSET_NOT_FOUND = "ASSET_NOT_FOUND"
 
 #: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，

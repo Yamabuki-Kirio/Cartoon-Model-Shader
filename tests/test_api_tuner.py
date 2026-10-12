@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -351,13 +352,30 @@ def test_baseline_preview_failure_keeps_baseline_but_fails_job(render_failing_cl
 def test_frontend_uses_job_id_cache_busting_and_handles_image_error() -> None:
     """前端静态契约：URL 带 job_id 防缓存；图片 error 必须落到错误态。
 
-    这两点是纯浏览器行为，无法用 TestClient 覆盖，故在此锁定源码契约，
-    真实浏览器验证见 tests/browser_check.mjs。
+    这两点是纯浏览器行为，无法用 TestClient 覆盖，故在此锁定源码契约。
+    自「提交 5」起前端是 `web/`（Vite + Preact + TS），因此断言落在 TS 源码上；
+    真实浏览器验收见 tests/browser_check.mjs。
     """
-    from pathlib import Path
+    web = Path("web")
+    client_ts = (web / "src" / "api" / "client.ts").read_text(encoding="utf-8")
+    canvas = (web / "src" / "components" / "PreviewCanvas.tsx").read_text(encoding="utf-8")
+    workspace = (web / "src" / "state" / "workspace.ts").read_text(encoding="utf-8")
+    jobs = (web / "src" / "state" / "jobs.ts").read_text(encoding="utf-8")
 
-    source = Path("src/web/app.js").read_text(encoding="utf-8")
-    assert '"?v=" + encodeURIComponent(job.job_id)' in source, "预览 URL 必须带 job_id 防缓存"
-    assert "img.onerror" in source, "必须处理图片加载失败"
-    assert "基线已建立，预览失败" in source
-    assert "previewToken" in source, "必须用代次守卫防止旧任务覆盖新图"
+    # 防缓存：预览 URL 一定带 v=<job_id>，且经 encodeURIComponent
+    assert "export function previewImageUrl(" in client_ts
+    assert "v=${encodeURIComponent(jobId)}" in client_ts
+    # 画面组件自己也有一层（基线图与成功预览图都走它）
+    assert "export function withCacheVersion(" in canvas
+    assert "v=${encodeURIComponent(token)}" in canvas
+
+    # 图片加载失败必须落到错误态，且**不得清空**最后一张成功预览
+    assert "onError" in canvas
+    assert "setImageError(" in canvas
+    assert "lastSuccessfulPreview" in canvas
+
+    # 基线首张预览失败时给出明确文案（而不是静默停在「正在生成」）
+    assert "基线已建立，但首张预览未能生成" in workspace
+
+    # 代次守卫：旧任务结果不得覆盖新画面
+    assert "isCurrent(generation" in jobs or "this.isCurrent(" in jobs

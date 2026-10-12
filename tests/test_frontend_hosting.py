@@ -1,13 +1,19 @@
-"""`/next` 前端托管的契约与安全测试（v4 提交 3B）。
+"""工作台前端的托管契约与安全测试。
 
-覆盖四件事：
+自「提交 5」起，新版工作台就是 ``/`` 上的**唯一**页面：旧的原生 HTML/JS 页面
+（`src/web/app.js` 等）与 `/next` 路由都已删除。本文件守住这条边界。
 
-1. **迁移期两套页面并存**：`/` 仍是旧页面，`/next` 是新工作台，互不影响；
-2. **未构建时明确报错**：503 + `FRONTEND_NOT_BUILT` + 构建步骤，**不回退旧页面**；
-3. **令牌只注入 HTML**：静态资源逐字节直出，且 `index.html` 明确 `no-store`；
-4. **路径穿越一律拒绝**：`..`、URL 编码、反斜杠、绝对路径都取不到 assets 之外的文件。
+覆盖六件事：
 
-用临时目录伪造 `web/dist`，因此**不需要真的跑 npm**（CI 里 Python job 与 Node 无关）。
+1. **页面挂在 `/`**：返回构建产物并注入令牌；占位注释被替换；`no-store` + `nosniff`；
+2. **未构建时明确报错**：503 + `FRONTEND_NOT_BUILT` + 构建步骤，**不回退**任何页面；
+3. **令牌只注入 HTML**：静态资源逐字节直出、长缓存，js/css/svg 里绝不含令牌；
+4. **路径穿越一律拒绝**：`..`、URL 编码、反斜杠、绝对路径都取不到 assets 之外的文件；
+5. **旧页面确实没了**：`/next` 与 `/static/*` 都不再是路由，`src/web/` 目录不存在；
+6. **令牌真的能用**：从 `/` 拿到的令牌必须能过写接口的闸门（否则页面等于摆设）。
+
+所有用例都用临时目录伪造 `web/dist`（见 `tests.support.write_fake_dist`），
+因此**不需要真的跑 npm** —— CI 的 Python job 与 Node 无关。
 """
 
 from __future__ import annotations
@@ -21,57 +27,41 @@ from fastapi.testclient import TestClient
 from src.server import errors, frontend
 from src.server.app import create_app
 from tests.fake_mcp_server import find_free_port
-from tests.support import authed, make_config, unauthed
+from tests.support import authed, make_config, unauthed, write_fake_dist
 
-TOKEN_BYTES = b'<script>window.__TOON_TUNER_TOKEN__ = "runtime-token";</script>'
-
-
-def write_dist(web_dir: Path, *, placeholder: str | None = frontend.INDEX_FILENAME) -> Path:
-    """伪造一份构建产物：`dist/index.html` + `dist/assets/*`。"""
-    dist = web_dir / "dist"
-    assets = dist / "assets"
-    assets.mkdir(parents=True, exist_ok=True)
-    html = (
-        "<!DOCTYPE html><html><head><!--TOON_TUNER_TOKEN-->"
-        '<script type="module" crossorigin src="/next/assets/index-abc123.js"></script>'
-        '<link rel="stylesheet" crossorigin href="/next/assets/index-abc123.css">'
-        "</head><body><div id=\"app\"></div></body></html>"
-    )
-    (dist / "index.html").write_text(html, encoding="utf-8")
-    (assets / "index-abc123.js").write_text(
-        "window.__TOON_TUNER_TOKEN__;export const x = 1;", encoding="utf-8"
-    )
-    (assets / "index-abc123.css").write_text("body{margin:0}", encoding="utf-8")
-    (assets / "logo.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'/>", encoding="utf-8")
-    if placeholder is not None and placeholder != frontend.INDEX_FILENAME:
-        (dist / placeholder).write_text("outside", encoding="utf-8")
-    return dist
+REPO_ROOT = Path(__file__).resolve().parents[1]
+LEGACY_PAGE_FILES = ("app.js", "index.html", "styles.css")
 
 
 @pytest.fixture()
 def built_app(tmp_path: Path):
+    """构建产物就绪：`/` 应该给出工作台页面。"""
     web_dir = tmp_path / "web"
-    write_dist(web_dir)
-    app = create_app(make_config(find_free_port(), web_dir=web_dir, presets_dir=tmp_path / "presets"))
+    write_fake_dist(web_dir)
+    app = create_app(
+        make_config(find_free_port(), web_dir=web_dir, presets_dir=tmp_path / "presets")
+    )
     return app, web_dir
 
 
 @pytest.fixture()
-def unpublished_app(tmp_path: Path):
-    # 没有 dist/ 的 web 目录 = 还没构建
+def unbuilt_app(tmp_path: Path):
+    """没有 dist/ 的 web 目录 = 还没构建。"""
     web_dir = tmp_path / "web"
     web_dir.mkdir(parents=True, exist_ok=True)
-    app = create_app(make_config(find_free_port(), web_dir=web_dir, presets_dir=tmp_path / "presets"))
+    app = create_app(
+        make_config(find_free_port(), web_dir=web_dir, presets_dir=tmp_path / "presets")
+    )
     return app, web_dir
 
 
-# -- 1. 两套页面并存 -------------------------------------------------------
+# -- 1. 页面挂在 / ---------------------------------------------------------
 
 
-def test_next_serves_v4_page_with_injected_token(built_app) -> None:
+def test_root_serves_workbench_with_injected_token(built_app) -> None:
     app, _ = built_app
     with TestClient(app) as client:
-        response = client.get("/next")
+        response = client.get("/")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     body = response.text
@@ -79,47 +69,39 @@ def test_next_serves_v4_page_with_injected_token(built_app) -> None:
     assert app.state.session_token in body
     assert "<!--TOON_TUNER_TOKEN-->" not in body
     assert 'id="app"' in body
+    # 资源引用是根路径（说明 base 与托管路径一致）
+    assert 'src="/assets/' in body
+    assert "/next/" not in body
 
 
 def test_index_html_is_never_cached(built_app) -> None:
     """页面含本次进程的会话令牌，缓存住它等于把令牌写进磁盘。"""
     app, _ = built_app
     with TestClient(app) as client:
-        response = client.get("/next")
-    cache_control = response.headers["cache-control"]
-    assert "no-store" in cache_control
+        response = client.get("/")
+    assert "no-store" in response.headers["cache-control"]
     assert response.headers["x-content-type-options"] == "nosniff"
 
 
-def test_legacy_index_still_served_at_root(built_app) -> None:
-    """/next 的加入不影响 /（迁移期两套并存，提交 5 才切换）。"""
-    app, _ = built_app
-    with TestClient(app) as client:
-        legacy = client.get("/")
-    assert legacy.status_code == 200
-    body = legacy.text
-    assert "卡通渲染调参" in body
-    # 旧页面用 /static/，不该引用 v4 的构建资源
-    assert "/next/assets/" not in body
-    assert app.state.session_token in body
-
-
-def test_legacy_api_untouched(built_app) -> None:
+def test_api_endpoints_untouched_by_the_switch(built_app) -> None:
+    """换页面不影响任何接口。"""
     app, _ = built_app
     with TestClient(app) as client:
         assert client.get("/api/health").json()["ok"] is True
         schema = client.get("/api/params/schema").json()
     assert schema["ok"] is True
-    assert any(param["id"] == "color.exposure" for group in schema["groups"] for param in group["params"])
+    assert any(
+        param["id"] == "color.exposure" for group in schema["groups"] for param in group["params"]
+    )
 
 
 # -- 2. 未构建 -------------------------------------------------------------
 
 
-def test_next_reports_frontend_not_built(unpublished_app) -> None:
-    app, _ = unpublished_app
+def test_root_reports_frontend_not_built(unbuilt_app) -> None:
+    app, _ = unbuilt_app
     with TestClient(app) as client:
-        response = client.get("/next")
+        response = client.get("/")
     assert response.status_code == 503
     body = response.json()
     assert body["ok"] is False
@@ -130,20 +112,20 @@ def test_next_reports_frontend_not_built(unpublished_app) -> None:
     assert "npm" in body["error"]["hint"]
 
 
-def test_next_never_falls_back_to_legacy_page(unpublished_app) -> None:
-    """未构建时绝不把旧页面当成新工作台返回 —— 那会让人以为「新的就是这样」。"""
-    app, _ = unpublished_app
+def test_root_never_returns_a_placeholder_page(unbuilt_app) -> None:
+    """未构建时绝不返回任何「看起来像页面」的东西 —— 那会让人以为「就这样」。"""
+    app, _ = unbuilt_app
     with TestClient(app) as client:
-        response = client.get("/next")
+        response = client.get("/")
     assert response.status_code == 503
-    assert "卡通渲染调参" not in response.text
     assert "text/html" not in response.headers.get("content-type", "")
+    assert "<html" not in response.text.lower()
 
 
-def test_assets_report_not_found_when_unbuilt(unpublished_app) -> None:
-    app, _ = unpublished_app
+def test_assets_report_not_found_when_unbuilt(unbuilt_app) -> None:
+    app, _ = unbuilt_app
     with TestClient(app) as client:
-        response = client.get("/next/assets/index-abc123.js")
+        response = client.get("/assets/index-abc123.js")
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "ASSET_NOT_FOUND"
 
@@ -160,13 +142,13 @@ def test_assets_are_served_byte_identical(built_app) -> None:
             ("index-abc123.css", "text/css"),
             ("logo.svg", "image/svg+xml"),
         ):
-            response = client.get(f"/next/assets/{name}")
+            response = client.get(f"/assets/{name}")
             assert response.status_code == 200, name
             assert response.headers["content-type"].startswith(expected_type)
             on_disk = (web_dir / "dist" / "assets" / name).read_bytes()
             assert response.content == on_disk, f"{name} 被改写过了"
             assert app.state.session_token.encode() not in response.content
-    # 应用内只有 index.html 带令牌；磁盘上的源码/产物里没有
+    # 磁盘上的产物里没有令牌（令牌只在响应时注入）
     disk_html = (web_dir / "dist" / "index.html").read_text(encoding="utf-8")
     assert app.state.session_token not in disk_html
 
@@ -174,7 +156,7 @@ def test_assets_are_served_byte_identical(built_app) -> None:
 def test_assets_are_long_cached(built_app) -> None:
     app, _ = built_app
     with TestClient(app) as client:
-        response = client.get("/next/assets/index-abc123.js")
+        response = client.get("/assets/index-abc123.js")
     assert "immutable" in response.headers["cache-control"]
     assert response.headers["x-content-type-options"] == "nosniff"
 
@@ -203,17 +185,17 @@ def test_asset_path_traversal_is_rejected(built_app, asset_path: str) -> None:
     (web_dir.parent / "secret.txt").write_text("TOP-SECRET", encoding="utf-8")
 
     with TestClient(app) as client:
-        response = client.get(f"/next/assets/{asset_path}")
+        response = client.get(f"/assets/{asset_path}")
 
     assert response.status_code in (404, 400), asset_path
     assert b"TOP-SECRET" not in response.content
-    assert "卡通渲染调参" not in response.text
+    assert "<html" not in response.text.lower()
 
 
 def test_resolve_asset_rejects_paths_outside_assets_root(tmp_path: Path) -> None:
     """直接对解析函数下断言：越界与不存在都归到同一个错误码。"""
     web_dir = tmp_path / "web"
-    write_dist(web_dir)
+    write_fake_dist(web_dir)
     (web_dir / "dist" / "outside.txt").write_text("outside", encoding="utf-8")
 
     resolved = frontend.resolve_asset(web_dir, "index-abc123.js")
@@ -227,11 +209,61 @@ def test_resolve_asset_rejects_paths_outside_assets_root(tmp_path: Path) -> None
         assert excinfo.value.http_status == 404
 
 
-# -- 5. 与旧写接口的令牌规则一致 ------------------------------------------
+# -- 5. 旧页面确实没了 -----------------------------------------------------
 
 
-def test_next_page_token_works_for_write_endpoints(built_app) -> None:
-    """从 /next 页面拿到的令牌必须能真的调用写接口（否则页面等于摆设）。
+def test_next_prefix_is_gone(built_app) -> None:
+    """`/next` 与 `/next/assets/*` 都已随旧页面一起删除。
+
+    留着它们会变成第二份真相：有人会以为「新的还在 /next 上」。
+    """
+    app, _ = built_app
+    paths = {route.path for route in app.routes if hasattr(route, "path")}
+    assert "/" in paths
+    assert "/assets/{asset_path:path}" in paths
+    assert not {path for path in paths if path.startswith("/next")}
+
+
+def test_legacy_static_mount_is_gone(built_app) -> None:
+    """`/static/*` 是旧页面的挂载点，必须一起删掉（否则旧资源仍可被访问）。"""
+    app, _ = built_app
+    with TestClient(app) as client:
+        for path in ("/static/app.js", "/static/index.html", "/static/styles.css"):
+            assert client.get(path).status_code == 404, path
+
+
+def test_legacy_page_sources_are_deleted() -> None:
+    """源码级断言：旧页面文件与目录都不该留在仓库里。
+
+    这是**防回归**：把它们留在树里，下一个人会以为那还是有效实现，
+    甚至会在上面继续改。
+    """
+    assert not (REPO_ROOT / "src" / "web").exists()
+    for name in LEGACY_PAGE_FILES:
+        assert not (REPO_ROOT / "src" / "web" / name).exists(), name
+
+
+def test_v4_routes_registered(built_app) -> None:
+    app, _ = built_app
+    paths = {route.path for route in app.routes if hasattr(route, "path")}
+    assert {
+        "/",
+        "/assets/{asset_path:path}",
+        "/api/v4/surface/schema",
+        "/api/v4/session/baseline",
+        "/api/v4/preview",
+        "/api/v4/jobs/{job_id}",
+        "/api/session/commit/prepare",
+        "/api/session/commit",
+        "/api/presets",
+    } <= paths
+
+
+# -- 6. 令牌真的能用 -------------------------------------------------------
+
+
+def test_root_page_token_works_for_write_endpoints(built_app) -> None:
+    """从 `/` 页面拿到的令牌必须能真的调用写接口（否则页面等于摆设）。
 
     这里只断言「过了令牌闸门」：`/api/session/restore` 后续是否成功取决于
     Blender 连接，与令牌无关。因此判据是「不是 401 / 不是 SESSION_TOKEN_INVALID」，
@@ -240,7 +272,7 @@ def test_next_page_token_works_for_write_endpoints(built_app) -> None:
     app, _ = built_app
 
     with TestClient(app) as anonymous:
-        page = anonymous.get("/next").text
+        page = anonymous.get("/").text
         assert app.state.session_token in page
         unauthed_response = anonymous.post("/api/session/restore")
     assert unauthed_response.status_code == 401
@@ -254,20 +286,6 @@ def test_next_page_token_works_for_write_endpoints(built_app) -> None:
     # 读接口本来就不需要令牌
     with unauthed(app) as client:
         assert client.get("/api/health").status_code == 200
-
-
-def test_v4_routes_registered(built_app) -> None:
-    app, _ = built_app
-    paths = {route.path for route in app.routes if hasattr(route, "path")}
-    assert {
-        "/",
-        "/next",
-        "/next/assets/{asset_path:path}",
-        "/api/v4/surface/schema",
-        "/api/v4/session/baseline",
-        "/api/v4/preview",
-        "/api/v4/jobs/{job_id}",
-    } <= paths
 
 
 def test_config_carries_web_dir(tmp_path: Path) -> None:

@@ -5,7 +5,7 @@ import type { Plugin } from "vite";
  *
  * FastAPI 在**响应时**把 `<!--TOON_TUNER_TOKEN-->` 换成真正的令牌脚本，
  * 因此磁盘上的构建产物里永远没有令牌。但 HTML 压缩器会把注释吃掉 ——
- * 一旦占位消失，`GET /next` 注入失败、**所有写操作 401**。
+ * 一旦占位消失，`GET /` 注入失败、**所有写操作 401**。
  *
  * 所以占位必须在 `transformIndexHtml` 的 `post` 阶段重新插一次，
  * 而不是指望源文件里的注释活下来。

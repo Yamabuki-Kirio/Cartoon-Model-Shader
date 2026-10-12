@@ -67,7 +67,7 @@ describe("令牌占位（Vite 插件）", () => {
     const script = readFileSync(join(webRoot, "scripts", "verify-dist.mjs"), "utf8");
     // 脚本刻意不 import TS（Node 加载 TS 依赖实验性类型擦除），因此这里钉住一致性。
     expect(script).toContain(`"${TOKEN_PLACEHOLDER}"`);
-    expect(script).toContain("/next/assets/");
+    expect(script).toContain("/assets/");
     expect(script).toContain("sourcemap");
   });
 });
@@ -112,10 +112,12 @@ describe("构建产物", () => {
     expect(distFiles.filter((file) => file.endsWith(".map"))).toEqual([]);
   });
 
-  it.skipIf(!built)("资源引用带 /next/ 前缀（由 FastAPI 托管）", () => {
+  it.skipIf(!built)("资源引用是根路径（工作台挂在 / 下，由 FastAPI 托管）", () => {
     const html = readFileSync(join(dist, "index.html"), "utf8");
-    expect(html).toContain('src="/next/assets/');
-    expect(html).toContain('href="/next/assets/');
+    expect(html).toContain('src="/assets/');
+    expect(html).toContain('href="/assets/');
+    // 迁移遗留：/next 前缀一旦回来，说明 base 或托管路径被改回去了。
+    expect(html).not.toContain('"/next/');
   });
 });
 

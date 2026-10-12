@@ -7,7 +7,7 @@
 4. 渲染失败也恢复
 5. 用户切帧后检测到基线失效
 6. 相机有关键帧时正确显示警告
-（另含：只读诊断、离原点取景、纵横比、选项校验、前端契约）
+（另含：只读诊断、离原点取景、纵横比、选项校验）
 
 这些测试**真的执行服务端生成的 Python 代码**（``bpy`` 换成桩），
 因此能抓出生成代码里的数学/恢复逻辑错误。
@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -881,46 +880,20 @@ def test_api_job_payload_exposes_no_local_paths(tuner_client) -> None:
 # =============================================================================
 #  6. 前端契约（真实浏览器验收见 tests/browser_check.mjs）
 # =============================================================================
-
-
-def test_frontend_exposes_framing_controls_and_stale_banner() -> None:
-    html = Path("src/web/index.html").read_text(encoding="utf-8")
-    js = Path("src/web/app.js").read_text(encoding="utf-8")
-
-    for element_id in (
-        "framing-bar",
-        "framing-frame",
-        "framing-camera",
-        "framing-camera-anim",
-        "framing-inside",
-        "framing-source",
-        "framing-mode",
-        "framing-margin",
-        "reframe-btn",
-        "framing-stale",
-    ):
-        assert f'id="{element_id}"' in html, f"缺少取景界面元素：{element_id}"
-
-    for mode in ("current_camera", "auto_full_body", "auto_upper_body", "auto_headshot"):
-        assert mode in js, f"前端缺少取景方式：{mode}"
-
-    assert "当前帧/相机已变化，请刷新基线" in js, "必须显示刷新基线提示"
-    assert "FRAMING_STALE" in js, "必须识别取景失效错误码"
-    assert "临时自动取景" in js and "当前相机预览" in js, "必须标明取景来源"
-    assert "不会改动用户相机" in js or "不改动用户相机" in js
-    assert "framingStale" in js, "必须用状态位停止自动预览"
-    assert "自动预览已停止" in js
-
-    # 「是否入画」的判据必须跟着取景方式走，并标注参照的相机。
-    assert "applyInsideVerdict" in js, "入画判据必须走统一入口，避免两条路径文案不一致"
-    assert "按临时取景相机" in js and "按当前相机" in js, "判据必须标注参照的相机"
-    assert js.count("applyInsideVerdict(") >= 3, "上下文渲染与任务结果两条路径都要写判据"
-    assert "setInsidePlaceholder" in js, "切到自动取景时应先置为取景中，避免滞留上一次结论"
-
-    # 顶部「当前相机」描述场景状态：临时相机渲染完即销毁，必须显示工程相机。
-    assert "framingResult.original_camera || framingResult.camera_used" in js, (
-        "自动取景后顶部「当前相机」必须显示工程相机（original_camera），而不是已销毁的临时相机"
-    )
-    assert "framingResult.camera_used || framingResult.original_camera" not in js, (
-        "禁止把已销毁的临时相机当作「当前相机」显示"
-    )
+#
+# 本节原先读取旧前端 `src/web/index.html` / `src/web/app.js`，断言取景控件
+# 的元素 id（`framing-bar` / `framing-frame` / `framing-mode` / `framing-stale`
+# …）与旧 JS 字符串（`applyInsideVerdict` / `FRAMING_STALE` /
+# `framingResult.original_camera || framingResult.camera_used` …）。
+#
+# 「提交 5」把工作台整体换成 `web/`（Vite + Preact + TypeScript）并删除了
+# `src/web/`，旧文件已不存在，这些静态断言不再可用作覆盖面。等价的约束改由
+# 以下位置承担：
+#
+#   * `web/src/state/workspace.ts`  —— `framingPayload()` / `framingChoice()`，
+#                                      取景方式、边距与「失效即停自动预览」；
+#   * `web/src/components/StatusBar.tsx`  —— 顶部相机来源与取景失效提示；
+#   * `web/src/components/PreviewCanvas.tsx` —— 「是否入画」判据与占位；
+#   * `tests/test_framing.py`（本文件其余章节）—— 后端取景与失效错误码契约。
+#
+# 真实浏览器验收见 `tests/browser_check.mjs`。
