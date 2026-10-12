@@ -79,6 +79,39 @@ def _render_framing_summary(render: dict[str, Any], job_framing: dict[str, Any] 
     }
 
 
+def _render_isolation_summary(render: dict[str, Any], job_framing: dict[str, Any] | None) -> dict[str, Any]:
+    """整理「隔离预览」结果。
+
+    与输出设置同一条准则：**拿不到证据就算没通过**。``restored_ok`` 只在
+    Blender 侧确实回读了每个被隐藏对象、且逐项与渲染前一致时才是 ``True``；
+    载荷缺字段一律回 ``None``（未知），绝不报假绿。
+    """
+    raw = render.get("isolation")
+    requested = (job_framing or {}).get("isolate_material")
+    empty = {
+        "requested": bool(requested),
+        "material": requested,
+        "applied": None,
+        "reason": None,
+        "objects_kept": [],
+        "objects_hidden": [],
+        "restored_ok": None,
+        "mismatches": {},
+    }
+    if not isinstance(raw, dict):
+        return empty
+    return {
+        "requested": bool(raw.get("requested", requested)),
+        "material": raw.get("material", requested),
+        "applied": bool(raw.get("applied")),
+        "reason": raw.get("reason"),
+        "objects_kept": [str(n) for n in (raw.get("objects_kept") or [])],
+        "objects_hidden": [str(n) for n in (raw.get("objects_hidden") or [])],
+        "restored_ok": raw.get("restored_ok"),
+        "mismatches": raw.get("mismatches") or {},
+    }
+
+
 def _render_output_summary(render: dict[str, Any]) -> dict[str, Any]:
     """整理「预览的输出设置有没有被污染」。
 
@@ -827,6 +860,8 @@ class PreviewService:
                 "parameters": _parameter_records(baseline, job, applied),
                 "view_transform": baseline.view_transform,
                 "framing": _render_framing_summary(render, job.framing),
+                # 隔离预览（逐材质）：隐藏了哪些对象、有没有完整写回
+                "isolation": _render_isolation_summary(render, job.framing),
                 # 输出设置（PNG 隔离）有没有被污染 —— 可审计、且计入闸门
                 "output": _render_output_summary(render),
                 # 工程脏标记（O3），与 v4 任务同一形状
@@ -981,6 +1016,8 @@ class PreviewService:
                 "parameters": _parameter_records(baseline, job, applied),
                 "view_transform": baseline.view_transform,
                 "framing": _render_framing_summary(render, job.framing),
+                # 隔离预览（逐材质）：隐藏了哪些对象、有没有完整写回
+                "isolation": _render_isolation_summary(render, job.framing),
                 # 输出设置（PNG 隔离）有没有被污染 —— 可审计、且计入闸门
                 "output": _render_output_summary(render),
                 # 工程脏标记（O3）：本工具不保存工程；写回原值也不会清除 Blender

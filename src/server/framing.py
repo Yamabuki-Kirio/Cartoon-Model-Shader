@@ -57,6 +57,18 @@ MARGIN_MAX = 0.40
 #: 临时预览相机的对象名（固定名，便于异常退出后清理残留）
 TEMP_CAMERA_NAME = "__TOON_TUNER_PREVIEW_CAM__"
 
+# -- 隔离预览（逐材质）------------------------------------------------------
+#
+# 「隔离」= 渲染时把**不使用该材质的网格对象**临时设为 ``hide_render``，
+# 渲染结束（含异常 / 中止）后在 ``finally`` 里逐个写回原值。
+# 与临时相机同属「渲染期场景过滤」：只活在这一条生成代码的生命周期里，
+# 既不写进 .blend，也不影响取景计算（相机在过滤**之前**就算好了，
+# 因此隔离前 / 隔离后两张图的机位完全一致，可直接对比）。
+ISOLATE_NAME_MAX = 200
+#: 材质身份在 schema 里用 ``/`` 分隔（``材质名/节点名/插座名``），名字里出现分隔符
+#: 会让身份产生歧义；引号与反斜杠则一律挡在 ``repr`` 之前，避免任何拼接风险。
+_ISOLATE_FORBIDDEN = ("/", "\\")
+
 #: 每个取景方式截取角色包围盒的哪一段：(高度占比, 水平半宽系数)
 #:   全身 = 整体；半身 = 顶部 55%；头像 = 顶部 16%，水平收窄到 ±20%
 REGION_RULES: dict[str, tuple[float, float]] = {
@@ -867,13 +879,20 @@ def collect_context(client) -> dict[str, Any]:
 
 
 def validate_options(raw: Any) -> dict[str, Any]:
-    """校验前端传来的取景方式与安全边距；越界即拒绝，不做静默兜底。"""
+    """校验前端传来的取景方式、安全边距与隔离材质；越界即拒绝，不做静默兜底。
+
+    ``isolate_material`` 语义：
+
+    * 缺省 / ``None`` / 空字符串（含纯空白） => **不隔离**（下拉框「全部材质」自然回空串，
+      这里显式把它归一成「未指定」，属于已文档化的行为，不是静默兜底）；
+    * 其余情况必须是非空字符串，且不含路径分隔符、不含控制字符、长度受限。
+    """
     if raw is None:
-        return {"mode": DEFAULT_MODE, "margin": DEFAULT_MARGIN}
+        return {"mode": DEFAULT_MODE, "margin": DEFAULT_MARGIN, "isolate_material": None}
     if not isinstance(raw, dict):
         raise errors.ToonTunerError(errors.PARAM_INVALID, "framing 必须是对象。")
 
-    unknown = sorted(set(raw) - {"mode", "margin"})
+    unknown = sorted(set(raw) - {"mode", "margin", "isolate_material"})
     if unknown:
         raise errors.ToonTunerError(
             errors.PARAM_INVALID, f"framing 中存在未知字段：{unknown}"
@@ -897,16 +916,50 @@ def validate_options(raw: Any) -> dict[str, Any]:
             errors.PARAM_INVALID,
             f"安全边距需在 {MARGIN_MIN:g}–{MARGIN_MAX:g} 之间，收到 {margin:g}。",
         )
-    return {"mode": mode, "margin": round(margin, 4)}
+    return {
+        "mode": mode,
+        "margin": round(margin, 4),
+        "isolate_material": _validate_isolate(raw.get("isolate_material")),
+    }
+
+
+def _validate_isolate(raw: Any) -> str | None:
+    """校验隔离材质名。空 / 缺省 => 不隔离；其余非法形态一律拒绝。"""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise errors.ToonTunerError(errors.PARAM_INVALID, "隔离材质名必须是字符串。")
+    name = raw.strip()
+    if not name:
+        return None
+    if len(name) > ISOLATE_NAME_MAX:
+        raise errors.ToonTunerError(
+            errors.PARAM_INVALID,
+            f"隔离材质名过长（最多 {ISOLATE_NAME_MAX} 个字符，收到 {len(name)}）。",
+        )
+    for token in _ISOLATE_FORBIDDEN:
+        if token in name:
+            raise errors.ToonTunerError(
+                errors.PARAM_INVALID,
+                f"隔离材质名不能包含 {token!r}（该字符用于材质身份分隔）。",
+            )
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+        raise errors.ToonTunerError(
+            errors.PARAM_INVALID, "隔离材质名不能包含控制字符。"
+        )
+    return name
 
 
 def describe_options(options: dict[str, Any]) -> dict[str, Any]:
     mode = options.get("mode", DEFAULT_MODE)
+    isolate = options.get("isolate_material")
     return {
         "mode": mode,
         "mode_label": FRAMING_MODES.get(mode, mode),
         "margin": options.get("margin", DEFAULT_MARGIN),
         "uses_temporary_camera": mode in AUTO_MODES,
+        "isolate_material": isolate,
+        "isolates": bool(isolate),
     }
 
 
@@ -1137,6 +1190,11 @@ def build_render_code(
     * 渲染前后都**不改帧**，渲染结束后恢复原分辨率。
     * ``expected`` 给出基线时的帧与相机名：若已被外部改动，则**不渲染**，
       直接回一个 ``FRAMING_STALE`` 中止标记（兜底，防止提交与执行之间的时间差）。
+    * ``framing.isolate_material`` 给出材质名时做**隔离预览**：把不使用该材质的
+      网格对象临时 ``hide_render``，渲染后逐个写回原值。隔离在**取景计算之后、
+      渲染之前**施加，因此隔离前 / 隔离后两张图的机位完全一致。
+      材质找不到、或没有任何网格对象使用它时**不渲染**，回
+      ``ISOLATE_MATERIAL_MISSING`` 中止标记（绝不回一张「看起来隔离了、其实没有」的图）。
 
     **输出格式（PNG）绝不硬写**：渲染前把 ``media_type`` / ``file_format`` /
     ``color_mode`` / ``color_depth`` / ``filepath`` 整份记下，再「赋值 + 回读」地
@@ -1152,6 +1210,7 @@ def build_render_code(
     options = validate_options(framing)
     mode = options["mode"]
     margin = float(options["margin"])
+    isolate = options["isolate_material"]
     expected = expected or {}
     expect_frame = expected.get("frame_current")
     expect_camera = expected.get("camera")
@@ -1163,6 +1222,7 @@ def build_render_code(
 _target = {png_path!r}
 _mode = {mode!r}
 _margin = {margin!r}
+_isolate = {isolate!r}
 _expect_frame = {expect_frame!r}
 _expect_camera = {expect_camera!r}
 _width = {int(width)}
@@ -1273,6 +1333,12 @@ _fit = None
 _character = None
 _camera_used_name = None
 _distance = None
+#: 隔离预览的写入记录：``[[对象, 原 hide_render], ...]``，在 finally 里逐个写回
+_isolate_state = []
+_isolate_applied = False
+_isolate_reason = None
+_isolate_kept = []
+_isolate_hidden = []
 
 try:
     if _expect_frame is not None and int(_frame_at_start) != int(_expect_frame):
@@ -1332,14 +1398,76 @@ try:
             [_width, _height, _percentage],
         )
 
-        bpy.ops.render.render(write_still=False)
-        _image = bpy.data.images.get("Render Result")
-        if _image is None:
-            raise RuntimeError("渲染结束后未找到 Render Result")
-        _image.save_render(filepath=_target, scene=scene)
-        _rendered = os.path.isfile(_target)
+        # ★ 隔离预览：取景算完之后、渲染之前才动可见性 ——
+        #   这样隔离前 / 隔离后两张图的机位完全一致，用户能直接对比。
+        if _isolate:
+            _mat = _safe(lambda: bpy.data.materials.get(_isolate))
+            if _mat is None:
+                _isolate_reason = "当前工程里没有名为 %r 的材质。" % _isolate
+                _aborted = {{
+                    "code": "ISOLATE_MATERIAL_MISSING",
+                    "message": "隔离预览已中止：%s" % _isolate_reason,
+                }}
+            else:
+                _users = []
+                for _obj in scene.objects:
+                    if getattr(_obj, "type", "") != "MESH":
+                        continue
+                    _slots = _safe(lambda _o=_obj: list(_o.material_slots), []) or []
+                    _hit = False
+                    for _slot in _slots:
+                        if _safe(lambda _s=_slot: getattr(_s, "material", None)) is _mat:
+                            _hit = True
+                            break
+                    if _hit:
+                        _users.append(_obj)
+                if not _users:
+                    _isolate_reason = "材质 %r 没有被场景里任何网格对象使用。" % _isolate
+                    _aborted = {{
+                        "code": "ISOLATE_MATERIAL_MISSING",
+                        "message": "隔离预览已中止：%s" % _isolate_reason,
+                    }}
+                else:
+                    for _obj in scene.objects:
+                        if getattr(_obj, "type", "") != "MESH" or _obj in _users:
+                            continue
+                        # 本来就不可渲染的对象不动它 —— 少写一个属性，就少一份恢复风险
+                        if bool(getattr(_obj, "hide_render", False)):
+                            continue
+                        _isolate_state.append([_obj, getattr(_obj, "hide_render", None)])
+                        try:
+                            _obj.hide_render = True
+                        except Exception as _exc:
+                            _isolate_state.pop()
+                            _isolate_reason = "无法隐藏对象 %r：%s" % (
+                                getattr(_obj, "name", "?"), _exc
+                            )
+                            _aborted = {{
+                                "code": "ISOLATE_MATERIAL_MISSING",
+                                "message": "隔离预览已中止：%s" % _isolate_reason,
+                            }}
+                            break
+                    if _aborted is None:
+                        _isolate_applied = True
+                        _isolate_kept = [getattr(o, "name", "") for o in _users]
+                        _isolate_hidden = [getattr(pair[0], "name", "") for pair in _isolate_state]
+                        _safe(lambda: bpy.context.view_layer.update())
+
+        if _aborted is None:
+            bpy.ops.render.render(write_still=False)
+            _image = bpy.data.images.get("Render Result")
+            if _image is None:
+                raise RuntimeError("渲染结束后未找到 Render Result")
+            _image.save_render(filepath=_target, scene=scene)
+            _rendered = os.path.isfile(_target)
 finally:
     # ★ 无论成功、异常、还是被中止，都必须把工程恢复原样
+    # 隔离的可见性最先写回：它影响渲染结果，且必须在任何可能抛异常的清理之前。
+    for _pair in _isolate_state:
+        try:
+            _pair[0].hide_render = _pair[1]
+        except Exception:
+            pass
     try:
         if scene.camera is not _original_camera:
             scene.camera = _original_camera
@@ -1391,6 +1519,19 @@ for _name in list(_OUTPUT_FIELDS) + ["filepath"]:
         _output_mismatches[_name] = {{"expected": _want, "actual": _got}}
 _output_restored = not _output_mismatches
 
+# 隔离的无污染验证：逐个对象回读 hide_render，与渲染前记录的原值比对。
+# 验证不了（读不到）就算**没通过** —— 宁可报「未确认恢复」，也不假设已恢复。
+_isolate_mismatches = {{}}
+for _pair in _isolate_state:
+    _obj = _pair[0]
+    _want = _pair[1]
+    if _want is None:
+        continue
+    _got = _safe(lambda _o=_obj: getattr(_o, "hide_render", None), "__unreadable__")
+    if _got != _want:
+        _isolate_mismatches[getattr(_obj, "name", "?")] = {{"expected": _want, "actual": _got}}
+_isolate_restored = not _isolate_mismatches
+
 _out = {{
     "rendered": _rendered,
     "aborted": _aborted,
@@ -1428,6 +1569,16 @@ _out = {{
         "distance": _distance,
         "fit": _fit,
         "character": _character,
+    }},
+    "isolation": {{
+        "requested": bool(_isolate),
+        "material": _isolate,
+        "applied": _isolate_applied,
+        "reason": _isolate_reason,
+        "objects_kept": _isolate_kept,
+        "objects_hidden": _isolate_hidden,
+        "restored_ok": _isolate_restored,
+        "mismatches": _isolate_mismatches,
     }},
 }}
 print("__TOON_JSON__" + json.dumps(_out, ensure_ascii=False, default=str))

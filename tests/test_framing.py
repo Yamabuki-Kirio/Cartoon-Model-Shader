@@ -235,11 +235,23 @@ def test_camera_animation_is_reported(project_fake: FakeBpy) -> None:
 
 
 def test_validate_options_rejects_bad_input() -> None:
-    assert framing.validate_options(None) == {"mode": "current_camera", "margin": 0.15}
+    assert framing.validate_options(None) == {
+        "mode": "current_camera",
+        "margin": 0.15,
+        "isolate_material": None,
+    }
     assert framing.validate_options({"mode": "auto_headshot", "margin": 0.1}) == {
         "mode": "auto_headshot",
         "margin": 0.1,
+        "isolate_material": None,
     }
+    # 隔离材质：名字原样保留（前后空白去掉），空串 = 不隔离
+    assert framing.validate_options({"isolate_material": " 皮肤 "}) == {
+        "mode": "current_camera",
+        "margin": 0.15,
+        "isolate_material": "皮肤",
+    }
+    assert framing.validate_options({"isolate_material": ""})["isolate_material"] is None
     for bad in (
         {"mode": "auto_full"},
         {"mode": "current"},
@@ -249,6 +261,12 @@ def test_validate_options_rejects_bad_input() -> None:
         {"margin": "big"},
         {"margin": True},
         {"evil": 1},
+        # 隔离材质名：类型不对 / 含身份分隔符 / 含控制字符 / 超长，一律拒绝
+        {"isolate_material": 7},
+        {"isolate_material": "a/b"},
+        {"isolate_material": "a\\b"},
+        {"isolate_material": "a\nb"},
+        {"isolate_material": "x" * 201},
         "not-a-dict",
     ):
         with pytest.raises(errors.ToonTunerError) as exc:

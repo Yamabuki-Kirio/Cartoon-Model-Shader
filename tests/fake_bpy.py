@@ -23,7 +23,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 # 一个最小合法 PNG（1x1 透明），用于校验「确实落盘了图片」
 PNG_BYTES = bytes.fromhex(
@@ -99,11 +99,23 @@ def compose_matrix(
 # =============================================================================
 
 
+def _socket_type_of(value: Any) -> str:
+    """按取值推断插座类型（真实 bpy 是 ``VALUE`` / ``RGBA`` / ``VECTOR`` …）。
+
+    桩只需要「够用且稳定」：4 元列表按颜色（``RGBA``），其余序列按 ``VECTOR``，
+    其它一律 ``VALUE``。探针会把 ``type`` 原样上报，材质适配器据此区分标量与颜色。
+    """
+    if isinstance(value, (list, tuple)):
+        return "RGBA" if len(value) == 4 else "VECTOR"
+    return "VALUE"
+
+
 class FakeSocket:
-    def __init__(self, name: str, value: Any) -> None:
+    def __init__(self, name: str, value: Any, socket_type: str | None = None) -> None:
         self.name = name
         self.default_value = value
         self.is_linked = False
+        self.type = socket_type or _socket_type_of(value)
 
 
 class FakeInputs:
@@ -161,14 +173,33 @@ class FakeNode:
         node_type: str,
         inputs: dict[str, Any] | None = None,
         color_ramp: FakeColorRamp | None = None,
+        bl_idname: str | None = None,
     ) -> None:
         self.name = name
         self.label = name
         self.type = node_type
-        self.bl_idname = "CompositorNode" + node_type.title()
+        #: 合成器节点默认 ``CompositorNode*``；着色器节点用 ``bl_idname`` 显式指定
+        #: （例如 ``ShaderNodeBsdfPrincipled``），因为探针会把它原样上报。
+        self.bl_idname = bl_idname or ("CompositorNode" + node_type.title())
         self.mute = False
         self.inputs = FakeInputs(inputs or {})
         self.color_ramp = color_ramp
+
+
+class FakeLink:
+    """节点连线。探针靠它判断「材质输出连的是哪个着色器节点」。"""
+
+    def __init__(self, from_node: "FakeNode", from_socket: FakeSocket, to_node: "FakeNode", to_socket: FakeSocket) -> None:
+        self.from_node = from_node
+        self.from_socket = from_socket
+        self.to_node = to_node
+        self.to_socket = to_socket
+
+
+class FakeMaterialNodeTree:
+    def __init__(self, nodes: list[FakeNode], links: list[FakeLink] | None = None) -> None:
+        self.nodes = _NodeMap(nodes)
+        self.links = list(links or [])
 
 
 class _NodeMap:
@@ -201,6 +232,20 @@ DEFAULT_GLARE_INPUTS: dict[str, Any] = {
     "Saturation": 1.0,
     "Tint": [1.0, 1.0, 1.0, 1.0],
     "Size": 0.5,
+}
+
+#: Principled BSDF 的候选插座默认值（逐材质编辑竖切用）。
+#:
+#: 插座名按 Blender 4.x：``Specular IOR Level`` 是 4.x 的新名（3.x 叫 ``Specular``），
+#: 两个候选都留在探针的候选表里 —— 探针只上报**实际存在**的那个，适配器只认探到的。
+DEFAULT_PRINCIPLED_SOCKETS: dict[str, Any] = {
+    "Base Color": (0.8, 0.8, 0.8, 1.0),
+    "Metallic": 0.0,
+    "Roughness": 0.5,
+    "Emission Color": (0.0, 0.0, 0.0, 1.0),
+    "Emission Strength": 0.0,
+    "Specular IOR Level": 0.5,
+    "Alpha": 1.0,
 }
 
 
@@ -923,11 +968,15 @@ class FakeMaterial:
         blend_method: str = "OPAQUE",
         use_nodes: bool = True,
         base_color: tuple[float, float, float, float] = (0.8, 0.8, 0.8, 1.0),
+        nodes: list[FakeNode] | None = None,
+        links: list[FakeLink] | None = None,
     ) -> None:
         self.name = name
         self.blend_method = blend_method
         self.use_nodes = use_nodes
         self.diffuse_color = base_color
+        #: 未开节点时真实 Blender 也不给 ``node_tree``（探针据此报告 ``use_nodes: false``）
+        self.node_tree = FakeMaterialNodeTree(list(nodes or []), links) if use_nodes else None
 
 
 class _MaterialMap:
@@ -1160,6 +1209,65 @@ class FakeBpy:
     @property
     def view_settings(self) -> FakeViewSettings:
         return self.context.scene.view_settings
+
+    # -- 材质（逐材质编辑竖切用）------------------------------------------
+    def add_material(
+        self,
+        name: str,
+        *,
+        users: Iterable["FakeObject"] = (),
+        sockets: dict[str, Any] | None = None,
+        linked: Iterable[str] = (),
+        outputs: int = 1,
+        connect: bool = True,
+        blend_method: str = "OPAQUE",
+    ) -> FakeMaterial:
+        """建一个「材质输出 + Principled BSDF」的材质，并按需挂到对象上。
+
+        ``outputs`` 与 ``connect`` 用来复现**降级路径**：材质输出不唯一、或
+        Surface 没连线时，探针必须返回 ``shader: None``，适配器据此整体降级只读 ——
+        这正是「绝不猜 socket 名」在材质侧的落地。
+        """
+        values = dict(DEFAULT_PRINCIPLED_SOCKETS)
+        values.update(sockets or {})
+        bsdf = FakeNode(
+            "Principled BSDF",
+            "BSDF_PRINCIPLED",
+            values,
+            bl_idname="ShaderNodeBsdfPrincipled",
+        )
+        for socket_name in linked:
+            socket = bsdf.inputs.get(socket_name)
+            if socket is not None:
+                socket.is_linked = True
+        output_nodes = [
+            FakeNode(
+                "Material Output" if index == 0 else f"Material Output.{index:03d}",
+                "OUTPUT_MATERIAL",
+                {"Surface": None},
+                bl_idname="ShaderNodeOutputMaterial",
+            )
+            for index in range(max(0, int(outputs)))
+        ]
+        links: list[FakeLink] = []
+        if connect and output_nodes:
+            links.append(
+                FakeLink(
+                    bsdf,
+                    bsdf.inputs["Base Color"],
+                    output_nodes[0],
+                    output_nodes[0].inputs["Surface"],
+                )
+            )
+        material = FakeMaterial(
+            name, blend_method=blend_method, nodes=[bsdf, *output_nodes], links=links
+        )
+        self.data.materials.add(material)
+        for obj in users:
+            slot = FakeMaterialSlot(name)
+            slot.material = material
+            obj.material_slots.append(slot)
+        return material
 
     # -- 默认场景（量级参照真实工程）--------------------------------------
     def build_default_scene(self) -> None:

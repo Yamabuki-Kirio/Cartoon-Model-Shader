@@ -34,6 +34,7 @@ from typing import Any
 
 from . import errors, surface
 from .surface import cel as cel_module
+from .surface import material as material_module
 from .surface.identity import (
     ObjectRecord,
     Verdict,
@@ -69,6 +70,8 @@ class SurfaceBaseline:
     found_groups: int = 0
     declared_groups: int = 0
     compositor_group: str = ""
+    #: 进入受管范围的材质数（只统计被对象引用的材质）
+    material_count: int = 0
 
     def to_public(self) -> dict[str, Any]:
         return {
@@ -81,6 +84,7 @@ class SurfaceBaseline:
             "compositor_group": self.compositor_group,
             "found_groups": self.found_groups,
             "declared_groups": self.declared_groups,
+            "material_count": self.material_count,
             # 声明了但探不到 ⇒ 明确列出，而不是假装支持
             "degraded": list(self.degraded),
             "identities": [record.identity.to_public() for record in self.records.values()],
@@ -130,7 +134,10 @@ class SurfaceService:
     def capture(self, describe: dict[str, Any]) -> SurfaceBaseline:
         """从 ``surface_probe.describe_groups`` 的输出建立基线。"""
         records = records_from_describe(describe)
-        nodes = cel_module.build_cel_groups(describe)
+        # Cel 组在前、材质在后：导航栏的默认选中组因此仍是 Cel，材质是新增的一族。
+        nodes = cel_module.build_cel_groups(describe) + material_module.build_material_groups(
+            describe
+        )
         values = surface.baseline_values(nodes)
         baseline = SurfaceBaseline(
             baseline_id=uuid.uuid4().hex[:12],
@@ -148,6 +155,7 @@ class SurfaceService:
             found_groups=int(describe.get("found_groups") or 0),
             declared_groups=int(describe.get("declared_groups") or 0),
             compositor_group=str(describe.get("compositor_group") or ""),
+            material_count=len(describe.get("materials") or []),
         )
         self._baseline = baseline
         self._error = None

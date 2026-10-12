@@ -47,6 +47,23 @@ COMPOSITOR_GROUP_NAME = "AI_Compositor"
 #: 结构签名的组成字段（**不含值**）：只有这些变化才算结构变化。
 STRUCTURE_FIELDS: tuple[str, ...] = ("nodes", "color_ramp_elements", "material_slots")
 
+#: 材质「安全参数」对应的着色器插座**候选**名。
+#:
+#: 与 Cel 的 Emission 同一条规矩：候选名只是线索，**不是事实**。
+#: 命中之后还要过结构验证 —— 材质输出唯一、来源节点唯一、插座未被连线 ——
+#: 才算「已确认能力」，才允许写入；任何一条不满足就降级只读。
+#: 真机确认之前不写死任何一项（Blender 4.x 把 ``Specular`` 改名为
+#: ``Specular IOR Level``，两个候选都留着）。
+MATERIAL_SOCKET_CANDIDATES: tuple[str, ...] = (
+    "Base Color",
+    "Metallic",
+    "Roughness",
+    "Emission Color",
+    "Emission Strength",
+    "Specular IOR Level",
+    "Specular",
+)
+
 
 def build_describe_code() -> str:
     """生成只读拓扑探测代码。
@@ -168,14 +185,101 @@ def _object_inventory():
     return {{"total": len(objects), "by_type": counters}}
 
 
-def _material_inventory():
-    materials = _safe(lambda: list(bpy.data.materials), None) or []
+def _material_users():
+    """材质名 -> 使用它的对象名。只统计**真的挂在对象材质槽上**的材质。"""
+    out = {{}}
+    for obj in _safe(lambda: list(bpy.data.objects), None) or []:
+        for slot in _safe(lambda o=obj: list(o.material_slots), None) or []:
+            mat = _safe(lambda s=slot: s.material)
+            if mat is None:
+                continue
+            name = str(_safe(lambda m=mat: m.name, "") or "")
+            if not name:
+                continue
+            out.setdefault(name, []).append(str(_safe(lambda o=obj: o.name, "") or ""))
+    return out
+
+
+def _shader_socket_report(node, candidates):
+    """只报告候选插座：材质节点上其余插座一律不进载荷（收敛暴露面，也收敛体积）。"""
     out = []
-    for mat in materials:
+    for sock in _safe(lambda: list(node.inputs), None) or []:
+        name = str(_safe(lambda s=sock: s.name, "") or "")
+        if name not in candidates:
+            continue
         out.append({{
-            "name": str(_safe(lambda m=mat: m.name, "") or ""),
-            "blend_method": str(_safe(lambda m=mat: m.blend_method, "") or ""),
-            "has_nodes": bool(_safe(lambda m=mat: m.use_nodes, False)),
+            "name": name,
+            "type": str(_safe(lambda s=sock: s.type, "") or ""),
+            "linked": bool(_safe(lambda s=sock: s.is_linked, False)),
+            "value": _socket_value(_safe(lambda s=sock: getattr(s, "default_value", None))),
+        }})
+    return out
+
+
+def _surface_shader(tree, candidates):
+    """材质输出所连的那个着色器节点；**只有唯一确定**才返回，否则 None。
+
+    唯一确定 = 恰好一个 ``OUTPUT_MATERIAL`` 节点 + 它的 ``Surface`` 输入恰好一条连线。
+    不满足就返回 None，由适配器整体降级为只读 —— 与 Cel 侧「绝不猜 socket 名」同一条规矩。
+    """
+    nodes = _safe(lambda: list(tree.nodes), None) or []
+    outputs = [
+        n for n in nodes if str(_safe(lambda n=n: n.type, "") or "") == "OUTPUT_MATERIAL"
+    ]
+    if len(outputs) != 1:
+        return None
+    sources = []
+    for link in _safe(lambda: list(tree.links), None) or []:
+        if _safe(lambda l=link: l.to_node) is not outputs[0]:
+            continue
+        if str(_safe(lambda l=link: l.to_socket.name, "") or "") != "Surface":
+            continue
+        source = _safe(lambda l=link: l.from_node)
+        if source is not None:
+            sources.append(source)
+    if len(sources) != 1:
+        return None
+    node = sources[0]
+    return {{
+        "name": str(_safe(lambda n=node: n.name, "") or ""),
+        "type": str(_safe(lambda n=node: n.type, "") or ""),
+        "bl_idname": str(_safe(lambda n=node: n.bl_idname, "") or ""),
+        "linked_to_output": True,
+        "sockets": _shader_socket_report(node, candidates),
+    }}
+
+
+def _material_inventory(candidates):
+    """只报告**被对象引用**的材质 —— 没挂到任何对象上的材质不属于本工具的受管范围。
+
+    每项带：使用对象、节点结构签名（不含值）、以及材质输出所连着色器节点的候选插座。
+    """
+    users = _material_users()
+    out = []
+    for mat in _safe(lambda: list(bpy.data.materials), None) or []:
+        name = str(_safe(lambda m=mat: m.name, "") or "")
+        if not name:
+            continue
+        used_by = sorted(users.get(name) or [])
+        if not used_by:
+            continue
+        use_nodes = bool(_safe(lambda m=mat: m.use_nodes, False))
+        tree = _safe(lambda m=mat: m.node_tree) if use_nodes else None
+        nodes = _safe(lambda t=tree: list(t.nodes), None) or []
+        out.append({{
+            "name": name,
+            "blend_method": str(_safe(lambda m=mat: getattr(m, "blend_method", "")) or ""),
+            "use_nodes": use_nodes,
+            "node_count": len(nodes),
+            "structure_signature": sorted(
+                "{{}}:{{}}".format(
+                    str(_safe(lambda n=n: n.name, "") or ""),
+                    str(_safe(lambda n=n: n.type, "") or ""),
+                )
+                for n in nodes
+            ),
+            "users": used_by,
+            "shader": _surface_shader(tree, candidates) if tree is not None else None,
         }})
     return out
 
@@ -213,7 +317,7 @@ for _name in {list(REFERENCE_NODE_GROUPS)!r}:
     _report["role"] = "reference"
     _PAYLOAD["reference_groups"].append(_report)
 _PAYLOAD["objects"] = _object_inventory()
-_PAYLOAD["materials"] = _material_inventory()
+_PAYLOAD["materials"] = _material_inventory({list(MATERIAL_SOCKET_CANDIDATES)!r})
 _PAYLOAD["images"] = _image_inventory()
 
 print({DESCRIBE_MARKER!r} + json.dumps(_PAYLOAD, ensure_ascii=False, default=str))
@@ -344,6 +448,43 @@ def describe_groups(payload: dict[str, Any]) -> dict[str, Any]:
         # 声明了但探不到 ⇒ 明确降级，而不是假装支持
         "degraded": sorted(group["name"] for group in groups if not group["exists"]),
         "objects": payload.get("objects") or {},
-        "materials": list(payload.get("materials") or []),
+        "materials": [_normalise_material(item) for item in (payload.get("materials") or [])],
         "images": list(payload.get("images") or []),
+    }
+
+
+def _normalise_material(raw: Any) -> dict[str, Any]:
+    """把材质条目收敛成**固定字段**的形状。
+
+    与 ``groups`` 同一条纪律：只保留 schema 生成器真的会读的字段，
+    其余一律丢弃 —— 免得 Blender 侧将来多吐一个字段就悄悄进了响应。
+    """
+    item = raw if isinstance(raw, dict) else {}
+    shader = item.get("shader")
+    shader_out: dict[str, Any] | None = None
+    if isinstance(shader, dict):
+        shader_out = {
+            "name": str(shader.get("name") or ""),
+            "type": str(shader.get("type") or ""),
+            "bl_idname": str(shader.get("bl_idname") or ""),
+            "linked_to_output": bool(shader.get("linked_to_output")),
+            "sockets": [
+                {
+                    "name": str(socket.get("name") or ""),
+                    "type": str(socket.get("type") or ""),
+                    "linked": bool(socket.get("linked")),
+                    "value": socket.get("value"),
+                }
+                for socket in (shader.get("sockets") or [])
+                if isinstance(socket, dict)
+            ],
+        }
+    return {
+        "name": str(item.get("name") or ""),
+        "blend_method": str(item.get("blend_method") or ""),
+        "use_nodes": bool(item.get("use_nodes")),
+        "node_count": int(item.get("node_count") or 0),
+        "structure_signature": [str(entry) for entry in (item.get("structure_signature") or [])],
+        "users": sorted(str(entry) for entry in (item.get("users") or [])),
+        "shader": shader_out,
     }

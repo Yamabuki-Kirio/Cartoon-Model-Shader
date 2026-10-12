@@ -28,6 +28,9 @@ FRAMING_STALE = "FRAMING_STALE"
 FRAMING_UNAVAILABLE = "FRAMING_UNAVAILABLE"
 #: 预览必须输出 PNG，但工程的输出设置无法被安全切换过来（例如影片输出 FFMPEG）
 PREVIEW_OUTPUT_UNAVAILABLE = "PREVIEW_OUTPUT_UNAVAILABLE"
+#: 隔离预览指定的材质在当前工程里找不到 / 没有被任何网格对象使用。
+#: 宁可中止渲染，也不回一张「看起来隔离了、其实没有」的图。
+ISOLATE_MATERIAL_MISSING = "ISOLATE_MATERIAL_MISSING"
 # 会话令牌（所有写接口）
 SESSION_TOKEN_INVALID = "SESSION_TOKEN_INVALID"
 # 保存 / 应用到工程
@@ -150,6 +153,12 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         False,
         "预览只能输出 PNG，但当前工程的输出设置切不过去（常见原因：工程把渲染输出设为影片格式，"
         "如 FFMPEG）。预览已中止，工程未被改动。请把「输出属性 → 输出」改为图片格式后重试。",
+    ),
+    ISOLATE_MATERIAL_MISSING: (
+        409,
+        True,
+        "要隔离的材质在当前工程里找不到（可能已被重命名、删除，或没有任何网格对象在使用它）。"
+        "预览已中止，工程未被改动。请刷新基线后重新选择材质。",
     ),
     PRESET_NOT_FOUND: (
         404,

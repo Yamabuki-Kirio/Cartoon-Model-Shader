@@ -181,9 +181,11 @@ class ColorLooksResponse(BaseModel):
 
 
 class FramingOptions(BaseModel):
-    """预览取景方式与安全边距。
+    """预览取景方式、安全边距与隔离材质。
 
-    ``mode`` 只允许四个白名单取值；``margin`` 为安全边距（0–0.4，0.15 = 四周各留 15%）。
+    ``mode`` 只允许四个白名单取值；``margin`` 为安全边距（0–0.4，0.15 = 四周各留 15%）；
+    ``isolate_material`` 给出材质名时做隔离预览（渲染时临时隐藏不使用该材质的网格对象，
+    渲染后逐个写回原值）；``None`` / 空串表示不隔离。
     多余字段一律拒绝（422），不做静默兜底。
     """
 
@@ -193,6 +195,11 @@ class FramingOptions(BaseModel):
         "current_camera", "auto_full_body", "auto_upper_body", "auto_headshot"
     ] = "current_camera"
     margin: float = Field(default=0.15, ge=0.0, le=0.4)
+    isolate_material: str | None = Field(
+        default=None,
+        max_length=200,
+        description="隔离预览的材质名；None / 空串表示不隔离。",
+    )
 
 
 class BaselineRequest(BaseModel):

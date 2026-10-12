@@ -32,6 +32,10 @@ STRUCTURAL_FIELDS: tuple[str, ...] = (
     "color_ramp_elements",
     "material_slots",
     "link_count",
+    #: 节点拓扑签名（``名称:类型`` 的有序列表）。Cel 组只用到 ``node_count``，
+    #: 材质用它 —— 「节点改名/换类型」也算结构变化，否则「节点结构变化阻止保存」
+    #: 会在「数量没变但节点换了」时漏掉。
+    "nodes_signature",
 )
 
 
@@ -200,7 +204,11 @@ def _close(left: Any, right: Any, *, tolerance: float) -> bool:
 def records_from_describe(describe: dict[str, Any]) -> dict[str, ObjectRecord]:
     """把 ``surface_probe.describe_groups`` 的输出转成受管对象记录。
 
-    ``source`` 用 ``AI_Compositor``（受管节点组的宿主），因此身份三段齐全。
+    * 受管节点组：``source`` 用 ``AI_Compositor``（宿主），因此身份三段齐全；
+    * 材质：``source`` 用 ``scene``（材质属于场景级 datablock）。
+
+    材质进记录表是为了让「材质被改名 / 删除 / 节点结构变化」走与节点组**同一条**
+    闸门 —— 命中即 ``IDENTITY_MISSING`` / ``STRUCTURE_CHANGED``，草稿与保存令牌一并作废。
     """
     records: dict[str, ObjectRecord] = {}
     for group in describe.get("groups") or []:
@@ -221,6 +229,27 @@ def records_from_describe(describe: dict[str, Any]) -> dict[str, ObjectRecord]:
                 "color_ramp_elements": int(ramp_counts[0]) if ramp_counts else None,
                 "material_slots": group.get("material_count"),
                 "link_count": None,
+                "nodes_signature": None,
+            },
+        )
+        records[record.key] = record
+
+    for material in describe.get("materials") or []:
+        if not isinstance(material, dict):
+            continue
+        name = str(material.get("name") or "")
+        if not name:
+            continue
+        signature = [str(entry) for entry in (material.get("structure_signature") or [])]
+        record = ObjectRecord(
+            identity=ObjectIdentity(object_type="MATERIAL", name=name, source="scene"),
+            structure={
+                "node_count": int(material.get("node_count") or 0),
+                "color_ramp_elements": None,
+                # 材质被多少个对象引用：增删引用属结构变化
+                "material_slots": len(material.get("users") or []),
+                "link_count": None,
+                "nodes_signature": signature,
             },
         )
         records[record.key] = record
@@ -274,4 +303,27 @@ def value_snapshot(describe: dict[str, Any]) -> dict[str, Any]:
                         out[f"{prefix}.{channel}"] = component
                 else:
                     out[prefix] = value
+
+    # 材质：着色器上未连线的候选插座。值层变化只报告、不作废草稿（与节点组同一条规矩）。
+    for material in describe.get("materials") or []:
+        if not isinstance(material, dict):
+            continue
+        name = str(material.get("name") or "")
+        if not name:
+            continue
+        shader = material.get("shader")
+        if not isinstance(shader, dict):
+            continue
+        key = ObjectIdentity(object_type="MATERIAL", name=name, source="scene").key()
+        node_name = str(shader.get("name") or "")
+        for socket in shader.get("sockets") or []:
+            if not isinstance(socket, dict) or socket.get("linked"):
+                continue
+            prefix = f"{key}.node[{node_name}].input[{socket.get('name')}]"
+            value = socket.get("value")
+            if isinstance(value, (list, tuple)):
+                for channel, component in enumerate(value):
+                    out[f"{prefix}.{channel}"] = component
+            else:
+                out[prefix] = value
     return out

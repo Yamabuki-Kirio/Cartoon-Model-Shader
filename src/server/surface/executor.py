@@ -160,6 +160,35 @@ SETTERS: dict[tuple[str, str], tuple[str, str]] = {
         "_image({object_id}).colorspace_settings.name",
         "_image({object_id}).colorspace_settings.name = {value}",
     ),
+    # -- 材质（逐材质编辑竖切）-------------------------------------------
+    # ``object_id`` 形如 ``材质名/节点名/插座名``，三段**全部由服务端从探测结果拼出**
+    # （``surface/material.py``）。客户端永远不能提交节点路径或插座名 —— 与
+    # ``COLOR_RAMP`` / ``NODE_SOCKET`` 同一条防线。
+    # 六个字段共用一对读写函数：颜色与标量由 ``_set_material_socket`` 按取值形状分派。
+    ("MATERIAL", "base_color"): (
+        "_material_socket({object_id})",
+        "_set_material_socket({object_id}, {value})",
+    ),
+    ("MATERIAL", "metallic"): (
+        "_material_socket({object_id})",
+        "_set_material_socket({object_id}, {value})",
+    ),
+    ("MATERIAL", "roughness"): (
+        "_material_socket({object_id})",
+        "_set_material_socket({object_id}, {value})",
+    ),
+    ("MATERIAL", "emission_color"): (
+        "_material_socket({object_id})",
+        "_set_material_socket({object_id}, {value})",
+    ),
+    ("MATERIAL", "emission_strength"): (
+        "_material_socket({object_id})",
+        "_set_material_socket({object_id}, {value})",
+    ),
+    ("MATERIAL", "specular"): (
+        "_material_socket({object_id})",
+        "_set_material_socket({object_id}, {value})",
+    ),
 }
 
 
@@ -358,6 +387,60 @@ def _image(name):
     if img is None:
         raise RuntimeError("image not found: " + str(name))
     return img
+
+
+def _material(name):
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        raise RuntimeError("material not found: " + str(name))
+    return mat
+
+
+def _material_socket_ref(object_id):
+    """``材质名/节点名/插座名`` -> 真实插座对象。
+
+    三段都由服务端从探测结果拼出。任一段缺失、节点或插座不存在都**抛出**：
+    拓扑在基线与写入之间变了就必须让整份计划失败并回滚，绝不静默跳过 ——
+    否则界面会显示「已生效」而画面没变。
+    """
+    material_name, _, rest = str(object_id).partition("/")
+    node_name, _, socket_name = rest.partition("/")
+    if not material_name or not node_name or not socket_name:
+        raise RuntimeError("material socket binding is malformed: " + str(object_id))
+    material = _material(material_name)
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        raise RuntimeError("material has no node tree: " + str(material_name))
+    node = tree.nodes.get(node_name)
+    if node is None:
+        raise RuntimeError("material node not found: " + str(node_name))
+    for candidate in list(node.inputs):
+        if str(getattr(candidate, "name", "")) == socket_name:
+            return candidate
+    raise RuntimeError("material socket not found: " + str(socket_name))
+
+
+def _material_socket(object_id):
+    """读插座当前值：颜色返回 4 元列表，标量返回 float。"""
+    socket = _material_socket_ref(object_id)
+    value = getattr(socket, "default_value", None)
+    if isinstance(value, (list, tuple)):
+        return [float(component) for component in value]
+    return float(value)
+
+
+def _set_material_socket(object_id, value):
+    """写插座。颜色与标量按取值形状分派 —— 六个材质字段共用这一个函数。"""
+    socket = _material_socket_ref(object_id)
+    if bool(getattr(socket, "is_linked", False)):
+        # 已被上游连线：写 default_value 不会影响画面。与其假装成功，不如失败。
+        raise RuntimeError(
+            "material socket is linked, default_value has no effect: " + str(object_id)
+        )
+    if isinstance(value, (list, tuple)):
+        socket.default_value = [float(component) for component in value]
+    else:
+        socket.default_value = float(value)
 '''.strip()
 
 
