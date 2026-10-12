@@ -60,6 +60,18 @@ export function ActionBar({ workspace }: { workspace: Workspace }) {
       </div>
 
       <div class="action-group action-primary">
+        <label class="auto-preview" title="连续输入停手约 300ms、或一次操作结束（失焦 / 松开拖动 / 颜色确认）后自动渲染">
+          <input
+            type="checkbox"
+            data-testid="action-auto-preview"
+            checked={state.autoPreview}
+            disabled={state.historyBlocked}
+            onChange={(event) =>
+              workspace.actions.setAutoPreview((event.currentTarget as HTMLInputElement).checked)
+            }
+          />
+          自动预览
+        </label>
         <span class="pending-hint" data-testid="pending-hint">
           {pendingHint(state)}
         </span>
@@ -101,25 +113,34 @@ export function ActionBar({ workspace }: { workspace: Workspace }) {
 }
 
 /**
- * 底部提示要区分三种状态，混成一句就会骗人：
+ * 底部提示要区分四种状态，混成一句就会骗人：
  *
- * | 有画面 | 草稿比画面新 | 提示 |
- * |---|---|---|
- * | 否 | — | N 项已改（未预览） |
- * | 是 | 否 | N 项已改（已预览） |
- * | 是 | 是 | 有待预览的 L1 修改 |
+ * | 有画面 | 草稿比画面新 | 自动预览 | 提示 |
+ * |---|---|---|---|
+ * | 否 | — | — | N 项已改（未预览） |
+ * | 是 | 否 | — | N 项已改（已预览） |
+ * | 是 | 是 | 已排期 | 待预览：N 项已改（自动预览已排期） |
+ * | 是 | 是 | 关 / 渲染中 | 有待预览的 L1 修改 |
  */
 export function pendingHint(state: {
   previewStale: boolean;
   dirtyIds: Set<string>;
   lastSuccessfulPreview: unknown;
+  autoPreview: boolean;
+  autoPreviewPending: boolean;
 }): string {
   const count = state.dirtyIds.size;
   if (count === 0) {
     return "草稿与基线一致";
   }
   if (state.previewStale) {
-    return "有待预览的 L1 修改";
+    if (!state.autoPreview) {
+      return "有待预览的 L1 修改（自动预览已关闭）";
+    }
+    // 排期还在 = 手刚停下，马上会渲染；排期没了但画面仍旧 = 正在渲染（或刚被取代）。
+    return state.autoPreviewPending
+      ? `待预览：${count} 项已改（自动预览已排期）`
+      : "有待预览的 L1 修改";
   }
   return state.lastSuccessfulPreview ? `${count} 项已改（已预览）` : `${count} 项已改（未预览）`;
 }

@@ -124,6 +124,15 @@ export interface WorkspaceState {
   /** 结构失效：草稿已作废，预览被禁用，直到刷新基线。 */
   historyBlocked: boolean;
   framingChoice: FramingChoice;
+  /**
+   * 自动预览开关（默认**开**）。
+   *
+   * 关掉之后只能手动点「应用并预览」—— 渲染很贵，用户可能就想一次改完再渲染。
+   * 关掉时**不影响**已有的排期语义：`previewStale` 照旧提示「有待预览的修改」。
+   */
+  autoPreview: boolean;
+  /** 自动预览已经排期、还没提交（界面据此显示「待预览」）。 */
+  autoPreviewPending: boolean;
 }
 
 export interface FramingChoice {
@@ -176,6 +185,13 @@ export interface WorkspaceOptions {
   pollIntervalMs?: number;
   jobTimeoutMs?: number;
   now?: () => number;
+  /**
+   * 自动预览的**初始**开关，默认 `true`。
+   *
+   * 做成可注入的，是为了让测试能关掉它 —— 否则每个用例都会在 300ms 后
+   * 冒出一个真实计时器，用例之间互相干扰。生产默认值就是 `true`。
+   */
+  autoPreview?: boolean;
 }
 
 const IDLE_CONNECTION: ConnectionState = {
@@ -191,6 +207,37 @@ const DEFAULT_FRAMING: FramingChoice = {
   margin: 0.15,
   isolateMaterial: null,
 };
+
+// -- 自动预览 ------------------------------
+
+/**
+ * 连续输入（数字框打字、色标拖动）**停手**多久之后自动预览。
+ *
+ * 300ms 是「手还在动」与「这一下改完了」之间的分界：再短会把一次拖动拆成好几张图，
+ * 再长会让人觉得界面没反应。
+ */
+export const AUTO_PREVIEW_INPUT_MS = 300;
+
+/**
+ * 一次操作**结束**（输入框失焦 / 松开色标 / 颜色确认）之后多久自动预览。
+ *
+ * 比连续输入短得多：动作已经结束了，没有理由再等 —— 但仍留一小段，
+ * 好让「失焦后紧接着改下一个控件」这类连续操作合并成一次渲染。
+ */
+export const AUTO_PREVIEW_COMMIT_MS = 120;
+
+/**
+ * 自动预览的完整交互规则（就这两条）：
+ *
+ * | 触发 | 等待 | 语义 |
+ * |---|---|---|
+ * | 任何草稿改动 | {@link AUTO_PREVIEW_INPUT_MS} | 连续输入：停手之后才算一次 |
+ * | `sealHistory()`（失焦 / 松开拖动 / 颜色确认） | {@link AUTO_PREVIEW_COMMIT_MS} | 操作结束：立刻预览 |
+ *
+ * **快速连续修改只执行最后一次**：每次改动都重启计时器，因此排期天然收敛到最后一次。
+ * 计时器到点时若已有任务在跑，**不提交**（否则一次拖动会打断好几轮渲染），
+ * 改由任务终态回收时再排一次。
+ */
 
 /**
  * 把界面上的取景选择翻成请求载荷。
@@ -223,6 +270,8 @@ export function createWorkspace(options: WorkspaceOptions) {
    * 才能把 URL 交给 `img`。这个变量就是「当前那一次」的凭据（每次只跟踪一个）。
    */
   let baselineJobId: string | null = null;
+  /** 自动预览的排期计时器；`null` = 没有排期。 */
+  let autoPreviewTimer: ReturnType<typeof setTimeout> | null = null;
 
   const store: Store<WorkspaceState> = createStore<WorkspaceState>({
     schema: null,
@@ -253,6 +302,8 @@ export function createWorkspace(options: WorkspaceOptions) {
     loading: false,
     historyBlocked: false,
     framingChoice: DEFAULT_FRAMING,
+    autoPreview: options.autoPreview ?? true,
+    autoPreviewPending: false,
   });
 
   function syncHistoryDepths(): void {
@@ -262,6 +313,87 @@ export function createWorkspace(options: WorkspaceOptions) {
       canUndo: history.undoDepth > 0,
       canRedo: history.redoDepth > 0,
     });
+  }
+
+  /** 取消自动预览排期（结构失效 / 刷新基线 / 手动提交 / 卸载时都要走这里）。 */
+  function cancelAutoPreview(): void {
+    if (autoPreviewTimer !== null) {
+      clearTimeout(autoPreviewTimer);
+      autoPreviewTimer = null;
+    }
+    if (store.getState().autoPreviewPending) {
+      store.setState({ autoPreviewPending: false });
+    }
+  }
+
+  /**
+   * 自动预览是否**确实有活要干** —— 也就是「画面与当前草稿不一致」。
+   *
+   * 三种「没活」的情形必须分开判，否则会凭空渲染：
+   *
+   * * 已经有画面、且画面就是当前草稿（`previewStale === false`）；
+   * * **还没有任何画面，草稿也还是空的** —— 首张图由基线流程负责，
+   *   不该由自动预览代劳（否则一次单纯的失焦就会渲染一张空草稿的图）；
+   * * 结构失效（由 `scheduleAutoPreview` 统一挡掉，这里不重复判）。
+   */
+  function autoPreviewHasWork(): boolean {
+    const state = store.getState();
+    if (state.previewStale) {
+      return true;
+    }
+    if (state.lastSuccessfulPreview) {
+      return false;
+    }
+    return state.dirtyIds.size > 0;
+  }
+
+  /**
+   * 排一次自动预览。**每次调用都重启计时器** —— 这就是「快速连续修改只执行最后一次」。
+   *
+   * 关掉开关 / 结构失效 / 还没有 schema / 没有活要干时直接返回：不排期、也不留下
+   * `pending`，免得界面显示一个永远不会兑现的「待预览」。
+   */
+  function scheduleAutoPreview(delayMs: number): void {
+    const state = store.getState();
+    if (!state.autoPreview || state.historyBlocked || !state.schema) {
+      return;
+    }
+    if (!autoPreviewHasWork()) {
+      return;
+    }
+    if (autoPreviewTimer !== null) {
+      clearTimeout(autoPreviewTimer);
+    }
+    store.setState({ autoPreviewPending: true });
+    autoPreviewTimer = setTimeout(() => {
+      autoPreviewTimer = null;
+      void runAutoPreview();
+    }, delayMs);
+  }
+
+  /**
+   * 排期到点：该渲染就渲染。
+   *
+   * 三条提前返回，各有理由：
+   *
+   * * 开关被关掉 / 结构失效 / 没有活要干 —— 不渲染；
+   * * **已有任务在跑** —— 不渲染。这里刻意不「取代」，否则一次拖动会把在途渲染
+   *   打断好几轮；改由终态回收时（`handleTerminal`）再排一次，最多多一张图。
+   */
+  async function runAutoPreview(): Promise<void> {
+    const state = store.getState();
+    if (!state.autoPreview || state.historyBlocked) {
+      store.setState({ autoPreviewPending: false });
+      return;
+    }
+    store.setState({ autoPreviewPending: false });
+    if (!autoPreviewHasWork()) {
+      return;
+    }
+    if (state.activeJob !== null || state.loading) {
+      return;
+    }
+    await actions.applyAndPreview();
   }
 
   function applyDraft(next: SurfaceDraft): void {
@@ -274,6 +406,8 @@ export function createWorkspace(options: WorkspaceOptions) {
       // 那种情况由「N 项已改（未预览）」表达，两件事不能混成一句提示。
       previewStale: state.lastSuccessfulPreview !== null && draftVersion !== previewedVersion,
     });
+    // 连续输入：停手 300ms 才算一次改动（`sealHistory` 会把等待缩短到 120ms）。
+    scheduleAutoPreview(AUTO_PREVIEW_INPUT_MS);
   }
 
   function commitCommand(params: {
@@ -381,6 +515,14 @@ export function createWorkspace(options: WorkspaceOptions) {
       }
     }
     store.setState(patch);
+
+    // 自动预览的回收点：排期到点时若已有任务在跑，那次改动就没被渲染。
+    // **只在成功时续排** —— 失败时续排会对同一份必然失败的草稿反复重试，
+    // 把错误日志刷满，也让用户以为界面卡住了；失败就交给用户决定下一步。
+    const state = store.getState();
+    if (outcome === "succeeded" && state.autoPreview && !state.historyBlocked && state.previewStale) {
+      scheduleAutoPreview(AUTO_PREVIEW_COMMIT_MS);
+    }
   }
 
   /**
@@ -461,6 +603,9 @@ export function createWorkspace(options: WorkspaceOptions) {
     const framing: FramingChoice = { ...store.getState().framingChoice, ...(choice ?? {}) };
     // 上一次的基线预览若还挂着，这次刷新同样会取代它 —— 先如实改判，别让它停在 pending。
     baselineJobId = null;
+    // 刷新基线会清空草稿：任何在途的自动预览排期都已无意义，必须取消，
+    // 否则它会在新基线上渲染一份**已经不存在**的草稿。
+    cancelAutoPreview();
     store.setState({
       loading: true,
       error: null,
@@ -687,6 +832,9 @@ export function createWorkspace(options: WorkspaceOptions) {
 
     sealHistory(): void {
       history.seal();
+      // 操作结束（输入框失焦 / 松开色标 / 颜色确认）：把自动预览的等待从 300ms 缩到 120ms。
+      // 每次调用都重启计时器，因此「失焦后紧接着改下一个控件」仍会合并成一次渲染。
+      scheduleAutoPreview(AUTO_PREVIEW_COMMIT_MS);
     },
 
     dragElement(
@@ -842,6 +990,8 @@ export function createWorkspace(options: WorkspaceOptions) {
       const framing: FramingChoice = { ...state.framingChoice, ...(choice ?? {}) };
       const draft = sanitizeDraft(state.schema, state.draft);
       previewedVersionForSubmit = draftVersion;
+      // 手动提交即「立刻渲染」：把排期撤掉，免得刚渲染完又立刻被自动预览再渲染一次。
+      cancelAutoPreview();
       store.setState({ loading: true, error: null, notice: null, framingChoice: framing });
       // 新任务会取代在途的基线预览 —— 那次基线图不可能再被我们跟踪到，如实改判。
       abandonPendingBaselinePreview();
@@ -868,6 +1018,8 @@ export function createWorkspace(options: WorkspaceOptions) {
       // 否则基线图会永远停在「正在生成…」。
       const pendingBaseline = store.getState().baselinePreviewStatus === "pending";
       baselineJobId = null;
+      // 结构失效期间绝不自动渲染：草稿已经作废，排期必须一起撤掉。
+      cancelAutoPreview();
       runner.dispose();
       history.clear();
       syncHistoryDepths();
@@ -890,6 +1042,27 @@ export function createWorkspace(options: WorkspaceOptions) {
       routeErrorDetail(toDetail(error));
     },
 
+    /**
+     * 开关自动预览。
+     *
+     * 打开时如果**当前草稿还没被渲染**，立刻排一次（用「操作结束」的短等待）——
+     * 否则用户打开了开关却什么都没发生，会以为开关坏了。
+     */
+    setAutoPreview(enabled: boolean): void {
+      store.setState({ autoPreview: enabled });
+      if (!enabled) {
+        cancelAutoPreview();
+        return;
+      }
+      // 打开时如果确实有未渲染的改动，立刻排一次（`scheduleAutoPreview` 自己会判有没有活）；
+      // 否则用户打开了开关却什么都没发生，会以为开关坏了。
+      scheduleAutoPreview(AUTO_PREVIEW_COMMIT_MS);
+    },
+
+    cancelAutoPreview(): void {
+      cancelAutoPreview();
+    },
+
     effectiveFor(nodeId: string): unknown {
       const state = store.getState();
       if (nodeId in state.effective) {
@@ -900,6 +1073,8 @@ export function createWorkspace(options: WorkspaceOptions) {
     },
 
     dispose(): void {
+      // 卸载后计时器绝不能还活着：它会在一个已卸载的工作台上提交任务。
+      cancelAutoPreview();
       runner.dispose();
     },
   };

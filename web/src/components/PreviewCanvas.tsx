@@ -156,7 +156,12 @@ export function PreviewCanvas({ workspace }: { workspace: Workspace }) {
       ) : null}
       {state.previewStale ? (
         <p class="inline-warn" data-testid="preview-stale">
-          画面已过期：你在渲染期间又改过草稿。点「应用并预览」刷新画面。
+          画面已过期：你在渲染期间又改过草稿。
+          {state.autoPreview
+            ? state.autoPreviewPending
+              ? "自动预览已排期，稍等即可。"
+              : "自动预览正在渲染，稍等即可。"
+            : "自动预览已关闭，点「应用并预览」刷新画面。"}
         </p>
       ) : null}
     </section>

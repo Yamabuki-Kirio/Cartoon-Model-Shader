@@ -64,9 +64,31 @@ export function makeTestEndpoints(overrides: Partial<WorkspaceEndpoints> = {}): 
   return endpoints;
 }
 
-export function makeTestWorkspace(overrides: Partial<WorkspaceEndpoints> = {}) {
+/**
+ * 造一个测试工作台。
+ *
+ * **默认关掉自动预览**：生产默认是开的，但开着的话每个用例都会在 300ms 后冒出一个
+ * 真实计时器，用例之间互相干扰（上一个用例的排期可能在上一个用例结束后才到点）。
+ * 要测自动预览的用例显式传 `{ autoPreview: true }` 并配合 `vi.useFakeTimers()`。
+ */
+/**
+ * 造一个测试工作台。
+ *
+ * **默认关掉自动预览**：生产默认是开的，但开着的话每个用例都会在 300ms 后冒出一个
+ * 真实计时器，用例之间互相干扰（上一个用例的排期可能在上一个用例结束后才到点）。
+ * 要测自动预览的用例显式传 `{ autoPreview: true }` 并配合 `vi.useFakeTimers()`。
+ */
+export function makeTestWorkspace(
+  overrides: Partial<WorkspaceEndpoints> = {},
+  options: { autoPreview?: boolean } = {}
+) {
   const endpoints = makeTestEndpoints(overrides);
-  const workspace = createWorkspace({ endpoints, pollIntervalMs: 0, now: () => 0 });
+  const workspace = createWorkspace({
+    endpoints,
+    pollIntervalMs: 0,
+    now: () => 0,
+    autoPreview: options.autoPreview ?? false,
+  });
   return { workspace, endpoints };
 }
 
