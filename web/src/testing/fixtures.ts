@@ -481,3 +481,123 @@ export function jobPayload(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+// -- 预设与保存 ------------------------
+
+/** 预设摘要。`surface_count` 为 0 表示这是一份只含 L0 的旧预设。 */
+export function presetSummary(overrides: Record<string, unknown> = {}) {
+  return {
+    preset_id: "p0000000001",
+    name: "柔和肤色 v2",
+    schema: "toon-tuner-preset/1",
+    created_at: "2026-10-01T10:00:00+08:00",
+    updated_at: "2026-10-09T18:00:00+08:00",
+    pipeline_mode: "faithful",
+    framing_mode: "current_camera",
+    framing_margin: 0.15,
+    preview_quality: "standard",
+    parameter_count: 0,
+    active_count: 0,
+    surface_count: 2,
+    ...overrides,
+  };
+}
+
+export function presetDetail(overrides: Record<string, unknown> = {}) {
+  return {
+    ...presetSummary(),
+    parameters: {},
+    surface: {
+      "cel.Cel_Skin.ramp.interpolation": "CONSTANT",
+      "cel.Cel_Skin.managed_mode": "simple",
+    },
+    ...overrides,
+  };
+}
+
+export function presetListPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    ok: true as const,
+    protocol: "toon-tuner-presets/1",
+    storage: "%LOCALAPPDATA%\\CartoonModelShader\\presets",
+    presets: [presetSummary()],
+    skipped: [],
+    quality_tiers: { standard: { label: "标准", long_side: 990, samples: 8 } },
+    pipeline_modes: ["faithful", "enhanced"],
+    framing_modes: ["current_camera", "auto_headshot"],
+    defaults: {
+      pipeline_mode: "faithful",
+      framing_mode: "current_camera",
+      framing_margin: 0.15,
+      preview_quality: "standard",
+    },
+    ...overrides,
+  };
+}
+
+/** prepare 成功的响应：`save_as`、目标不存在 → 不需要备份。 */
+export function commitPreparedPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    ok: true as const,
+    token: "tok-0000000001",
+    mode: "save_as",
+    target_path: "D:\\项目\\角色-调参.blend",
+    backup_path: null as string | null,
+    warnings: [],
+    baseline_id: "bl0000000001",
+    draft_hash: "a".repeat(64),
+    parameter_count: 24,
+    surface_parameter_count: 2,
+    structure_hash: "f".repeat(64),
+    normalized: [],
+    expires_at: "2026-10-09T18:05:00+08:00",
+    expires_in_seconds: 300,
+    confirmation_required: false,
+    ...overrides,
+  };
+}
+
+/** 完整的四态状态块（成功保存）。 */
+export function commitStatusPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    applied: true,
+    readback_verified: true,
+    mismatches: [],
+    backup: { required: false, created: false, path: null, path_confirmed: null },
+    rollback: {
+      attempted: false,
+      verified: false,
+      mismatches: [],
+      code: null,
+      error: null,
+      reason: "保存成功，未触发回滚。",
+    },
+    saved: true,
+    target_path: "D:\\项目\\角色-调参.blend",
+    mode: "save_as",
+    draft_preserved: true,
+    applied_surface: { "cel.Cel_Skin.managed_mode": "simple" },
+    surface_readback_verified: true,
+    surface_mismatches: [],
+    save: { path_after: "D:\\项目\\角色-调参.blend", path_matches: true, file_exists: true, is_dirty_after: false },
+    ...overrides,
+  };
+}
+
+export function commitResponsePayload(overrides: Record<string, unknown> = {}) {
+  return {
+    ok: true as const,
+    mode: "save_as",
+    target_path: "D:\\项目\\角色-调参.blend",
+    backup_path: null as string | null,
+    saved: true,
+    status: commitStatusPayload(),
+    steps: ["复核确认时的前提", "应用完整草稿", "回读校验", "复核 v4 结构", "应用 Cel 草稿", "无需备份", "保存工程", "刷新基线"],
+    normalized: [],
+    baseline_id: "bl0000000002",
+    baseline_refreshed: true,
+    saved_at: "2026-10-09T18:01:00+08:00",
+    warnings: [],
+    ...overrides,
+  };
+}

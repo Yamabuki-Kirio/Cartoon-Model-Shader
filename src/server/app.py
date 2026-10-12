@@ -234,7 +234,11 @@ class BlenderGateway:
 
 def _preset_public(preset: dict[str, Any]) -> dict[str, Any]:
     """预设的对外形状：摘要 + 逐参数明细（字段名与存储格式一致）。"""
-    return {**presets_module.summary_of(preset), "parameters": dict(preset.get("parameters") or {})}
+    return {
+        **presets_module.summary_of(preset),
+        "parameters": dict(preset.get("parameters") or {}),
+        "surface": dict(preset.get("surface") or {}),
+    }
 
 
 def create_app(

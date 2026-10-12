@@ -286,3 +286,78 @@ body {
 }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* 保存闭环：预设面板与保存面板 */
+.save-dialog,
+.preset-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 16px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+.save-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  align-items: baseline;
+}
+.save-head strong { margin-right: 4px; }
+.save-modes { display: flex; gap: 18px; font-size: 13px; }
+.save-mode { display: inline-flex; align-items: center; gap: 6px; }
+.save-field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.save-field input[type="text"] {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.save-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--panel-alt);
+  font-size: 13px;
+}
+.save-paths { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0; }
+.save-paths dt { color: var(--muted); }
+.save-paths dd { margin: 0; word-break: break-all; }
+.save-warnings { margin: 0; padding-left: 18px; color: var(--warn); }
+.save-confirm-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.save-steps { margin: 0; padding-left: 20px; font-size: 12px; color: var(--muted); }
+.save-status-ok { color: var(--ok); }
+.save-status-bad { color: var(--bad); }
+.save-status-unknown { color: var(--muted); }
+.save-status-skip { color: var(--muted); }
+.save-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+.preset-save-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; }
+.preset-save-row input[type="text"] {
+  flex: 1 1 220px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  color: var(--text);
+}
+.preset-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.preset-item {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.preset-item-main { display: flex; flex-direction: column; }
+.preset-meta { font-size: 12px; }
+.preset-item-actions { display: flex; gap: 6px; }

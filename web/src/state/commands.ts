@@ -20,7 +20,9 @@ export type CommandKind =
   | "setElementColor"
   | "resetGroup"
   | "resetAll"
-  | "copyToGroup";
+  | "copyToGroup"
+  /** 套用一份预设到草稿。一次性改很多项，因此是不可合并的原子命令。 */
+  | "applyPreset";
 
 export interface DraftCommand {
   kind: CommandKind;

@@ -17,6 +17,14 @@
 * 文件名由预设名派生（方便人工浏览 ``presets`` 目录），但**稳定身份**是文件内的
   ``preset_id``：重命名只改名字与文件名，身份不变，前端引用不会失效。
 * 对外响应只给**可展示**的存储位置（``%LOCALAPPDATA%\\...``），不给本机绝对路径。
+
+两份草稿、两套校验强度
+----------------------
+``parameters`` 是 L0 参数（本工具声明的、跨工程稳定的 id）→ 逐项对着
+:data:`~src.server.params.BY_ID` 白名单与范围校验。
+``surface`` 是 v4 参数面草稿（Cel 组名 + 材质名，都是**工程事实**）→ 没有白名单，
+只做结构校验；「这个 id 在当前工程里存不存在」由预览 / 保存时的基线判定。
+这不是放松要求，而是把校验放在**唯一知道答案的地方**。
 """
 
 from __future__ import annotations
@@ -53,9 +61,29 @@ PRESET_FIELDS: tuple[str, ...] = (
     "framing_margin",
     "preview_quality",
     "parameters",
+    "surface",
 )
 #: 单个参数条目允许出现的字段
 PARAMETER_FIELDS: tuple[str, ...] = ("configured_value", "effective_value", "active")
+
+# ---- v4 参数面草稿 --------------------------------------------------------
+
+#: ``surface`` 段：``v4 参数 id -> 取值``。
+#:
+#: 与 ``parameters`` 的**根本区别**：``parameters`` 只收 L0 白名单里的 id，
+#: 因为那批参数是本工具自己声明的、跨工程稳定；而 v4 参数 id 里含**工程事实**
+#: （Cel 组名、材质名），没有、也不该有全局白名单。所以这里只做**结构**校验：
+#: 形状、长度、有限性、嵌套深度。合法性（这个 id 在当前基线里存不存在、
+#: 这个值超没超范围）一律留到预览 / 保存时由服务端对着**当时的**基线判定 ——
+#: 预设要能跨工程、跨版本存在，把本机结构写死进预设反而是错的。
+#:
+#: 不允许把「本机路径 / 模型名 / 凭据」写进来这一条**照旧生效**：
+#: 整份预设（含 ``surface``）都要过 :func:`scan_forbidden`。
+SURFACE_MAX_ENTRIES = 512
+SURFACE_ID_MAX_LENGTH = 200
+SURFACE_TEXT_MAX_LENGTH = 400
+SURFACE_VALUE_MAX_DEPTH = 6
+SURFACE_VALUE_MAX_ITEMS = 64
 
 # ---- 存储位置 -------------------------------------------------------------
 
@@ -371,6 +399,81 @@ def _normalize_parameter(param_id: Any, raw: Any) -> dict[str, Any]:
     }
 
 
+def _check_surface_id(param_id: Any) -> str:
+    """v4 参数 id 的**结构**校验（不做白名单，理由见 ``SURFACE_MAX_ENTRIES``）。"""
+    if not isinstance(param_id, str):
+        raise _invalid("surface 的参数 id 必须是字符串。")
+    if not param_id.strip():
+        raise _invalid("surface 的参数 id 不能为空。")
+    if len(param_id) > SURFACE_ID_MAX_LENGTH:
+        raise _invalid(
+            f"surface 的参数 id 超长（最多 {SURFACE_ID_MAX_LENGTH} 个字符）：{param_id[:40]!r}…"
+        )
+    if any(ord(char) < 32 for char in param_id):
+        raise _invalid(f"surface 的参数 id 含控制字符：{param_id!r}")
+    return param_id
+
+
+def _check_surface_value(value: Any, path: str, depth: int = 0) -> Any:
+    """递归校验 v4 取值形状。
+
+    允许：``None`` / 布尔 / 有限数字 / 字符串 / 同构列表 / 字符串键的对象
+    （色带的 ``{"elements": [...], "interpolation": "..."}`` 就是最后一种）。
+    拒绝：非有限浮点、超长字符串、超深或超宽的嵌套、非字符串的键。
+
+    **不做**范围校验：范围是基线里的事实（材质粗糙度 0–1、色标位置 0–1 …），
+    服务端在预览 / 保存时会对着当时的 schema 判定并给出稳定错误码。
+    """
+    if depth > SURFACE_VALUE_MAX_DEPTH:
+        raise _invalid(f"{path} 嵌套过深（最多 {SURFACE_VALUE_MAX_DEPTH} 层）。")
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if not math.isfinite(number):
+            raise _invalid(f"{path} 必须是有限数值。")
+        return value
+    if isinstance(value, str):
+        if not value.strip():
+            raise _invalid(f"{path} 不能为空字符串。")
+        if len(value) > SURFACE_TEXT_MAX_LENGTH:
+            raise _invalid(
+                f"{path} 超长（最多 {SURFACE_TEXT_MAX_LENGTH} 个字符，收到 {len(value)} 个）。"
+            )
+        return value
+    if isinstance(value, (list, tuple)):
+        if len(value) > SURFACE_VALUE_MAX_ITEMS:
+            raise _invalid(f"{path} 元素过多（最多 {SURFACE_VALUE_MAX_ITEMS} 个）。")
+        return [
+            _check_surface_value(item, f"{path}[{index}]", depth + 1)
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        if len(value) > SURFACE_VALUE_MAX_ITEMS:
+            raise _invalid(f"{path} 字段过多（最多 {SURFACE_VALUE_MAX_ITEMS} 个）。")
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise _invalid(f"{path} 的字段名必须是字符串。")
+            out[key] = _check_surface_value(item, f"{path}.{key}", depth + 1)
+        return out
+    raise _invalid(f"{path} 的取值类型不支持：{type(value).__name__}。")
+
+
+def _normalize_surface(raw: Any) -> dict[str, Any]:
+    """校验并规范 v4 参数面草稿。缺省 / ``None`` / 空对象都归一成 ``{}``。"""
+    if raw in (None, ""):
+        return {}
+    if not isinstance(raw, dict):
+        raise _invalid("surface 必须是对象（参数 id -> 取值）。")
+    if len(raw) > SURFACE_MAX_ENTRIES:
+        raise _invalid(f"surface 参数过多（最多 {SURFACE_MAX_ENTRIES} 个）。")
+    return {
+        _check_surface_id(param_id): _check_surface_value(value, f"surface[{param_id!r}]")
+        for param_id, value in raw.items()
+    }
+
+
 def normalize_preset(
     raw: Any,
     *,
@@ -418,6 +521,10 @@ def normalize_preset(
         raise _invalid("parameters 必须是对象（参数 id -> 取值）。")
     parameters = {pid: _normalize_parameter(pid, value) for pid, value in parameters_raw.items()}
 
+    # v4 参数面草稿（Cel + 逐材质）。旧文件没有这一段 —— 归一成 `{}`，
+    # 因此「老预设照旧能读」，不需要迁移，也不会因为缺字段被判非法。
+    surface = _normalize_surface(raw.get("surface"))
+
     if new_id:
         resolved_id = uuid.uuid4().hex[:12]
     else:
@@ -450,6 +557,7 @@ def normalize_preset(
             DEFAULT_PREVIEW_QUALITY,
         ),
         "parameters": parameters,
+        "surface": surface,
     }
 
     findings = scan_forbidden(preset)
@@ -479,7 +587,24 @@ def summary_of(preset: dict[str, Any]) -> dict[str, Any]:
         "preview_quality": preset["preview_quality"],
         "parameter_count": len(parameters),
         "active_count": sum(1 for entry in parameters.values() if entry.get("active")),
+        # v4 参数面草稿条数（0 = 这份预设不含 Cel / 材质草稿）。
+        # 前端据此区分「L0 预设」与「完整预设」，不需要先取明细。
+        "surface_count": len(preset.get("surface") or {}),
     }
+
+
+def materialize_surface(preset: dict[str, Any]) -> dict[str, Any]:
+    """取出预设里的 v4 参数面草稿（可直接提交给预览 / 保存）。
+
+    与 :func:`materialize_draft` 分开是有意的：那份处理的是 L0 的
+    ``configured_value / effective_value / active`` 三元组与 look 依赖校验，
+    这里的取值在写入时就已经是**裸取值**（见 ``_normalize_surface``），
+    没有可迁移的显示标签，也就没有需要延后到提交时再校验的东西。
+
+    返回的是深拷贝 —— 调用方改它不该改到预设本体。
+    """
+    raw = preset.get("surface") or {}
+    return json.loads(json.dumps(raw))
 
 
 # =============================================================================

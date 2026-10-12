@@ -2,7 +2,16 @@
 
 import { vi } from "vitest";
 import { parseSchema } from "../schema/parse";
-import { baselinePayload, jobPayload, schemaPayload } from "./fixtures";
+import {
+  baselinePayload,
+  commitPreparedPayload,
+  commitResponsePayload,
+  jobPayload,
+  presetDetail,
+  presetListPayload,
+  presetSummary,
+  schemaPayload,
+} from "./fixtures";
 import { createWorkspace, type WorkspaceEndpoints } from "../state/workspace";
 import type { JobState } from "../api/types";
 
@@ -14,6 +23,13 @@ export type TestEndpoints = WorkspaceEndpoints & {
   job: ReturnType<typeof vi.fn>;
   blenderStatus: ReturnType<typeof vi.fn>;
   framingContext: ReturnType<typeof vi.fn>;
+  listPresets: ReturnType<typeof vi.fn>;
+  readPreset: ReturnType<typeof vi.fn>;
+  createPreset: ReturnType<typeof vi.fn>;
+  updatePreset: ReturnType<typeof vi.fn>;
+  deletePreset: ReturnType<typeof vi.fn>;
+  commitPrepare: ReturnType<typeof vi.fn>;
+  commitApply: ReturnType<typeof vi.fn>;
 };
 
 export function makeTestEndpoints(overrides: Partial<WorkspaceEndpoints> = {}): TestEndpoints {
@@ -59,6 +75,42 @@ export function makeTestEndpoints(overrides: Partial<WorkspaceEndpoints> = {}): 
       },
     })),
     parseSchema,
+    // -- 预设 ------------------------
+    // 夹具**不**缓存：真实服务端每次都读目录，缓存一份会让
+    // 「删了之后还在」这类缺陷在测试里永远看不到。
+    listPresets: vi.fn(async () => presetListPayload()),
+    readPreset: vi.fn(async (presetId: string) => ({
+      ok: true as const,
+      preset: presetDetail({ preset_id: presetId }),
+    })),
+    createPreset: vi.fn(async (body: { name: string; surface?: Record<string, unknown> }) => ({
+      ok: true as const,
+      preset: presetDetail({
+        name: body.name,
+        surface: body.surface ?? {},
+        surface_count: Object.keys(body.surface ?? {}).length,
+      }),
+    })),
+    updatePreset: vi.fn(
+      async (presetId: string, body: { name: string; surface?: Record<string, unknown> }) => ({
+        ok: true as const,
+        preset: presetDetail({
+          preset_id: presetId,
+          name: body.name,
+          surface: body.surface ?? {},
+          surface_count: Object.keys(body.surface ?? {}).length,
+        }),
+      })
+    ),
+    deletePreset: vi.fn(async (presetId: string) => ({
+      ok: true as const,
+      deleted: presetSummary({ preset_id: presetId }),
+    })),
+    // -- 保存 ------------------------
+    // 默认「目标不存在」→ 不需要备份 → prepare 直接签发令牌，不要求确认。
+    // 要测二次确认的用例自己把 commitPrepare 换成抛 SAVE_CONFIRM_REQUIRED。
+    commitPrepare: vi.fn(async () => commitPreparedPayload()),
+    commitApply: vi.fn(async () => commitResponsePayload()),
     ...overrides,
   } as TestEndpoints;
   return endpoints;

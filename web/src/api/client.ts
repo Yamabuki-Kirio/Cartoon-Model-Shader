@@ -32,7 +32,11 @@ export function readInjectedToken(): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-export type HttpMethod = "GET" | "POST";
+/**
+ * 允许的方法。`GET` 之外的一律算写请求 —— 判定按「是不是读」而不是逐个列举，
+ * 将来新增方法时不会因为忘了加进白名单而漏掉令牌。
+ */
+export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 
 export interface RequestOptions {
   method?: HttpMethod;
@@ -141,6 +145,15 @@ export class ApiClient {
 
   post<T>(path: string, body?: unknown, options: Omit<RequestOptions, "method" | "body"> = {}): Promise<T> {
     return this.request<T>(path, { ...options, method: "POST", body: body ?? {} });
+  }
+
+  /** 覆盖保存预设用。与 `post` 同样带令牌（`GET` 之外一律算写请求）。 */
+  put<T>(path: string, body?: unknown, options: Omit<RequestOptions, "method" | "body"> = {}): Promise<T> {
+    return this.request<T>(path, { ...options, method: "PUT", body: body ?? {} });
+  }
+
+  del<T>(path: string, options: Omit<RequestOptions, "method" | "body"> = {}): Promise<T> {
+    return this.request<T>(path, { ...options, method: "DELETE" });
   }
 }
 

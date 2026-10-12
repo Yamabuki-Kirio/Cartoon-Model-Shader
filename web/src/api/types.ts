@@ -29,6 +29,17 @@ export class AppError extends Error {
   get isStructureFatal(): boolean {
     return this.code === "STRUCTURE_CHANGED" || this.code === "IDENTITY_MISSING";
   }
+
+  /**
+   * 「覆盖需要二次确认」—— 这**不是**失败。
+   *
+   * 服务端在覆盖已有文件且没收到 `confirm` 时回 409 + 该错误码，
+   * `details` 里带目标绝对路径与预计备份路径。前端要把它渲染成确认提示，
+   * 而不是一条红色错误：用户还没做错任何事，只是还没看清路径。
+   */
+  get isSaveConfirmRequired(): boolean {
+    return this.code === "SAVE_CONFIRM_REQUIRED";
+  }
 }
 
 export function isAbortError(error: unknown): boolean {
@@ -192,4 +203,181 @@ export interface ConnectionState {
   latencyMs: number | null;
   checkedAt: string | null;
   message: string | null;
+}
+
+// -- 预设（MVP-03）------------------------
+
+export interface PresetSummary {
+  preset_id: string;
+  name: string;
+  schema: string;
+  created_at: string;
+  updated_at: string;
+  pipeline_mode: string;
+  framing_mode: string;
+  framing_margin: number;
+  preview_quality: string;
+  /** L0 参数条数。 */
+  parameter_count: number;
+  active_count: number;
+  /**
+   * v4 参数面草稿条数。
+   *
+   * `0` 表示这是一份**只含 L0 的旧预设**（v4 参数面加进来之前存的）；
+   * 界面据此区分「L0 预设」与「完整预设」，不需要先把明细拉下来。
+   */
+  surface_count: number;
+}
+
+export interface PresetDetail extends PresetSummary {
+  /** L0 参数：`{configured_value, effective_value, active}` 三元组。 */
+  parameters: Record<string, unknown>;
+  /**
+   * v4 参数面草稿：`参数 id -> 裸取值`。
+   *
+   * 与 `parameters` 的区别不是风格问题：`surface` 的取值在写入时就是最终值，
+   * 没有需要迁移的显示标签，所以没有三元组包装。
+   */
+  surface: Record<string, unknown>;
+}
+
+export interface PresetSkip {
+  file: string;
+  code: string;
+  message: string;
+}
+
+export interface PresetListResponse {
+  ok: true;
+  protocol: string;
+  /** **可展示**的存储位置（如 `%LOCALAPPDATA%\...`），绝不含本机绝对路径。 */
+  storage: string;
+  presets: PresetSummary[];
+  /** 读不动的文件：不会被静默忽略，带着错误码与原因列出来。 */
+  skipped: PresetSkip[];
+  quality_tiers: Record<string, Record<string, unknown>>;
+  pipeline_modes: string[];
+  framing_modes: string[];
+  defaults: Record<string, unknown>;
+}
+
+export interface PresetDetailResponse {
+  ok: true;
+  preset: PresetDetail;
+}
+
+/** 新建 / 覆盖保存预设的请求体。 */
+export interface PresetSaveBody {
+  name: string;
+  pipeline_mode?: string;
+  framing_mode?: string;
+  framing_margin?: number;
+  preview_quality?: string;
+  parameters?: Record<string, unknown>;
+  surface?: Record<string, unknown>;
+}
+
+// -- 应用到工程（commit）------------------------
+
+export type SaveMode = "save_as" | "overwrite";
+
+/** `POST /api/session/commit/prepare` 的请求体。 */
+export interface CommitPrepareBody {
+  mode: SaveMode;
+  draft: Record<string, unknown>;
+  /** 仅 `save_as` 使用：绝对路径且以 `.blend` 结尾。 */
+  target_path?: string | null;
+  /** 覆盖已有文件必须为 `true`（先看清绝对路径与备份位置再确认）。 */
+  confirm?: boolean;
+  surface_draft?: Record<string, unknown> | null;
+  structure_hash?: string | null;
+}
+
+/**
+ * 准备阶段成功时的响应：**一次性短效令牌** + 目标 / 备份的绝对路径。
+ *
+ * `confirmation_required` 为 `true` 表示这次会覆盖已有文件、且已生成过备份路径。
+ * 覆盖**未经确认**时服务端不会走到这里，而是回 `SAVE_CONFIRM_REQUIRED`（409），
+ * 其 `details` 里带着同样的两条路径 —— 前端把那个错误当成「确认提示」来渲染。
+ */
+export interface CommitPrepareResponse {
+  ok: true;
+  token: string;
+  mode: string;
+  target_path: string;
+  backup_path: string | null;
+  warnings: string[];
+  baseline_id: string;
+  draft_hash: string;
+  parameter_count: number;
+  surface_parameter_count: number;
+  structure_hash: string | null;
+  normalized: Array<Record<string, unknown>>;
+  expires_at: string;
+  expires_in_seconds: number;
+  confirmation_required: boolean;
+}
+
+/** `POST /api/session/commit` 的请求体（令牌 + 与 prepare 逐项一致的内容）。 */
+export interface CommitBody {
+  token: string;
+  mode: SaveMode;
+  draft: Record<string, unknown>;
+  target_path?: string | null;
+  surface_draft?: Record<string, unknown> | null;
+  structure_hash?: string | null;
+}
+
+/** 保存失败时 `details.status` 的形状。四个状态各自独立，不合并成一句。 */
+export interface CommitStatus {
+  applied: boolean;
+  readback_verified: boolean;
+  mismatches: Array<Record<string, unknown>>;
+  backup: {
+    required: boolean;
+    created: boolean;
+    path: string | null;
+    path_confirmed: string | null;
+  };
+  rollback: {
+    attempted: boolean;
+    verified: boolean;
+    mismatches: Array<Record<string, unknown>>;
+    code: string | null;
+    error: string | null;
+    reason: string | null;
+    l0?: Record<string, unknown> | null;
+    cel?: Record<string, unknown> | null;
+  };
+  saved: boolean;
+  target_path: string;
+  mode: string;
+  /** 失败时草稿一定还在界面上（服务端也这么承诺）。 */
+  draft_preserved: boolean;
+  applied_surface: Record<string, unknown>;
+  surface_readback_verified: boolean;
+  surface_mismatches: Array<Record<string, unknown>>;
+  save?: {
+    path_after?: string | null;
+    path_matches?: boolean;
+    file_exists?: boolean;
+    is_dirty_after?: boolean;
+  } | null;
+  baseline_refresh_error?: ErrorDetail | null;
+  [key: string]: unknown;
+}
+
+export interface CommitResponse {
+  ok: true;
+  mode: string;
+  target_path: string;
+  backup_path: string | null;
+  saved: boolean;
+  status: CommitStatus;
+  steps: string[];
+  normalized: Array<Record<string, unknown>>;
+  baseline_id: string | null;
+  baseline_refreshed: boolean;
+  saved_at: string;
+  warnings: string[];
 }

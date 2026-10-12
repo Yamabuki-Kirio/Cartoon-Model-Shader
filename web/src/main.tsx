@@ -9,6 +9,12 @@ import "./styles/index.css";
 const client = createApiClient();
 const endpoints = new Endpoints(client);
 
+/**
+ * 工作台能用的接口**逐条列出来**，而不是把整个 `Endpoints` 直接传进去。
+ *
+ * 这是一份能力清单：工作台能调用哪些接口，在这里一眼看得完。
+ * 传整个对象的话，任何一个新增接口都会自动对工作台可见 —— 那就没有边界了。
+ */
 const workspace = createWorkspace({
   endpoints: {
     surfaceSchema: (options) => endpoints.surfaceSchema(options),
@@ -18,6 +24,13 @@ const workspace = createWorkspace({
     job: (jobId, options) => endpoints.job(jobId, options),
     blenderStatus: () => endpoints.blenderStatus(),
     framingContext: () => endpoints.framingContext(),
+    listPresets: (options) => endpoints.listPresets(options),
+    readPreset: (presetId, options) => endpoints.readPreset(presetId, options),
+    createPreset: (body, options) => endpoints.createPreset(body, options),
+    updatePreset: (presetId, body, options) => endpoints.updatePreset(presetId, body, options),
+    deletePreset: (presetId, options) => endpoints.deletePreset(presetId, options),
+    commitPrepare: (body, options) => endpoints.commitPrepare(body, options),
+    commitApply: (body, options) => endpoints.commitApply(body, options),
     parseSchema,
   },
 });

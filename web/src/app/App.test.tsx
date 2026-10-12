@@ -97,18 +97,25 @@ describe("工作台整体", () => {
     expect(getByTestId("status-structure").textContent).toContain("已失效");
   });
 
-  it("保存 / 应用到工程 / 正式渲染按钮只占位不发请求", async () => {
+  it("「保存完整预设」「应用到工程」打开面板但不自行发请求；「正式渲染」仍占位", async () => {
     const { workspace, endpoints } = await setup();
-    const { getByText } = render(<App workspace={workspace} autoBootstrap={false} />);
-    const savePreset = getByText("保存完整预设") as HTMLButtonElement;
-    const commit = getByText("应用到工程") as HTMLButtonElement;
-    expect(savePreset.disabled).toBe(true);
-    expect(commit.disabled).toBe(true);
-    fireEvent.click(savePreset);
-    fireEvent.click(commit);
+    const { getByTestId, queryByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+
+    // 点按钮只**打开面板**：不该顺手渲染，也不该顺手签发令牌。
+    fireEvent.click(getByTestId("action-open-presets"));
+    fireEvent.click(getByTestId("action-open-save"));
     await settle(2);
-    // 只点按钮不会产生任何请求
+    expect(getByTestId("preset-panel")).toBeTruthy();
+    expect(getByTestId("save-dialog")).toBeTruthy();
     expect(endpoints.submitPreview).not.toHaveBeenCalled();
+    expect(endpoints.commitPrepare).not.toHaveBeenCalled();
+
+    // 打开预设面板会拉一次列表（读接口，不带令牌），这是它唯一主动做的事。
+    expect(endpoints.listPresets).toHaveBeenCalledTimes(1);
+
+    // 尚未开放的按钮必须**禁用**，而不是发一个必然 422 的请求。
+    expect((getByTestId("action-final-render") as HTMLButtonElement).disabled).toBe(true);
+    expect(queryByTestId("action-final-render")?.getAttribute("title")).toContain("后续提交开放");
   });
 
   it("预览图 URL 带防缓存参数", async () => {

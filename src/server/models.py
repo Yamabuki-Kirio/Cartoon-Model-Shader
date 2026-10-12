@@ -318,6 +318,10 @@ class PresetSaveRequest(BaseModel):
     framing_margin: float = 0.15
     preview_quality: str = "standard"
     parameters: dict[str, Any] = Field(default_factory=dict)
+    #: v4（可选）：参数面草稿（``v4 参数 id -> 裸取值``）。
+    #: 含 Cel 组名与材质名这类**工程事实**，因此没有 id 白名单，只做结构校验；
+    #: 旧客户端不带这个字段，行为完全不变。
+    surface: dict[str, Any] = Field(default_factory=dict)
 
 
 class PresetRenameRequest(BaseModel):
@@ -344,12 +348,17 @@ class PresetSummary(BaseModel):
     preview_quality: str
     parameter_count: int
     active_count: int
+    #: v4 参数面草稿条数（0 = 这份预设不含 Cel / 材质草稿）。
+    surface_count: int = 0
 
     model_config = ConfigDict(populate_by_name=True)
 
 
 class PresetDetail(PresetSummary):
     parameters: dict[str, PresetParameter] = Field(default_factory=dict)
+    #: v4 参数面草稿：``参数 id -> 裸取值``（没有 configured/effective 三元组 ——
+    #: 它的取值在写入时就是最终值，不存在需要迁移的显示标签）。
+    surface: dict[str, Any] = Field(default_factory=dict)
 
 
 class PresetSkip(BaseModel):

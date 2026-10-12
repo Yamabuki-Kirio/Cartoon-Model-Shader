@@ -404,6 +404,171 @@ def test_parameter_active_must_be_bool(bad_active: object) -> None:
 
 
 # =============================================================================
+#  4.5 校验：v4 参数面草稿（surface）
+# =============================================================================
+#
+#  这一段的立场与 L0 参数**不同**：surface 的 id 里含工程事实（Cel 组名、材质名），
+#  没有全局白名单，所以只做结构校验。这些用例守的就是「结构校验该拦的拦住、
+#  不该拦的（合法但本机不存在的 id）放行」这条线。
+
+
+#: 一份形状完整的 v4 草稿：标量 / 颜色 / 色带 / 枚举都覆盖到。
+SURFACE_DRAFT = {
+    "cel.Cel_Skin.ramp": {
+        "elements": [
+            {"position": 0.0, "color": [0.0, 0.0, 0.0, 1.0]},
+            {"position": 1.0, "color": [1.0, 1.0, 1.0, 1.0]},
+        ],
+        "interpolation": "LINEAR",
+    },
+    "cel.Cel_Skin.managed_mode": "simple",
+    "material.皮肤_脸.base_color": [0.94, 0.82, 0.76, 1.0],
+    "material.皮肤_脸.roughness": 0.62,
+    "material.皮肤_脸.emission_strength": 0.0,
+}
+
+
+def test_normalize_defaults_surface_to_empty() -> None:
+    """老预设没有 surface 段 —— 归一成 `{}`，不迁移、不报错。"""
+    preset = presets.normalize_preset({"name": "旧预设", "parameters": {}})
+    assert preset["surface"] == {}
+    assert presets.summary_of(preset)["surface_count"] == 0
+    assert presets.materialize_surface(preset) == {}
+
+
+def test_normalize_accepts_surface_draft_verbatim() -> None:
+    """v4 取值在写入时就是最终值，原样往返（不做三元组包装、不做单位换算）。"""
+    preset = presets.normalize_preset({"name": "完整预设", "parameters": {}, "surface": SURFACE_DRAFT})
+    assert preset["surface"] == SURFACE_DRAFT
+    assert presets.summary_of(preset)["surface_count"] == len(SURFACE_DRAFT)
+    assert presets.materialize_surface(preset) == SURFACE_DRAFT
+
+
+def test_materialize_surface_returns_a_copy() -> None:
+    """调用方改返回值不该改到预设本体（否则「保存过」的内容会被悄悄改掉）。"""
+    preset = presets.normalize_preset({"name": "复制", "parameters": {}, "surface": SURFACE_DRAFT})
+    taken = presets.materialize_surface(preset)
+    taken["material.皮肤_脸.roughness"] = 0.1
+    assert preset["surface"]["material.皮肤_脸.roughness"] == 0.62
+
+
+def test_surface_round_trips_through_store(store: presets.PresetStore) -> None:
+    saved = store.save({"name": "往返", "parameters": {}, "surface": SURFACE_DRAFT})
+    again = store.get(saved["preset_id"])
+    assert again["surface"] == SURFACE_DRAFT
+    assert presets.materialize_surface(again) == SURFACE_DRAFT
+
+
+def test_surface_accepts_project_specific_ids_without_a_whitelist() -> None:
+    """本机不存在的材质名 / Cel 组名照旧能存 —— 合法性由预览 / 保存时的基线判定。"""
+    preset = presets.normalize_preset(
+        {
+            "name": "别的工程",
+            "parameters": {},
+            "surface": {"material.这个材质本机没有.base_color": [0.1, 0.2, 0.3, 1.0]},
+        }
+    )
+    assert "material.这个材质本机没有.base_color" in preset["surface"]
+
+
+@pytest.mark.parametrize(
+    ("bad_surface", "reason"),
+    [
+        (["不是对象"], "surface 必须是对象"),
+        ({"": 1.0}, "参数 id 不能为空"),
+        ({"  ": 1.0}, "参数 id 不能为空"),
+        ({1: 1.0}, "参数 id 必须是字符串"),
+        ({"a" * (presets.SURFACE_ID_MAX_LENGTH + 1): 1.0}, "参数 id 超长"),
+        ({"cel.X.a\x00b": 1.0}, "控制字符"),
+        ({"cel.X.roughness": float("inf")}, "有限数值"),
+        ({"cel.X.roughness": float("nan")}, "有限数值"),
+        ({"cel.X.label": ""}, "不能为空字符串"),
+        ({"cel.X.label": "  "}, "不能为空字符串"),
+        ({"cel.X.label": "x" * (presets.SURFACE_TEXT_MAX_LENGTH + 1)}, "超长"),
+        (
+            {"cel.X.ramp": {"extra": {"a": {"b": {"c": {"d": {"e": {"f": 1}}}}}}}},
+            "嵌套过深",
+        ),
+        ({"cel.X.ramp": [0.0] * (presets.SURFACE_VALUE_MAX_ITEMS + 1)}, "元素过多"),
+        (
+            {"cel.X.ramp": {"k": 1.0} | {f"k{i}": 1.0 for i in range(presets.SURFACE_VALUE_MAX_ITEMS)}},
+            "字段过多",
+        ),
+        ({"cel.X.ramp": {1: "x"}}, "字段名必须是字符串"),
+        ({"cel.X.obj": object()}, "取值类型不支持"),
+    ],
+)
+def test_surface_rejects_bad_shapes(bad_surface: object, reason: str) -> None:
+    with pytest.raises(errors.ToonTunerError) as excinfo:
+        presets.normalize_preset({"name": "坏草稿", "parameters": {}, "surface": bad_surface})
+    assert excinfo.value.code == errors.PRESET_INVALID
+    assert reason in excinfo.value.message
+
+
+def test_surface_rejects_too_many_entries() -> None:
+    with pytest.raises(errors.ToonTunerError) as excinfo:
+        presets.normalize_preset(
+            {
+                "name": "太多",
+                "parameters": {},
+                "surface": {f"cel.X.p{i}": 1.0 for i in range(presets.SURFACE_MAX_ENTRIES + 1)},
+            }
+        )
+    assert excinfo.value.code == errors.PRESET_INVALID
+    assert "surface 参数过多" in excinfo.value.message
+
+
+def test_surface_is_scanned_for_forbidden_content() -> None:
+    """路径 / 凭据禁令**同样覆盖** surface —— 换一个字段不等于换一套安全标准。"""
+    with pytest.raises(errors.ToonTunerError) as excinfo:
+        presets.normalize_preset(
+            {
+                "name": "带路径",
+                "parameters": {},
+                "surface": {"material.皮肤_脸.base_color": "C:\\models\\a.pmx"},
+            }
+        )
+    assert excinfo.value.code == errors.PRESET_INVALID
+    assert "禁止保存的内容" in excinfo.value.message
+
+    with pytest.raises(errors.ToonTunerError) as excinfo:
+        presets.normalize_preset(
+            {
+                "name": "带令牌",
+                "parameters": {},
+                "surface": {"cel.X.note": "sk-abcdefghijklmnopqrst"},
+            }
+        )
+    assert excinfo.value.code == errors.PRESET_INVALID
+
+
+def test_api_round_trips_surface(client: TestClient) -> None:
+    created = client.post(
+        "/api/presets", json={"name": "完整", "parameters": {}, "surface": SURFACE_DRAFT}
+    )
+    assert created.status_code == 201, created.text
+    preset = created.json()["preset"]
+    assert preset["surface"] == SURFACE_DRAFT
+    assert preset["surface_count"] == len(SURFACE_DRAFT)
+
+    listed = client.get("/api/presets").json()["presets"]
+    assert [item for item in listed if item["preset_id"] == preset["preset_id"]][0][
+        "surface_count"
+    ] == len(SURFACE_DRAFT)
+
+    detail = client.get(f"/api/presets/{preset['preset_id']}").json()["preset"]
+    assert detail["surface"] == SURFACE_DRAFT
+
+
+def test_api_rejects_bad_surface(client: TestClient) -> None:
+    response = client.post(
+        "/api/presets", json={"name": "坏", "parameters": {}, "surface": {"": 1.0}}
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == errors.PRESET_INVALID
+
+
+# =============================================================================
 #  5. 敏感内容扫描
 # =============================================================================
 

@@ -1,16 +1,22 @@
 import { useWorkspace } from "../app/useWorkspace";
 import type { Workspace } from "../state/workspace";
+import { saveBusy } from "../state/save";
 
 /**
  * 底部操作栏。
  *
- * 启用的都是**当前真的能工作**的动作；三个尚未接通的（保存预设、应用到工程、正式渲染）
- * 一律 `disabled` 并注明「后续提交开放」—— 按钮可以占位，但**不能发不完整的请求**：
- * 一个会返回 422 的按钮比没有按钮更让人困惑。
+ * 启用的都是**当前真的能工作**的动作。保存闭环（保存完整预设 / 应用到工程）
+ * 已经接通；「正式渲染」仍未开放，因此保持 `disabled` 并注明原因 ——
+ * 按钮可以占位，但**不能发不完整的请求**：一个会返回 422 的按钮比没有按钮更让人困惑。
+ *
+ * 保存与预览共用同一台 Blender，服务端也是串行的（同一把锁）。因此两边互相禁用：
+ * 保存进行中不提交预览，预览进行中也不签发保存令牌。
  */
 export function ActionBar({ workspace }: { workspace: Workspace }) {
   const state = useWorkspace(workspace);
+  const saving = saveBusy(state.save);
   const previewDisabled = !state.schema || state.historyBlocked;
+  const saveDisabled = !state.schema || state.historyBlocked || saving || state.loading;
 
   return (
     <footer class="action-bar" data-testid="action-bar">
@@ -79,8 +85,14 @@ export function ActionBar({ workspace }: { workspace: Workspace }) {
           type="button"
           class="btn btn-primary"
           data-testid="action-apply-preview"
-          disabled={previewDisabled || state.loading}
-          title={state.historyBlocked ? "结构已变化，请先刷新基线" : "提交完整 Cel 草稿并渲染一张预览"}
+          disabled={previewDisabled || state.loading || saving}
+          title={
+            state.historyBlocked
+              ? "结构已变化，请先刷新基线"
+              : saving
+                ? "保存进行中，等它结束再预览"
+                : "提交完整 Cel 草稿并渲染一张预览"
+          }
           onClick={() => workspace.actions.applyAndPreview()}
         >
           {state.loading ? "处理中…" : "应用并预览"}
@@ -89,7 +101,7 @@ export function ActionBar({ workspace }: { workspace: Workspace }) {
           type="button"
           class="btn"
           data-testid="action-refresh-baseline"
-          disabled={state.loading}
+          disabled={state.loading || saving}
           onClick={() => workspace.actions.refreshBaseline()}
         >
           刷新基线
@@ -97,16 +109,38 @@ export function ActionBar({ workspace }: { workspace: Workspace }) {
       </div>
 
       <div class="action-group action-pending">
-        <button type="button" class="btn" disabled title="提交 5 开放">
+        <button
+          type="button"
+          class="btn"
+          data-testid="action-open-presets"
+          disabled={state.historyBlocked}
+          title={state.historyBlocked ? "结构已变化，请先刷新基线" : "本地预设：保存 / 套用 / 覆盖 / 删除"}
+          onClick={() => workspace.actions.openPresetPanel()}
+        >
           保存完整预设
         </button>
-        <button type="button" class="btn" disabled title="提交 5 开放">
+        <button
+          type="button"
+          class="btn"
+          data-testid="action-open-save"
+          disabled={saveDisabled}
+          title={
+            state.historyBlocked
+              ? "结构已变化，请先刷新基线"
+              : saving
+                ? "保存进行中"
+                : state.loading
+                  ? "渲染进行中，等它结束再保存"
+                  : "保存到工程：默认另存为，覆盖前必先生成备份"
+          }
+          onClick={() => workspace.actions.openSaveDialog("save_as")}
+        >
           应用到工程
         </button>
-        <button type="button" class="btn" disabled title="后续提交开放">
+        <button type="button" class="btn" data-testid="action-final-render" disabled title="后续提交开放">
           正式渲染
         </button>
-        <span class="muted">（保存闭环在提交 5 开放，当前按钮不发送请求）</span>
+        <span class="muted">（正式渲染仍未开放；预设与保存已可用）</span>
       </div>
     </footer>
   );

@@ -17,6 +17,11 @@
 import { previewImageUrl } from "../api/client";
 import type {
   BaselineResponse,
+  CommitBody,
+  CommitPrepareBody,
+  CommitPrepareResponse,
+  CommitResponse,
+  CommitStatus,
   ConnectionState,
   ErrorDetail,
   ExternalChange,
@@ -26,6 +31,12 @@ import type {
   JobError,
   JobResult,
   JobState,
+  PresetDetailResponse,
+  PresetListResponse,
+  PresetSaveBody,
+  PresetSkip,
+  PresetSummary,
+  SaveMode,
   SurfaceBaselinePublic,
 } from "../api/types";
 import { AppError } from "../api/types";
@@ -46,6 +57,17 @@ import {
   valuesEqual,
 } from "./draft";
 import { JobRunner, type JobOutcome, type JobSubmitPayload } from "./jobs";
+import {
+  confirmFromError,
+  confirmFromPrepared,
+  emptySaveState,
+  saveBusy,
+  saveFailureNotice,
+  saveTargetProblem,
+  splitSaveDraft,
+  type SaveOutcome,
+  type SaveState,
+} from "./save";
 import { createStore, type Store } from "./store";
 
 export interface PreviewState {
@@ -133,6 +155,66 @@ export interface WorkspaceState {
   autoPreview: boolean;
   /** 自动预览已经排期、还没提交（界面据此显示「待预览」）。 */
   autoPreviewPending: boolean;
+  /** 保存闭环（预设 + 应用到工程）。 */
+  save: SaveState;
+  /** 本地预设列表。 */
+  presets: PresetState;
+}
+
+export interface PresetState {
+  /** 预设面板是否打开。 */
+  open: boolean;
+  loading: boolean;
+  /** 有写请求在途（保存 / 覆盖 / 套用），按钮据此禁用。 */
+  busy: boolean;
+  list: PresetSummary[];
+  /** 读不动的预设文件：带着错误码列出来，绝不静默忽略。 */
+  skipped: PresetSkip[];
+  /** 可展示的存储位置（服务端给的展示写法，不含本机绝对路径）。 */
+  storage: string;
+  error: ErrorDetail | null;
+  /** 最近一次预设操作的结果说明。 */
+  notice: string | null;
+}
+
+function emptyPresetState(): PresetState {
+  return {
+    open: false,
+    loading: false,
+    busy: false,
+    list: [],
+    skipped: [],
+    storage: "",
+    error: null,
+    notice: null,
+  };
+}
+
+/**
+ * 把一份预设的参数面草稿分成「当前工程认得」与「认不得」两堆。
+ *
+ * 预设里的 id 含**工程事实**（材质名、Cel 组名），所以跨工程套用必然有一部分对不上。
+ * 对不上的必须**报数**：静默丢弃会让用户以为预设生效了，而画面毫无变化 ——
+ * 那是最难排查的一类问题。
+ *
+ * 只读 / 不支持的节点也一并算作「认不得」：它们本来就不接受写入。
+ */
+export function presetDraftFor(
+  schema: SurfaceSchema | null,
+  surface: Record<string, unknown>
+): { applied: SurfaceDraft; skipped: string[] } {
+  const index = flatten(schema?.groups ?? []);
+  const applied: SurfaceDraft = {};
+  const skipped: string[] = [];
+  for (const [paramId, value] of Object.entries(surface)) {
+    const node = index.get(paramId);
+    if (!node || node.kind === "group" || node.kind === "unknown" || !node.supported || !node.editable) {
+      skipped.push(paramId);
+      continue;
+    }
+    applied[paramId] = deepCopy(value);
+  }
+  return { applied, skipped };
 }
 
 export interface FramingChoice {
@@ -176,6 +258,23 @@ export interface WorkspaceEndpoints {
     error?: ErrorDetail | null;
   }>;
   framingContext(): Promise<FramingContext & { ok: true }>;
+  listPresets(options?: { signal?: AbortSignal }): Promise<PresetListResponse>;
+  readPreset(presetId: string, options?: { signal?: AbortSignal }): Promise<PresetDetailResponse>;
+  createPreset(body: PresetSaveBody, options?: { signal?: AbortSignal }): Promise<PresetDetailResponse>;
+  updatePreset(
+    presetId: string,
+    body: PresetSaveBody,
+    options?: { signal?: AbortSignal }
+  ): Promise<PresetDetailResponse>;
+  deletePreset(
+    presetId: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<{ ok: true; deleted: PresetSummary }>;
+  commitPrepare(
+    body: CommitPrepareBody,
+    options?: { signal?: AbortSignal }
+  ): Promise<CommitPrepareResponse>;
+  commitApply(body: CommitBody, options?: { signal?: AbortSignal }): Promise<CommitResponse>;
   parseSchema(raw: unknown): SurfaceSchema;
 }
 
@@ -304,6 +403,8 @@ export function createWorkspace(options: WorkspaceOptions) {
     framingChoice: DEFAULT_FRAMING,
     autoPreview: options.autoPreview ?? true,
     autoPreviewPending: false,
+    save: emptySaveState(),
+    presets: emptyPresetState(),
   });
 
   function syncHistoryDepths(): void {
@@ -613,6 +714,17 @@ export function createWorkspace(options: WorkspaceOptions) {
       framingChoice: framing,
       baselinePreviewStatus: "pending",
       baselinePreviewUrl: null,
+      // 刷新基线会让服务端手里的确认令牌全部失效（`BASELINE_STALE`）。
+      // 面板上那条「即将覆盖 …」的确认信息指向的就是那个令牌，必须一起撤掉 ——
+      // 留着它，用户点确认时才发现要重来一次。
+      save: {
+        ...store.getState().save,
+        phase: "idle",
+        confirm: null,
+        error: null,
+        steps: [],
+        status: null,
+      },
     });
     let created: Awaited<ReturnType<WorkspaceEndpoints["createBaseline"]>>;
     try {
@@ -776,6 +888,337 @@ export function createWorkspace(options: WorkspaceOptions) {
       return;
     }
     store.setState({ ...patch, error: detail, loading: false });
+  }
+
+  // -- 保存闭环：预设 + 应用到工程 ---------------------------------------
+
+  function patchSave(patch: Partial<SaveState>): void {
+    store.setState({ save: { ...store.getState().save, ...patch } });
+  }
+
+  function patchPresets(patch: Partial<PresetState>): void {
+    store.setState({ presets: { ...store.getState().presets, ...patch } });
+  }
+
+  /** 保存的当前载荷：草稿拆成 L0 / 参数面两半，带上客户端持有的结构指纹。 */
+  function savePayload(mode: SaveMode, targetPath: string | null): {
+    mode: SaveMode;
+    targetPath: string | null;
+    l0: Record<string, unknown>;
+    surface: Record<string, unknown>;
+    structureHash: string | null;
+  } {
+    const state = store.getState();
+    const { l0, surface } = splitSaveDraft(state.schema, state.draft);
+    return { mode, targetPath, l0, surface, structureHash: state.structureHash };
+  }
+
+  /**
+   * 保存成功后把基线**读回来**并与草稿对齐。
+   *
+   * 为什么不直接调 `refreshBaseline()`：服务端在 `commit` 内部已经重新采集过基线
+   * （`baseline_refreshed`），再走一次 `createBaseline` 会白渲染一张与刚才那张
+   * 一模一样的图 —— 而这次渲染的唯一作用只是让前端知道 `baseline_id`。
+   * 读一次只读接口就够了。
+   *
+   * 草稿必须清空：磁盘上的内容现在**就是**那份草稿，留着它会让下一次保存
+   * 把同一批值再写一遍，也会让「N 项已改」的提示变成假话。
+   */
+  async function syncBaselineAfterSave(): Promise<void> {
+    await readBaseline();
+    history.clear();
+    syncHistoryDepths();
+    draftVersion = 0;
+    previewedVersion = 0;
+    previewedVersionForSubmit = 0;
+    cancelAutoPreview();
+    store.setState({
+      draft: emptyDraft(),
+      dirtyIds: new Set<string>(),
+      effective: {},
+      previewStale: false,
+      historyBlocked: false,
+      notice: "已保存到工程文件：基线已按新内容刷新，草稿已清空。",
+    });
+  }
+
+  /** 执行保存（消费令牌）。失败时**只**写保存状态，绝不碰草稿与最后一张成功预览。 */
+  async function runCommit(prepared: CommitPrepareResponse): Promise<boolean> {
+    const payload = savePayload(
+      prepared.mode === "overwrite" ? "overwrite" : "save_as",
+      // 目标路径一律以**票据**为准：传 null 表示「用你确认过的那条」，
+      // 服务端会自己回填。前端再传一次只会多一处可以不一致的地方。
+      null
+    );
+    const body: CommitBody = {
+      token: prepared.token,
+      mode: payload.mode,
+      draft: payload.l0,
+      surface_draft: payload.surface,
+      structure_hash: payload.structureHash,
+    };
+    patchSave({ phase: "committing", error: null, confirm: null, steps: ["已签发确认令牌"] });
+    try {
+      const result = await endpoints.commitApply(body);
+      const outcome: SaveOutcome = {
+        saved: Boolean(result.saved),
+        mode: result.mode,
+        targetPath: result.target_path,
+        backupPath: result.backup_path ?? null,
+        steps: result.steps ?? [],
+        warnings: result.warnings ?? [],
+        savedAt: result.saved_at ?? null,
+        status: result.status ?? null,
+        baselineRefreshed: Boolean(result.baseline_refreshed),
+      };
+      patchSave({ phase: result.saved ? "saved" : "failed", outcome, status: result.status ?? null, steps: outcome.steps });
+      if (result.saved) {
+        await syncBaselineAfterSave();
+      } else {
+        // `saved: false` 但没有抛错：服务端明确说没落盘。草稿一律保留。
+        store.setState({ notice: saveFailureNotice(result.status ?? null) });
+      }
+      return Boolean(result.saved);
+    } catch (error) {
+      const detail = toDetail(error);
+      const status = commitStatusOf(detail);
+      // 走统一错误路由：结构失效（STRUCTURE_CHANGED / IDENTITY_MISSING）必须在这里
+      // 就作废草稿与已签发的令牌，否则用户能拿一份作废的草稿继续保存。
+      routeErrorDetail(detail);
+      patchSave({ phase: "failed", error: detail, status, steps: commitStepsOf(detail) });
+      return false;
+    }
+  }
+
+  /**
+   * 准备保存。
+   *
+   * `SAVE_CONFIRM_REQUIRED` **不是失败**：它表示这次会覆盖已有文件、而用户还没看过
+   * 绝对路径与备份位置。这条路径把两条路径摊开、停在 `confirming`，等用户点确认。
+   * 把它当错误渲染会让用户以为出了故障，而其实只是流程要求他看一眼。
+   */
+  async function prepareSave(confirm: boolean): Promise<boolean> {
+    const state = store.getState();
+    if (!state.schema) {
+      store.setState({ error: { code: "NO_SCHEMA", message: "尚未加载 schema。", retryable: true } });
+      return false;
+    }
+    if (state.historyBlocked) {
+      store.setState({
+        error: {
+          code: "STRUCTURE_CHANGED",
+          message: "结构已变化，草稿已作废。请先刷新基线再保存。",
+          retryable: true,
+        },
+      });
+      return false;
+    }
+    if (saveBusy(state.save)) {
+      return false;
+    }
+    const mode = state.save.mode;
+    let targetPath: string | null = null;
+    if (mode === "save_as") {
+      const problem = saveTargetProblem(state.save.targetPath);
+      if (problem) {
+        patchSave({
+          phase: "idle",
+          error: { code: "SAVE_TARGET_INVALID", message: problem, retryable: false },
+        });
+        return false;
+      }
+      targetPath = state.save.targetPath.trim();
+    }
+
+    const payload = savePayload(mode, targetPath);
+    patchSave({
+      phase: "preparing",
+      error: null,
+      confirm: null,
+      outcome: null,
+      status: null,
+      steps: ["校验基线 / 草稿 / 保存模式 / 目标路径"],
+    });
+    try {
+      const prepared = await endpoints.commitPrepare({
+        mode: payload.mode,
+        draft: payload.l0,
+        target_path: payload.targetPath,
+        confirm,
+        surface_draft: payload.surface,
+        structure_hash: payload.structureHash,
+      });
+      patchSave({ confirm: confirmFromPrepared(prepared) });
+      return await runCommit(prepared);
+    } catch (error) {
+      const detail = toDetail(error);
+      if (detail.code === "SAVE_CONFIRM_REQUIRED") {
+        const confirmInfo = confirmFromError(detail);
+        if (confirmInfo) {
+          patchSave({
+            phase: "confirming",
+            confirm: confirmInfo,
+            error: null,
+            steps: ["等待确认：这次会覆盖已有文件"],
+          });
+          return false;
+        }
+        // details 形状对不上：**不编路径**，如实说拿不到待确认的信息。
+        patchSave({
+          phase: "failed",
+          confirm: null,
+          error: {
+            ...detail,
+            message: "服务端要求确认覆盖，但没有给出目标路径与备份路径；请重新准备。",
+          },
+        });
+        return false;
+      }
+      routeErrorDetail(detail);
+      patchSave({ phase: "failed", error: detail, steps: commitStepsOf(detail) });
+      return false;
+    }
+  }
+
+  /** 保存预设的请求体：L0 留空、参数面草稿整份带上，另附当前的取景设置。 */
+  function presetPayload(name: string): PresetSaveBody {
+    const state = store.getState();
+    const { surface } = splitSaveDraft(state.schema, state.draft);
+    return {
+      name,
+      framing_mode: state.framingChoice.mode,
+      framing_margin: state.framingChoice.margin,
+      // L0 参数没有搬进 v4 界面，因此这一半一定是空的 —— 不假装有。
+      parameters: {},
+      surface,
+    };
+  }
+
+  async function refreshPresets(): Promise<void> {
+    patchPresets({ loading: true, error: null });
+    try {
+      const payload = await endpoints.listPresets();
+      patchPresets({
+        loading: false,
+        list: payload.presets ?? [],
+        skipped: payload.skipped ?? [],
+        storage: payload.storage ?? "",
+        error: null,
+      });
+    } catch (error) {
+      patchPresets({ loading: false, error: toDetail(error) });
+    }
+  }
+
+  /**
+   * 保存当前草稿为预设（`presetId` 给定时为覆盖保存）。
+   *
+   * 同名冲突（`PRESET_NAME_CONFLICT`）走保存状态里的 error，**不**动全局错误横幅：
+   * 那是一个可以在面板里当场改名字解决的问题，不该同时弹两条提示。
+   */
+  async function savePreset(name: string, presetId?: string): Promise<boolean> {
+    const state = store.getState();
+    if (!state.schema) {
+      patchPresets({ error: { code: "NO_SCHEMA", message: "尚未加载 schema。", retryable: true } });
+      return false;
+    }
+    const trimmed = name.trim();
+    if (!trimmed) {
+      patchPresets({
+        error: { code: "PRESET_INVALID", message: "请填写预设名称。", retryable: false },
+      });
+      return false;
+    }
+    patchPresets({ busy: true, error: null, notice: null });
+    try {
+      const body = presetPayload(trimmed);
+      const result = presetId
+        ? await endpoints.updatePreset(presetId, body)
+        : await endpoints.createPreset(body);
+      const count = Object.keys(result.preset.surface ?? {}).length;
+      patchPresets({
+        busy: false,
+        notice: presetId
+          ? `已覆盖预设「${result.preset.name}」（参数面 ${count} 项）。`
+          : `已保存预设「${result.preset.name}」（参数面 ${count} 项）。`,
+      });
+      await refreshPresets();
+      return true;
+    } catch (error) {
+      patchPresets({ busy: false, error: toDetail(error) });
+      return false;
+    }
+  }
+
+  /**
+   * 套用预设到草稿。
+   *
+   * 三件事必须做到：
+   *
+   * * 走 `commitCommand` —— 套用预设要能**撤销**，否则用户按错一下就得手动改回去；
+   * * 只写当前工程认得的 id，并把跳过的**数量**说出来（跨工程套用必然对不上）；
+   * * 结构失效期间拒绝：草稿已经作废，往里面写东西毫无意义。
+   */
+  async function applyPreset(presetId: string): Promise<boolean> {
+    const state = store.getState();
+    if (!state.schema) {
+      patchPresets({ error: { code: "NO_SCHEMA", message: "尚未加载 schema。", retryable: true } });
+      return false;
+    }
+    if (state.historyBlocked) {
+      patchPresets({
+        error: {
+          code: "STRUCTURE_CHANGED",
+          message: "结构已变化，草稿已作废。请先刷新基线再套用预设。",
+          retryable: true,
+        },
+      });
+      return false;
+    }
+    patchPresets({ busy: true, error: null, notice: null });
+    try {
+      const { preset } = await endpoints.readPreset(presetId);
+      const { applied, skipped } = presetDraftFor(state.schema, preset.surface ?? {});
+      const next: SurfaceDraft = { ...store.getState().draft };
+      for (const [paramId, value] of Object.entries(applied)) {
+        next[paramId] = value;
+      }
+      const count = Object.keys(applied).length;
+      if (count > 0) {
+        commitCommand({
+          kind: "applyPreset",
+          label: `套用预设 ${preset.name}`,
+          groupId: "",
+          groupIds: topGroups(state.schema).map((group) => group.id),
+          next,
+          mergeKey: null,
+        });
+      }
+      patchPresets({
+        busy: false,
+        notice:
+          skipped.length > 0
+            ? `已套用「${preset.name}」${count} 项；另有 ${skipped.length} 项在当前工程里找不到（可能来自别的工程或已被重命名），已跳过。`
+            : `已套用「${preset.name}」${count} 项。`,
+      });
+      return true;
+    } catch (error) {
+      patchPresets({ busy: false, error: toDetail(error) });
+      return false;
+    }
+  }
+
+  async function deletePreset(presetId: string): Promise<boolean> {
+    patchPresets({ busy: true, error: null, notice: null });
+    try {
+      const result = await endpoints.deletePreset(presetId);
+      patchPresets({ busy: false, notice: `已删除预设「${result.deleted.name}」。` });
+      await refreshPresets();
+      return true;
+    } catch (error) {
+      patchPresets({ busy: false, error: toDetail(error) });
+      return false;
+    }
   }
 
   const actions = {
@@ -1035,6 +1478,16 @@ export function createWorkspace(options: WorkspaceOptions) {
         error: detail,
         notice: "工程结构已变化：草稿与已签发的保存确认令牌均已作废，请刷新基线。",
         loading: false,
+        // 令牌真的失效了（服务端会以 `BASELINE_STALE` / `STRUCTURE_CHANGED` 拒绝），
+        // 面板上那条确认信息也必须撤掉 —— 否则用户点「确认覆盖」时才发现白点了一下。
+        save: {
+          ...store.getState().save,
+          phase: "idle",
+          confirm: null,
+          error: null,
+          steps: [],
+          status: null,
+        },
       });
     },
 
@@ -1061,6 +1514,87 @@ export function createWorkspace(options: WorkspaceOptions) {
 
     cancelAutoPreview(): void {
       cancelAutoPreview();
+    },
+
+    // -- 保存闭环 ------------------------
+
+    /**
+     * 打开保存面板（默认「另存为」，不动用户已有的工程文件）。
+     *
+     * 清掉的是**这一次尝试**的工作状态（待确认 / 错误 / 步骤 / 四态表），
+     * 保留 `outcome` —— 那是一条已经发生的事实（「上次保存到了哪个文件」），
+     * 用户下次打开还该看得见。失败提示反而会随新的一次尝试消失，因为
+     * 那描述的是上一次尝试，重开面板时再摆一遍只会让人以为又失败了一次。
+     */
+    openSaveDialog(mode: SaveMode = "save_as"): void {
+      patchSave({
+        open: true,
+        mode,
+        phase: "idle",
+        error: null,
+        status: null,
+        steps: [],
+        confirm: null,
+      });
+    },
+
+    closeSaveDialog(): void {
+      // 关闭只收起面板：**不清** outcome / confirm —— 用户下次打开还能看到
+      // 刚才写到了哪里、备份在哪。真正清空的是「重新准备」那条路径。
+      patchSave({ open: false });
+    },
+
+    /**
+     * 切换保存模式。
+     *
+     * 切换会丢掉**这一次尝试**的东西：确认信息、四态表、步骤、错误。
+     * 确认过的是「写到这个文件的这条路径」，模式一换，那个确认就不再指向同一件事，
+     * 留着它等于让用户确认一件已经变了的事。
+     * `outcome` 不动 —— 它是上一次保存的记录，不因为切换模式而失真。
+     */
+    setSaveMode(mode: SaveMode): void {
+      patchSave({ mode, phase: "idle", confirm: null, status: null, steps: [], error: null });
+    },
+
+    setSaveTarget(path: string): void {
+      patchSave({ targetPath: path });
+    },
+
+    /** 准备保存。`confirm=true` 表示用户已经在面板上看过绝对路径与备份位置。 */
+    prepareSave(confirm = false): Promise<boolean> {
+      return prepareSave(confirm);
+    },
+
+    refreshPresets,
+    savePreset,
+    applyPreset,
+    deletePreset,
+
+    /**
+     * 打开预设面板并**顺带拉一次列表**。
+     *
+     * 不做缓存：预设目录是用户（或别的工具）可以直接动的，缓存一份过期列表
+     * 会让「我明明删了它还在」。列表很便宜，每次都拉。
+     */
+    openPresetPanel(): void {
+      patchPresets({ open: true });
+      void refreshPresets();
+    },
+
+    closePresetPanel(): void {
+      patchPresets({ open: false });
+    },
+
+    clearPresetError(): void {
+      patchPresets({ error: null });
+    },
+
+    clearPresetNotice(): void {
+      patchPresets({ notice: null });
+    },
+
+    saveBusy(): boolean {
+      return saveBusy(store.getState().save);
     },
 
     effectiveFor(nodeId: string): unknown {
@@ -1114,6 +1648,29 @@ function jobErrorToDetail(error: JobError): ErrorDetail {
     hint: error.hint ?? null,
     details: error.details ?? null,
   };
+}
+
+/**
+ * 失败响应里的四态状态块（`details.status`）。
+ *
+ * 取不到就返回 `null` —— **不报假绿**：编一个「全部 false」的状态出来，
+ * 用户会以为服务端明确说了「什么都没写」，而其实我们只是没拿到证据。
+ */
+export function commitStatusOf(detail: ErrorDetail): CommitStatus | null {
+  const raw = (detail.details ?? {}) as Record<string, unknown>;
+  const status = raw.status;
+  if (status === null || typeof status !== "object" || Array.isArray(status)) {
+    return null;
+  }
+  return status as CommitStatus;
+}
+
+/** 失败响应里的步骤轨迹（走到哪一步断的）。取不到就空数组。 */
+export function commitStepsOf(detail: ErrorDetail): string[] {
+  const raw = (detail.details ?? {}) as Record<string, unknown>;
+  return Array.isArray(raw.steps)
+    ? raw.steps.filter((item): item is string => typeof item === "string")
+    : [];
 }
 
 function toDetail(error: unknown): ErrorDetail {

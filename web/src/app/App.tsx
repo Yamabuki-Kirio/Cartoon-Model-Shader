@@ -7,6 +7,8 @@ import { Inspector } from "../components/Inspector";
 import { NavPanel } from "../components/NavPanel";
 import { PreviewCanvas } from "../components/PreviewCanvas";
 import { StatusBar } from "../components/StatusBar";
+import { PresetPanel } from "../features/save/PresetPanel";
+import { SaveDialog } from "../features/save/SaveDialog";
 import type { Workspace } from "../state/workspace";
 
 /** v4 工作台。三栏：导航 / 固定预览 / 检查器，加顶部状态栏与底部操作栏。 */
@@ -97,6 +99,11 @@ export function App({ workspace, autoBootstrap = true }: { workspace: Workspace;
         <PreviewCanvas workspace={workspace} />
         <Inspector workspace={workspace} />
       </main>
+
+      {/* 保存闭环的两块面板：预设（参数集合）与保存（写进 .blend）。
+          两者刻意分开 —— 预设不落盘、保存才落盘，混在一起最误导人。 */}
+      <PresetPanel workspace={workspace} />
+      <SaveDialog workspace={workspace} />
 
       <ActionBar workspace={workspace} />
     </div>
