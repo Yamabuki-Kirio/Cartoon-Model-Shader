@@ -384,9 +384,10 @@ class RenderPipelineService:
         依据 ``render.done`` 与产物文件判定 —— 因此这里即使匹配不到任何关键词，
         也不会导致任务卡在非终止态。
         """
-        # 固定的开始渲染.py 通过 MCP 派发 Blender 后会打印 `@@LAUNCH@@{...pid...}`；
-        # 必须登记**真实 Blender PID**（不是只记入口 Python）才能保证整树终止。
-        if "@@LAUNCH@@" in line:
+        # 固定的开始渲染.py 通过 MCP 派发 Blender 后会打印稳定事件
+        # `@@BLENDER_PID@@{"pid": N}`；必须登记**真实 Blender PID**（不是只记入口
+        # Python）才能保证整树终止。`pid` 为 null 表示未能取得 PID。
+        if "@@BLENDER_PID@@" in line:
             self._record_dispatched_pid(job_id, line)
         if "预检与自动分类" in line:
             self._safe_transition(job_id, "analyzing_materials")
@@ -401,29 +402,42 @@ class RenderPipelineService:
             self._safe_transition(job_id, "verifying")
 
     def _record_dispatched_pid(self, job_id: str, line: str) -> None:
-        """从 ``@@LAUNCH@@`` 行解析并登记真实 Blender PID。
+        """从 ``@@BLENDER_PID@@`` 行解析并登记真实 Blender PID。
 
-        固定脚本用 ``print('@@LAUNCH@@' + json.dumps({'pid': p.pid}))`` 报告派发结果。
-        解析失败时**明确记录「不保证已终止」**，而不是假装成功。
+        固定脚本用 ``@@BLENDER_PID@@{"pid": N}`` 报告**真实 Blender**（常驻 Blender 经
+        MCP 派发，不是本入口脚本的子进程）。``pid`` 为 null / 解析失败时**明确记录
+        「不保证已终止」**，而不是假装成功。
         """
-        if self._proc_registry is None:
-            return
         try:
-            payload = line.split("@@LAUNCH@@", 1)[1]
+            payload = line.split("@@BLENDER_PID@@", 1)[1]
             data = json.loads(payload)
-            pid = int(data["pid"])
+            raw_pid = data.get("pid")
+            if raw_pid is None:
+                raise ValueError("pid is null")
+            pid = int(raw_pid)
         except (IndexError, ValueError, KeyError, json.JSONDecodeError):
+            # 取不到 PID 时必须**明确告警**（与是否装配了注册表无关）：
+            # 这是任务级事实，不能被静默吞掉。
             self._manager.append_log(
-                job_id, "[render] 警告：已派发 Blender 但未能解析其 PID，不保证取消/关闭时能终止。"
+                job_id, "[render] 警告：已派发 Blender 但未能取得其 PID，不保证取消/关闭时能终止。"
             )
             return
-        self._proc_registry.register(
+        if self._proc_registry is None:
+            return
+        rec = self._proc_registry.register(
             pid,
             job_id=job_id,
             exe=str(self._blender) if self._blender else "blender",
             parent_pid=None,
             kind="blender",
         )
+        # Job Object 绑定可能失败（进程已属于其他 Job / 权限不足）：必须显式记录，
+        # 否则系统会表现为「治理成功」而实际无法整树终止。
+        if not getattr(rec, "assigned", True):
+            self._manager.append_log(
+                job_id,
+                f"[render] 警告：Blender PID {pid} 未能加入 Job Object，取消时将走 PID/treekill 兜底。",
+            )
 
     async def cancel_job(self, job_id: str) -> list[int]:
         """取消任务：终止该任务**整棵进程树**（入口 + MCP 派发的 Blender + 确认服务）。

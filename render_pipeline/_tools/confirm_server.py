@@ -118,6 +118,8 @@ RENDER = {
     "started_at": None,
     "ended_at": None,
     "self_test": False,
+    #: 真实 Blender PID（由 _dispatch 记录，经 render_status 暴露给入口脚本转发）。
+    "blender_pid": None,
     "lock": threading.Lock(),
     "thread": None,
     "auto_event": threading.Event(),
@@ -284,6 +286,9 @@ def render_status():
         "out_root": display_path(out_root, root=out_root),
         "error": RENDER["error"],
         "blender_channel": blender_channel_ready(),
+        #: 服务端唯一持有的真实 Blender PID（由 _dispatch 记录）。入口脚本据此
+        #: 把 PID 转发到自己的 stdout，供 HTTP 编排层登记 / 终止。
+        "blender_pid": RENDER.get("blender_pid"),
         "started_at": RENDER["started_at"],
         "ended_at": RENDER["ended_at"],
         "targets": [{"label": t.get("label"),
@@ -322,6 +327,10 @@ def _dispatch(argv, log_path):
     起一个后台 Blender。返回 (ok, info)。
     优先走常驻 Blender MCP 进程；不可用时回退为本机直接启动。
     两条通道都失败时给出可操作诊断，而不是抛裸异常。
+
+    成功时把真实 Blender PID 记入 ``RENDER["blender_pid"]``，并通过 ``render_status``
+    暴露出去 —— 入口脚本据此把 PID 转发到自己的 stdout（真实 Blender 并非入口的
+    子进程，必须显式取 PID 才能被终止）。
     """
     resident_err = None
     try:
@@ -330,7 +339,9 @@ def _dispatch(argv, log_path):
                 " stderr=subprocess.STDOUT)\n"
                 "print('@@LAUNCH@@' + json.dumps({'pid': p.pid}))\n" % (argv, log_path))
         r = _send({"type": "execute_code", "params": {"code": code}}, timeout=60)
-        if "@@LAUNCH@@" in json.dumps(r):
+        text = json.dumps(r)
+        if "@@LAUNCH@@" in text:
+            RENDER["blender_pid"] = _extract_pid(text)
             return True, "resident"
         resident_err = str(r)[:200]
     except Exception as e:
@@ -339,6 +350,7 @@ def _dispatch(argv, log_path):
     try:
         logf = open(log_path, "w", encoding="utf-8", errors="replace")
         p = subprocess.Popen(argv, stdout=logf, stderr=subprocess.STDOUT)
+        RENDER["blender_pid"] = p.pid
         return True, "direct:pid=%d" % p.pid
     except Exception as e:
         return False, ("无法启动 Blender。"
@@ -346,6 +358,23 @@ def _dispatch(argv, log_path):
                        "直接启动亦被拒（%s）。\n"
                        "      处理：先在 Blender 里启用 MCP 监听（默认端口 9876），再重试渲染。"
                        % (resident_err, e))
+
+
+def _extract_pid(text):
+    """从含 ``@@LAUNCH@@`` 的文本里解析出 pid；解析不到返回 None。
+
+    payload 可能被 ``json.dumps`` 转义（引号前带 ``\\``），因此用正则抓数字，
+    不依赖严格的 JSON 解析。
+    """
+    try:
+        import re
+
+        payload = text.split("@@LAUNCH@@", 1)[1]
+        # 引号可能被转义成 `\"`，允许可选反斜杠。
+        m = re.search(r'\\?"pid\\?"\s*:\s*(\d+)', payload)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
 
 
 _CHAN = {"ok": None, "ts": 0.0}

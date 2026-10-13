@@ -6,6 +6,12 @@
 * Windows 用 **Job Object** 管理完整进程树，关闭 Job Object 即统一终止所有子进程；
 * MCP 派发 Blender 后必须返回真实 PID（不能只记录入口 Python）。
 
+**重要事实**：真实 Blender 由**常驻 Blender 进程**经 MCP 执行 ``Popen`` 拉起，
+**不是入口 Python 的子进程**。因此它不会自动落进入口进程的 Job Object ——
+必须先通过入口脚本 stdout 的 ``@@BLENDER_PID@@{"pid": N}`` 取得真实 PID，
+再 ``AssignProcessToJobObject`` 显式纳入。``assign`` 可能失败（进程已属其他 Job /
+权限不足），此时 ``ProcRecord.assigned=False``，取消/关闭必须走 PID/treekill 兜底。
+
 本模块不依赖第三方库；Job Object 通过 ctypes 调用，非 Windows 或调用失败时
 退化为「按登记的 PID 逐个终止 + 兜底 tree kill」，保证不会因为平台差异而完全不清理。
 """
@@ -28,6 +34,9 @@ class ProcRecord:
     started_at: float
     exe: str
     kind: str = "entry"  # entry | confirm | blender
+    #: 是否成功加入 Job Object。False 表示取消/关闭时须走 PID/treekill 兜底；
+    #: 调用方应据此**明确告警**，不得表现为「治理成功」。
+    assigned: bool = False
 
 
 @dataclass
@@ -68,15 +77,21 @@ class ProcessRegistry:
             started_at=time.time(),
             exe=exe,
             kind=kind,
+            assigned=False,
         )
         self.records[pid] = rec
         # 若该任务已绑定 Job Object，立即把进程 assign 进去（整树终止的根基）。
+        # 必须检查返回值：进程可能已属于其他 Job 或权限不足 —— 那种情况下
+        # Job Object 不会收纳它，必须记录 assigned=False 供调用方兜底。
         job_object = self.jobs.get(job_id)
-        if job_object is not None:
+        if job_object is not None and job_object.available:
             try:
-                job_object.assign(pid)
-            except Exception:  # noqa: BLE001 - assign 失败不阻断登记
-                pass
+                rec.assigned = bool(job_object.assign(pid))
+            except Exception as exc:  # noqa: BLE001 - assign 失败不阻断登记，但记录
+                rec.assigned = False
+                import logging
+
+                logging.getLogger("toon_tuner").warning("AssignProcessToJobObject 失败：%s", exc)
         return rec
 
     def unregister(self, pid: int) -> None:
@@ -357,6 +372,8 @@ def terminate_job_processes(
         registry.release_job_object(job_id)
 
     for rec in records:
+        # 关闭 Job 已覆盖 assigned=True 的进程；未成功 assign 的（含真实 Blender 与
+        # 确认服务）必须逐 PID 走 treekill 兜底，否则会漏掉。
         ok = terminate_tree(rec.pid, job_object=None, grace_seconds=grace_seconds)
         if ok:
             registry.unregister(rec.pid)

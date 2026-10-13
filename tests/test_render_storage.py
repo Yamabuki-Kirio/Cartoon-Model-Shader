@@ -439,6 +439,119 @@ def test_cancel_terminates_process_tree(tmp_path: Path) -> None:
     assert app.state.proc_registry.for_job(job_id) == []
 
 
+def test_pid_contract_registers_real_blender(tmp_path: Path) -> None:
+    """真实固定脚本契约：入口脚本 stdout 上报的 @@BLENDER_PID@@ 必须被登记。
+
+    走完整适配器路径（真的起子进程 + 真的解析 stdout），不手工调用 _observe_line。
+    """
+    import asyncio
+    import sys
+
+    from src.server.models_scan import ModelRegistry
+    from src.server.render_pipeline_adapter import RenderPipelineService
+    from src.server.proc_cleanup import ProcessRegistry, _pid_alive
+
+    contract = Path(__file__).resolve().parent / "fake_render_pid_contract.py"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "m.pmx").write_bytes(b"model")
+
+    registry = ModelRegistry(model_dir, tmp_path / ".reg.json")
+    registry.scan()
+    manager = RenderJobManager(tmp_path / "out")
+    proc_registry = ProcessRegistry()
+    service = RenderPipelineService(
+        manager,
+        registry,
+        fixed_render_script=contract,
+        model_root=model_dir,
+        runtime_dir=tmp_path / "runtime",
+        output_root=tmp_path / "out",
+        proc_registry=proc_registry,
+    )
+    model_id = registry.to_public()[0]["model_id"]
+    job, _ = service.create_job(model_id, {"mode": "faithful"})
+
+    async def scenario():
+        await service.start_worker()
+        service.enqueue(job.job_id)
+        deadline = time.monotonic() + 15
+        bloben = None
+        while time.monotonic() < deadline:
+            recs = [r for r in proc_registry.for_job(job.job_id) if r.kind == "blender"]
+            if recs:
+                bloben = recs[0]
+                break
+            await asyncio.sleep(0.05)
+        assert bloben is not None, "入口脚本上报的 Blender PID 必须被登记为 blender 类型"
+        assert _pid_alive(bloben.pid), "登记的真实 Blender 进程应在运行"
+        # 取消：必须终止整棵树（含登记的 Blender）
+        await service.cancel_job(job.job_id)
+        await asyncio.sleep(0.3)
+        assert not _pid_alive(bloben.pid), "取消应终止登记的真实 Blender 进程"
+        await service.stop_worker()
+
+    asyncio.run(scenario())
+
+
+def test_pid_contract_null_pid_records_warning(tmp_path: Path) -> None:
+    """取不到 PID 时（pid=null）必须记录「不保证已终止」告警，不得假装成功。"""
+    import asyncio
+
+    from src.server.models_scan import ModelRegistry
+    from src.server.render_pipeline_adapter import RenderPipelineService
+
+    contract = Path(__file__).resolve().parent / "fake_render_pid_contract.py"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "m.pmx").write_bytes(b"model")
+    registry = ModelRegistry(model_dir, tmp_path / ".reg.json")
+    registry.scan()
+    manager = RenderJobManager(tmp_path / "out")
+    service = RenderPipelineService(
+        manager,
+        registry,
+        fixed_render_script=contract,
+        model_root=model_dir,
+        runtime_dir=tmp_path / "runtime",
+        output_root=tmp_path / "out",
+    )
+    model_id = registry.to_public()[0]["model_id"]
+    job, _ = service.create_job(model_id, {"mode": "faithful", "auto_frame": False})
+
+    # 直接以 --fail-pid 调脚本本体，验证契约输出
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [sys.executable, str(contract), "--out", str(tmp_path / "o"), "--fail-pid", "1"],
+        capture_output=True,
+        text=True,
+    )
+    assert "@@BLENDER_PID@@{\"pid\": null}" in out.stdout
+
+    # 适配器侧：解析 null 时应写入告警日志
+    service._observe_line(job.job_id, '@@BLENDER_PID@@{"pid": null}', job.fingerprint)
+    logs = "\n".join(manager.get(job.job_id).logs)
+    assert "未能取得其 PID" in logs
+
+
+def test_job_object_assign_failure_recorded(tmp_path: Path) -> None:
+    """assign 失败时必须记录 assigned=False（不得表现为治理成功）。"""
+    from src.server.proc_cleanup import ProcessRegistry
+
+    class FakeJobObject:
+        available = True
+
+        def assign(self, pid: int) -> bool:
+            return False  # 模拟绑定失败（已属其他 Job / 权限不足）
+
+    registry = ProcessRegistry()
+    registry.attach_job_object("j1", FakeJobObject())
+    rec = registry.register(1234, job_id="j1", exe="blender", kind="blender")
+    assert rec.assigned is False, "assign 失败必须记录为 False"
+
+
 def test_evictions_prioritize_but_respect_thresholds(tmp_path: Path) -> None:
     """取消/失败只提高优先级；未超阈值时不得把它们无条件淘汰。"""
     manager = _manager_with_jobs(
