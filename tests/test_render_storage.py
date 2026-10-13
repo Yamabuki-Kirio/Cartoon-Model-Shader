@@ -38,7 +38,7 @@ from src.server.render_storage import (
     purge_job_dir,
     safe_remove,
 )
-from tests.support import authed
+from tests.support import FakeBlenderGateway, authed
 
 FAKE_LAYOUT = Path(__file__).resolve().parent / "fake_render_layout.py"
 
@@ -310,10 +310,19 @@ def _config(tmp_path: Path, model_dir: Path) -> AppConfig:
     )
 
 
+def _render_app(tmp_path: Path, model_dir: Path, *, gateway=None):
+    """渲染工作流装配：注入**已连接**的假 MCP。
+
+    规格 §5.4 起，创建渲染任务前会校验 Blender MCP 是否连接；这些用例都在跑
+    取消/清理流程，必须先建任务，因此统一注入 FakeBlenderGateway。
+    """
+    return create_app(_config(tmp_path, model_dir), gateway=gateway or FakeBlenderGateway())
+
+
 def test_api_storage_and_pin_and_cleanup(tmp_path: Path) -> None:
     model_dir = tmp_path / "models"
     model_dir.mkdir()
-    app = create_app(_config(tmp_path, model_dir))
+    app = _render_app(tmp_path, model_dir)
     with authed(app) as client:
         storage = client.get("/api/render/storage")
         assert storage.status_code == 200
@@ -355,7 +364,7 @@ def test_api_storage_write_requires_token(tmp_path: Path) -> None:
 
     model_dir = tmp_path / "models"
     model_dir.mkdir()
-    app = create_app(_config(tmp_path, model_dir))
+    app = _render_app(tmp_path, model_dir)
     response = unauthed(app).post("/api/render/storage/cleanup")
     assert response.status_code == 401
 
@@ -415,7 +424,7 @@ def test_cancel_terminates_process_tree(tmp_path: Path) -> None:
 
     model_dir = tmp_path / "models"
     model_dir.mkdir()
-    app = create_app(_config(tmp_path, model_dir))
+    app = _render_app(tmp_path, model_dir)
     with authed(app) as client:
         model_id = client.get("/api/render/models").json()["models"][0]["model_id"]
         created = client.post(
@@ -693,7 +702,7 @@ def test_cancel_illegal_state_does_not_terminate(tmp_path: Path) -> None:
 
     model_dir = tmp_path / "models"
     model_dir.mkdir()
-    app = create_app(_config(tmp_path, model_dir))
+    app = _render_app(tmp_path, model_dir)
     # 不启动 worker 执行：让任务停在测试指定的状态，避免与后台执行竞态。
     app.state.pipeline.enqueue = lambda job_id: None  # type: ignore[assignment]
     with authed(app) as client:
@@ -727,7 +736,7 @@ def test_cancel_legal_state_transitions_first_then_terminates(tmp_path: Path) ->
 
     model_dir = tmp_path / "models"
     model_dir.mkdir()
-    app = create_app(_config(tmp_path, model_dir))
+    app = _render_app(tmp_path, model_dir)
 
     order: list[str] = []
     real_cancel_job = app.state.pipeline.cancel_job
@@ -764,7 +773,7 @@ def test_cancel_queued_runs_cleanup(tmp_path: Path) -> None:
     """排队任务取消后不会走 _finalize，接口必须主动做任务级清理。"""
     model_dir = tmp_path / "models"
     model_dir.mkdir()
-    app = create_app(_config(tmp_path, model_dir))
+    app = _render_app(tmp_path, model_dir)
     app.state.pipeline.enqueue = lambda job_id: None  # type: ignore[assignment]
     with authed(app) as client:
         model_id = client.get("/api/render/models").json()["models"][0]["model_id"]

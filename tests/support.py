@@ -20,6 +20,7 @@ from src.server.security import TOKEN_HEADER
 
 __all__ = [
     "TOKEN_HEADER",
+    "FakeBlenderGateway",
     "authed",
     "headers_for",
     "make_config",
@@ -27,6 +28,40 @@ __all__ = [
     "unauthed",
     "write_fake_dist",
 ]
+
+
+class FakeBlenderGateway:
+    """伪造 MCP 连接状态（仅供测试注入 ``create_app(gateway=...)``）。
+
+    存在的理由：渲染环境诊断与「Blender 未连接不得创建渲染任务」（规格 §5.4）
+    都依赖 ``gateway.status()``。不注入假 gateway 的话，这两条路径在 CI 里
+    （没有真 Blender）永远只能覆盖「未连接」那一半。
+    """
+
+    def __init__(self, *, connected: bool = True, message: str | None = None) -> None:
+        self.connected = connected
+        self.message = message
+        self.status_calls = 0
+
+    async def status(self) -> dict:
+        self.status_calls += 1
+        if self.connected:
+            return {
+                "ok": True,
+                "status": "connected",
+                "target": "127.0.0.1:9876",
+                "checked_at": "2026-10-13T00:00:00+08:00",
+                "latency_ms": 1.0,
+                "error": None,
+            }
+        return {
+            "ok": False,
+            "status": "refused",
+            "target": "127.0.0.1:9876",
+            "checked_at": "2026-10-13T00:00:00+08:00",
+            "latency_ms": None,
+            "error": {"code": "BLENDER_CONNECTION_REFUSED", "message": self.message or "连接被拒绝"},
+        }
 
 
 def make_config(

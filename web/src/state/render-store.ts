@@ -13,6 +13,7 @@ import type { ErrorDetail } from "../api/types";
 import type { RenderEndpoints } from "../api/render-endpoints";
 import type {
   RenderCleanupReport,
+  RenderEnvironmentResponse,
   RenderJob,
   RenderModel,
   RenderState,
@@ -43,6 +44,11 @@ export interface RenderUiState {
   storage: RenderStorageUsage | null;
   /** 最近一次清理预演/执行的结果。 */
   lastCleanup: RenderCleanupReport | null;
+  /** 环境诊断（规格 §5）：就绪状态 + 12 项检查。null = 尚未读取。 */
+  environment: RenderEnvironmentResponse | null;
+  environmentLoading: boolean;
+  /** 首次使用教程是否展开（规格 §5.2：首次进入默认展开，可折叠，可随时重开）。 */
+  tourOpen: boolean;
 }
 
 function toDetail(error: unknown): ErrorDetail {
@@ -92,6 +98,9 @@ export function createRenderStore(options: RenderStoreOptions) {
     notice: null,
     storage: null,
     lastCleanup: null,
+    environment: null,
+    environmentLoading: false,
+    tourOpen: true,
   });
 
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -197,11 +206,39 @@ export function createRenderStore(options: RenderStoreOptions) {
     }
   }
 
+  async function loadEnvironment(): Promise<void> {
+    store.setState({ environmentLoading: true });
+    try {
+      const report = await endpoints.environment();
+      store.setState({ environment: report, environmentLoading: false });
+    } catch {
+      // 诊断读取失败不阻断页面：保持上一份（或 null），由就绪判断按「未就绪」处理。
+      store.setState({ environmentLoading: false });
+    }
+  }
+
   async function startJob(): Promise<boolean> {
     const state = store.getState();
     if (!state.selectedModelId) {
       store.setState({
         jobError: { code: "MODEL_NOT_FOUND", message: "请先选择一个模型。", retryable: false },
+      });
+      return false;
+    }
+    // 规格 §5.4：环境未就绪时**前端就先拒**，把具体缺项列出来，
+    // 而不是发一个注定被服务端 503 拒绝的请求。
+    const env = state.environment;
+    if (env && !env.ready) {
+      store.setState({
+        jobError: {
+          code: "RENDER_ENVIRONMENT_NOT_READY",
+          message: "环境检查未通过，暂时不能开始渲染。",
+          retryable: false,
+          hint: env.checks
+            .filter((c) => c.status === "error")
+            .map((c) => c.hint ?? c.message)
+            .join("；"),
+        },
       });
       return false;
     }
@@ -332,8 +369,13 @@ export function createRenderStore(options: RenderStoreOptions) {
     bootstrap(): void {
       void loadModels();
       void loadStorage();
+      void loadEnvironment();
     },
     loadStorage,
+    loadEnvironment,
+    setTourOpen(open: boolean): void {
+      store.setState({ tourOpen: open });
+    },
     pinJob,
     cleanupStorage,
     loadModels,

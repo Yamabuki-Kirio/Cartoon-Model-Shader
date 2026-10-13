@@ -439,6 +439,23 @@ class StorageService:
                     found.append(str(candidate))
         return found
 
+    def stale_lock_count(self) -> int:
+        """**只计数**遗留渲染锁，不做任何删除。
+
+        与 ``cleanup_stale_locks`` 分开：环境诊断（规格 §5）是只读接口，
+        不能因为它被调一次就顺手删掉锁文件 —— 那会让「检查环境」变成「改环境」。
+        """
+        count = 0
+        for root in self._roots:
+            lock_dir = Path(root) / ".locks"
+            if not lock_dir.is_dir():
+                continue
+            try:
+                count += sum(1 for p in lock_dir.glob("*.render.lock") if p.is_file())
+            except OSError:
+                continue
+        return count
+
     def cleanup_stale_locks(self) -> int:
         """清理过期的渲染锁文件（孤儿锁会让下次渲染误判「已被占用」）。"""
         removed = 0

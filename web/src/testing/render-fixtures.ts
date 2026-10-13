@@ -95,6 +95,12 @@ export function makeTestRenderEndpoints(overrides: Partial<RenderEndpoints> = {}
       reclaimable_bytes: 0,
       roots: ["out"],
     })),
+    environment: vi.fn(async () => ({
+      ok: true as const,
+      ready: true,
+      blockers: [],
+      checks: [],
+    })),
     cleanupStorage: vi.fn(async (dryRun: boolean) => ({
       ok: true as const,
       dry_run: dryRun,

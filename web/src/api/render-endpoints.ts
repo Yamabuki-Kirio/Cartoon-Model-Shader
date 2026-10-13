@@ -5,6 +5,7 @@ import type {
   CreateRenderJobBody,
   RenderArtifactsResponse,
   RenderCleanupReport,
+  RenderEnvironmentResponse,
   RenderJob,
   RenderMaterialsResponse,
   RenderModelsResponse,
@@ -14,6 +15,7 @@ import type {
 const MODELS_PATH = "/api/render/models";
 const JOBS_PATH = "/api/render/jobs";
 const STORAGE_PATH = "/api/render/storage";
+const ENVIRONMENT_PATH = "/api/render/environment";
 
 export class RenderEndpoints {
   constructor(private readonly client: ApiClient) {}
@@ -90,5 +92,15 @@ export class RenderEndpoints {
     options: { signal?: AbortSignal } = {}
   ): Promise<RenderCleanupReport> {
     return this.client.post(`${STORAGE_PATH}/cleanup`, {}, { ...options, query: { dry_run: dryRun } });
+  }
+
+  /**
+   * 渲染环境只读诊断（规格 §5）。
+   *
+   * 只读、不带令牌，也不接受任何路径参数 —— 路径全部由服务端自己解析，
+   * 响应里只有脱敏标签。用于渲染前的红黄绿预检与「开始」按钮的就绪判断。
+   */
+  environment(options: { signal?: AbortSignal } = {}): Promise<RenderEnvironmentResponse> {
+    return this.client.get(ENVIRONMENT_PATH, options);
   }
 }

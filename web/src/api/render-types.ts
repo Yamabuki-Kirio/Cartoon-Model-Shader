@@ -119,6 +119,32 @@ export interface RenderMaterialsResponse {
   waiting: boolean;
 }
 
+/** 环境诊断的单项检查（规格 §5.3）。 */
+export interface RenderEnvironmentCheck {
+  id: string;
+  /** ok / warning / error。 */
+  status: "ok" | "warning" | "error";
+  message: string;
+  /** 下一步该做什么（error/warning 时才有）。 */
+  hint?: string;
+}
+
+/** 环境诊断响应。**绝不含本机绝对路径**（规格 §5.4）。 */
+export interface RenderEnvironmentResponse {
+  ok: true;
+  ready: boolean;
+  /** error 级检查项 id；非空即应禁用「开始渲染」。 */
+  blockers: string[];
+  checks: RenderEnvironmentCheck[];
+}
+
+/** 三步教程的固定文案（规格 §5.2）。 */
+export const RENDER_ONBOARDING_STEPS = [
+  "打开 Blender 测试工程",
+  "启用 Blender MCP，确认端口 9876",
+  "检查环境并刷新模型列表",
+] as const;
+
 export interface RenderArtifactsResponse {
   ok: true;
   job_id: string;

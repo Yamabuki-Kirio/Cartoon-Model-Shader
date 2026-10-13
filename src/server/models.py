@@ -553,6 +553,19 @@ class ArtifactListResponse(BaseModel):
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class RenderEnvironmentResponse(BaseModel):
+    """渲染环境只读诊断（规格 §5）。
+
+    ``ready`` 为 False 时 ``blockers`` 列出 error 级检查项 id，前端据此禁用
+    「开始渲染」并逐项说明原因。**响应里不含任何本机绝对路径。**
+    """
+
+    ok: Literal[True] = True
+    ready: bool = False
+    blockers: list[str] = Field(default_factory=list)
+    checks: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class RenderLogResponse(BaseModel):
     ok: Literal[True] = True
     job_id: str

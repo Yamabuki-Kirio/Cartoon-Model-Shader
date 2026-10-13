@@ -4,6 +4,7 @@ import { Chip } from "../../components/chips";
 import { formatBytes, type RenderStore } from "../../state/render-store";
 import {
   RENDER_CANCEL_LOCKED_MESSAGE,
+  RENDER_ONBOARDING_STEPS,
   RENDER_STATE_LABELS,
   RENDER_STEPS,
   RENDER_TERMINAL_LABELS,
@@ -42,7 +43,19 @@ export function RenderWizard({ controller }: { controller: RenderStore }) {
         >
           刷新模型列表
         </button>
+        <button
+          type="button"
+          class="chip"
+          data-testid="render-tour-toggle"
+          onClick={() => controller.actions.setTourOpen(!state.tourOpen)}
+        >
+          {state.tourOpen ? "收起教程" : "第一次使用？"}
+        </button>
       </header>
+
+      <Onboarding controller={controller} />
+
+      <EnvironmentPanel controller={controller} />
 
       <Steps current={step} />
 
@@ -74,6 +87,117 @@ export function RenderWizard({ controller }: { controller: RenderStore }) {
     </section>
   );
 }
+/**
+ * 首次使用教程（规格 §5.2）。
+ *
+ * 三步固定文案；首次进入默认展开，可折叠，也能从右上角随时重开 ——
+ * 新用户不该被要求先去读命令行文档。
+ */
+function Onboarding({ controller }: { controller: RenderStore }) {
+  const state = useStore(controller.store, (snapshot) => snapshot);
+  if (!state.tourOpen) {
+    return null;
+  }
+  return (
+    <div class="banner banner-info" data-testid="render-tour">
+      <b>第一次使用</b>
+      <ol class="tour-steps">
+        {RENDER_ONBOARDING_STEPS.map((label, index) => (
+          <li key={label}>
+            <span class="step-index">{index + 1}</span>
+            <span>{label}</span>
+          </li>
+        ))}
+      </ol>
+      <div class="muted">
+        三步完成后，「开始渲染」即可点击。卡住时点「重新检测环境」刷新这一页的诊断结果。
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 环境诊断面板（规格 §5.3 / §5.4）。
+ *
+ * 红黄绿分级；error 级逐项给出**下一步做什么**。未就绪时上层会禁用「开始渲染」，
+ * 因此这里不是装饰，而是用户唯一能看懂「为什么还不能开始」的地方。
+ */
+function EnvironmentPanel({ controller }: { controller: RenderStore }) {
+  const state = useStore(controller.store, (snapshot) => snapshot);
+  const env = state.environment;
+
+  if (state.environmentLoading && !env) {
+    return (
+      <div class="banner banner-info" data-testid="render-environment">
+        正在检查环境…
+      </div>
+    );
+  }
+  if (!env) {
+    return (
+      <div class="banner banner-warn" data-testid="render-environment">
+        环境检查结果暂不可用。
+        <button
+          type="button"
+          class="chip"
+          data-testid="render-environment-recheck"
+          onClick={() => void controller.actions.loadEnvironment()}
+        >
+          重新检测环境
+        </button>
+      </div>
+    );
+  }
+
+  const errors_ = env.checks.filter((c) => c.status === "error");
+  const warnings = env.checks.filter((c) => c.status === "warning");
+  const okCount = env.checks.length - errors_.length - warnings.length;
+
+  return (
+    <div
+      class={env.ready ? "banner banner-ok" : "banner banner-error"}
+      data-testid="render-environment"
+      data-ready={env.ready ? "true" : "false"}
+    >
+      <b data-testid="render-environment-summary">
+        {env.ready
+          ? `环境就绪：${okCount} 项正常${warnings.length ? `，${warnings.length} 项提醒` : ""}`
+          : `环境未就绪：${errors_.length} 项需要处理`}
+      </b>
+      <button
+        type="button"
+        class="chip"
+        data-testid="render-environment-recheck"
+        onClick={() => void controller.actions.loadEnvironment()}
+      >
+        重新检测环境
+      </button>
+
+      {errors_.length > 0 ? (
+        <ul class="env-list" data-testid="render-environment-blockers">
+          {errors_.map((check) => (
+            <li key={check.id} class="env-error">
+              <b>{check.message}</b>
+              {check.hint ? <div class="muted">{check.hint}</div> : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      {warnings.length > 0 ? (
+        <ul class="env-list" data-testid="render-environment-warnings">
+          {warnings.map((check) => (
+            <li key={check.id} class="env-warn">
+              <span>{check.message}</span>
+              {check.hint ? <div class="muted">{check.hint}</div> : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
 function StoragePanel({ controller }: { controller: RenderStore }) {
   const state = useStore(controller.store, (snapshot) => snapshot);
   const usage = state.storage;
@@ -148,6 +272,9 @@ function Steps({ current }: { current: number }) {
 }
 function ModelStep({ controller }: { controller: RenderStore }) {
   const state = useStore(controller.store, (snapshot) => snapshot);
+  // 环境未就绪时禁用「开始渲染」：诊断还没读到时按未就绪处理（保守方向），
+  // 避免在信息不足时放行一个必然失败的任务。
+  const environmentReady = state.environment !== null && state.environment.ready === true;
   return (
     <div class="wizard-body" data-testid="render-model-step">
       {state.modelsLoading ? <p class="muted">正在加载模型…</p> : null}
@@ -208,11 +335,20 @@ function ModelStep({ controller }: { controller: RenderStore }) {
           type="button"
           class="primary"
           data-testid="render-start"
-          disabled={!state.selectedModelId || state.busy}
+          disabled={!state.selectedModelId || state.busy || !environmentReady}
           onClick={() => void controller.actions.startJob()}
         >
-          {state.busy ? "正在创建任务…" : "开始渲染"}
+          {state.busy
+            ? "正在创建任务…"
+            : environmentReady
+              ? "开始渲染"
+              : "环境检查未通过，暂不能开始"}
         </button>
+        {!environmentReady ? (
+          <div class="muted" data-testid="render-start-disabled-reason">
+            请先按上方「环境未就绪」里的逐项提示处理，然后点「重新检测环境」。
+          </div>
+        ) : null}
       </div>
     </div>
   );

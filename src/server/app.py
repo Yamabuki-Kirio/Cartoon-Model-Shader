@@ -30,6 +30,7 @@
 * ``GET  /api/v4/session/baseline`` v4 基线（身份 + 结构指纹 + 基线值）
 * ``POST /api/v4/preview``         v4 预览：L0 + Cel 编进同一任务，只渲染一次
 * ``GET  /api/v4/jobs/{id}``       v4 任务状态（与 ``/api/jobs/{id}`` 同一份存储）
+* ``GET  /api/render/environment`` 渲染环境只读诊断（红黄绿 + 脱敏标签；未就绪时禁用开始）
 
 安全边界：
 * 只监听 127.0.0.1（见 config 回环校验）。
@@ -80,6 +81,7 @@ from .commit import CommitService
 from .models_scan import ModelRegistry
 from .proc_cleanup import ProcessRegistry
 from .render_jobs import RenderJobManager
+from .render_environment import build_environment_report
 from .render_pipeline_adapter import RenderPipelineService
 from .render_storage import StorageService
 from pathlib import Path
@@ -112,6 +114,7 @@ from .models import (
     V4PreviewRequest,
     ArtifactListResponse,
     ModelInfoResponse,
+    RenderEnvironmentResponse,
     RenderJobResponse,
     RenderLogResponse,
     RenderMaterialsResponse,
@@ -251,10 +254,19 @@ def _preset_public(preset: dict[str, Any]) -> dict[str, Any]:
 
 
 def create_app(
-    config: AppConfig | None = None, *, preset_store: PresetStore | None = None
+    config: AppConfig | None = None,
+    *,
+    preset_store: PresetStore | None = None,
+    gateway: BlenderGateway | None = None,
 ) -> FastAPI:
+    """构建应用。
+
+    ``gateway`` 仅供测试注入（伪造 MCP 在线/离线状态）；生产路径下不传，
+    由本函数自己构造。渲染环境诊断与「未连接禁止建任务」都依赖它，
+    因此必须可替换 —— 否则真机之外无法覆盖这两条路径。
+    """
     cfg = config or load_config()
-    gateway = BlenderGateway(cfg)
+    gateway = gateway or BlenderGateway(cfg)
     binder = BlenderBinder(cfg.blender_mcp)
     surface_service = SurfaceService()
     preview = PreviewService(binder, surface_service)
@@ -773,6 +785,35 @@ def create_app(
     async def render_models_refresh() -> dict[str, Any]:
         return {"ok": True, "models": app.state.registry.scan()}
 
+    @app.get(
+        "/api/render/environment",
+        response_model=RenderEnvironmentResponse,
+        tags=["render"],
+    )
+    async def render_environment() -> dict[str, Any]:
+        """渲染环境只读诊断（规格 §5）。
+
+        **只读**：不创建/修改/删除任何东西，也不接受任何路径参数。
+        响应里的路径一律脱敏（``redact.display_path``），绝不出现本机绝对路径。
+        """
+        try:
+            status = await gateway.status()
+        except Exception as exc:  # noqa: BLE001 - 诊断接口自己不能抛
+            status = {"ok": False, "status": "unknown", "error": {"message": str(exc)}}
+        report = build_environment_report(
+            blender_status=status,
+            blender_exe=cfg.render.blender,
+            source_blend=cfg.render.source_blend,
+            model_root=cfg.render.model_root,
+            output_root=_output_root,
+            runtime_dir=_render_rt,
+            maps_dir=cfg.render.maps_dir,
+            fixed_script=cfg.render.pipeline_script_path,
+            jobs=app.state.jobs.list_jobs(),
+            stale_lock_count=app.state.storage.stale_lock_count(),
+        )
+        return report.to_public()
+
     @app.post(
         "/api/render/jobs",
         response_model=RenderJobResponse,
@@ -780,6 +821,16 @@ def create_app(
         dependencies=require_token,
     )
     async def create_render_job(body: RenderSettingsRequest) -> dict[str, Any]:
+        # 规格 §5.4：**Blender 未连接不得创建正式渲染任务**。
+        # 在这里拦，而不是等任务跑起来再失败 —— 用户会先看到一句可操作的提示，
+        # 而不是一个必然失败的渲染任务和半堆日志。
+        status = await gateway.status()
+        if not (bool(status.get("ok")) and status.get("status") == "connected"):
+            raise errors.ToonTunerError(
+                errors.BLENDER_CONNECTION_REFUSED,
+                "Blender MCP 未连接，无法创建渲染任务。",
+                retryable=True,
+            )
         job, created = app.state.pipeline.create_job(
             body.model_id, body.model_dump(exclude={"model_id"})
         )

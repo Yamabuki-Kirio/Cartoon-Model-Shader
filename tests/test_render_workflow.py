@@ -22,7 +22,7 @@ from src.server.config import AppConfig, BlenderMCPConfig, RenderConfig, ServerC
 from src.server.models_scan import ModelRegistry, model_id_from_fingerprint
 from src.server.render_jobs import RenderJobManager
 from src.server.render_pipeline_adapter import RenderPipelineService, validate_settings
-from tests.support import authed, unauthed
+from tests.support import FakeBlenderGateway, authed, unauthed
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FAKE_OK = Path(__file__).resolve().parent / "fake_render_ok.py"
@@ -255,6 +255,19 @@ def _config(tmp_path: Path, script: Path, model_dir: Path) -> AppConfig:
     )
 
 
+def _render_app(tmp_path: Path, script: Path, model_dir: Path, *, gateway=None):
+    """渲染工作流专用装配：注入**已连接**的假 MCP。
+
+    规格 §5.4 起，创建渲染任务前会校验 Blender MCP 是否连接。测试里没有真
+    Blender，因此统一经这里注入 ``FakeBlenderGateway``；需要验证「未连接被拒」
+    的用例显式传 ``gateway=FakeBlenderGateway(connected=False)``。
+    """
+    return create_app(
+        _config(tmp_path, script, model_dir),
+        gateway=gateway or FakeBlenderGateway(),
+    )
+
+
 def _wait_terminal(client: TestClient, job_id: str, timeout: float = 20.0) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -269,7 +282,7 @@ def test_api_render_workflow_end_to_end(tmp_path: Path) -> None:
     model_dir = tmp_path / "models"
     model_dir.mkdir()
     (model_dir / "m.pmx").write_bytes(b"model")
-    app = create_app(_config(tmp_path, FAKE_OK, model_dir))
+    app = _render_app(tmp_path, FAKE_OK, model_dir)
 
     # 必须进入上下文管理器，lifespan 才会启动常驻渲染 worker。
     with authed(app) as client:
@@ -298,7 +311,7 @@ def test_api_write_endpoints_require_token(tmp_path: Path) -> None:
     model_dir = tmp_path / "models"
     model_dir.mkdir()
     (model_dir / "m.pmx").write_bytes(b"model")
-    app = create_app(_config(tmp_path, FAKE_OK, model_dir))
+    app = _render_app(tmp_path, FAKE_OK, model_dir)
     client = unauthed(app)
 
     response = client.post(
@@ -310,7 +323,7 @@ def test_api_write_endpoints_require_token(tmp_path: Path) -> None:
 def test_api_unknown_model_404(tmp_path: Path) -> None:
     model_dir = tmp_path / "models"
     model_dir.mkdir()
-    app = create_app(_config(tmp_path, FAKE_OK, model_dir))
+    app = _render_app(tmp_path, FAKE_OK, model_dir)
     client = authed(app)
     response = client.post(
         "/api/render/jobs", json={"model_id": "model-nope", "mode": "faithful", "auto_frame": False}
@@ -323,7 +336,7 @@ def test_api_rejects_extra_settings(tmp_path: Path) -> None:
     model_dir = tmp_path / "models"
     model_dir.mkdir()
     (model_dir / "m.pmx").write_bytes(b"model")
-    app = create_app(_config(tmp_path, FAKE_OK, model_dir))
+    app = _render_app(tmp_path, FAKE_OK, model_dir)
     client = authed(app)
     models = client.get("/api/render/models").json()
     model_id = models["models"][0]["model_id"]
@@ -343,7 +356,7 @@ def test_api_concurrent_same_model_reuses_active_job(tmp_path: Path) -> None:
     model_dir = tmp_path / "models"
     model_dir.mkdir()
     (model_dir / "m.pmx").write_bytes(b"model")
-    app = create_app(_config(tmp_path, FAKE_SLOW, model_dir))
+    app = _render_app(tmp_path, FAKE_SLOW, model_dir)
 
     with authed(app) as client:
         model_id = client.get("/api/render/models").json()["models"][0]["model_id"]
@@ -430,7 +443,7 @@ def test_shutdown_terminates_active_subprocess(tmp_path: Path) -> None:
     model_dir = tmp_path / "models"
     model_dir.mkdir()
     (model_dir / "m.pmx").write_bytes(b"model")
-    app = create_app(_config(tmp_path, FAKE_SLOW, model_dir))
+    app = _render_app(tmp_path, FAKE_SLOW, model_dir)
 
     saved: list = []
     with authed(app) as client:
@@ -496,7 +509,7 @@ def test_artifact_lookup_rejects_sibling_prefix_and_traversal(tmp_path: Path) ->
     sibling.mkdir(parents=True, exist_ok=True)
     (sibling / "secret.png").write_bytes(b"secret")
 
-    app = create_app(_config(tmp_path, FAKE_OK, model_dir))
+    app = _render_app(tmp_path, FAKE_OK, model_dir)
     with authed(app) as client:
         model_id = client.get("/api/render/models").json()["models"][0]["model_id"]
         created = client.post(
