@@ -24,6 +24,7 @@ from . import render_state
 from .redact import redact
 
 _LOG_CAP = 200
+_MEMORY_JOB_CAP = 200
 _ARTIFACT_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".mov", ".gif")
 
 
@@ -46,6 +47,12 @@ class RenderJob:
     #: 展示用材质清单（来自 main 预检产物；不在此接受客户端答案）
     materials: list[dict[str, Any]] = field(default_factory=list)
     confirm_url: str | None = None
+    #: 用户固定：固定后的任务**绝不**被自动清理。
+    pinned: bool = False
+    #: 产物目录当前占用的字节数（惰性统计，用于容量治理与前端展示）。
+    disk_bytes: int = 0
+    #: 取消原因（取消时需要保留，供诊断）。
+    cancel_reason: str | None = None
     _proc: Any = field(default=None, repr=False, compare=False)
 
     # -- 派生属性 --------------------------------------------------------
@@ -100,6 +107,9 @@ class RenderJob:
             "confirm_url": self.confirm_url,
             "confirmed_count": self.confirmed_count,
             "required_count": self.required_count,
+            "pinned": self.pinned,
+            "disk_bytes": self.disk_bytes,
+            "retention_state": self.retention_state,
         }
         if include_logs:
             out["logs"] = list(self.logs)
@@ -107,29 +117,77 @@ class RenderJob:
             out["artifacts"] = self.list_artifacts()
         return out
 
+    @property
+    def retention_state(self) -> str:
+        """保留状态（active / pinned / kept / expired / cancelled / failed）。"""
+        if not self.is_terminal:
+            return "active"
+        if self.pinned:
+            return "pinned"
+        if self.state == "cancelled":
+            return "cancelled"
+        if self.state == "failed":
+            return "failed"
+        return "kept"
+
     def list_artifacts(self) -> list[dict[str, Any]]:
-        """扫输出目录，返回 opaque artifact_id <-> 文件名 的映射。"""
+        """扫输出目录，返回 opaque artifact_id <-> 文件名 的映射。
+
+        同时扫描任务根目录与 ``artifacts/`` 子目录：历史任务可能用扁平布局，
+        新任务用分类布局，两种都要能列出来。
+        """
+        roots: list[Path] = []
         root = Path(self.output_dir)
-        if not root.is_dir():
-            return []
+        if root.is_dir():
+            roots.append(root)
+        sub = root / "artifacts"
+        if sub.is_dir():
+            roots.append(sub)
         items: list[dict[str, Any]] = []
-        for p in sorted(root.iterdir()):
-            if not p.is_file() or p.suffix.lower() not in _ARTIFACT_EXTS:
-                continue
-            items.append({
-                "artifact_id": f"art-{p.name}",
-                "name": p.name,
-                "size": p.stat().st_size,
-            })
+        seen: set[str] = set()
+        for base in roots:
+            for p in sorted(base.iterdir()):
+                if not p.is_file() or p.suffix.lower() not in _ARTIFACT_EXTS:
+                    continue
+                if p.name in seen:
+                    continue
+                seen.add(p.name)
+                items.append({
+                    "artifact_id": f"art-{p.name}",
+                    "name": p.name,
+                    "size": p.stat().st_size,
+                })
         return items
+
+    def refresh_disk_bytes(self) -> int:
+        """重新统计产物目录占用字节数（不跟随符号链接）。"""
+        from .render_storage import path_size_no_follow
+
+        try:
+            self.disk_bytes = path_size_no_follow(self.output_dir)
+        except OSError:
+            self.disk_bytes = 0
+        return self.disk_bytes
 
 
 class RenderJobManager:
-    def __init__(self, output_root: str | os.PathLike) -> None:
+    def __init__(
+        self,
+        output_root: str | os.PathLike,
+        *,
+        max_memory_jobs: int = _MEMORY_JOB_CAP,
+        history_index_path: str | os.PathLike | None = None,
+    ) -> None:
         self._output_root = Path(output_root)
         self._jobs: dict[str, RenderJob] = {}
         self._by_fingerprint: dict[str, str] = {}
         self._active: dict[str, Any] = {}  # job_id -> 子进程句柄（仅运行时）
+        #: 内存中最多保留多少条任务（仅淘汰**终态**任务，活跃任务永不淘汰）。
+        self._max_memory_jobs = max(1, int(max_memory_jobs))
+        #: 历史任务摘要索引（小型 JSON；不存图片/视频/完整日志）。
+        self._history_index_path = (
+            Path(history_index_path) if history_index_path else (self._output_root / ".jobs_index.json")
+        )
 
     # -- 建任务（同模型去重） -------------------------------------------
     def active_for_fingerprint(self, fingerprint: str) -> RenderJob | None:
@@ -171,7 +229,75 @@ class RenderJobManager:
         )
         self._jobs[job_id] = job
         self._by_fingerprint[fingerprint] = job_id
+        self._enforce_memory_cap()
         return job, True
+
+    # -- 内存治理 --------------------------------------------------------
+    def _enforce_memory_cap(self) -> None:
+        """超出内存上限时淘汰最旧的**终态**任务；活跃任务永不淘汰。
+
+        淘汰前把摘要写进小型 JSON 历史索引（不存图片/视频/完整日志）。
+        """
+        if len(self._jobs) <= self._max_memory_jobs:
+            return
+        terminal = [j for j in self._jobs.values() if j.is_terminal]
+        # 最旧的在前（按 updated_at 字符串升序即时间升序）
+        terminal.sort(key=lambda j: j.updated_at)
+        overflow = len(self._jobs) - self._max_memory_jobs
+        evicted = terminal[:overflow]
+        for job in evicted:
+            self._append_history_index(job)
+            self._jobs.pop(job.job_id, None)
+            if self._by_fingerprint.get(job.fingerprint) == job.job_id:
+                self._by_fingerprint.pop(job.fingerprint, None)
+
+    def _append_history_index(self, job: RenderJob) -> None:
+        """把一条任务摘要追加到小型 JSON 索引（失败不影响主流程）。"""
+        try:
+            self._history_index_path.parent.mkdir(parents=True, exist_ok=True)
+            existing: list[dict[str, Any]] = []
+            if self._history_index_path.is_file():
+                import json
+
+                try:
+                    existing = json.loads(self._history_index_path.read_text(encoding="utf-8"))
+                    if not isinstance(existing, list):
+                        existing = []
+                except (json.JSONDecodeError, OSError):
+                    existing = []
+            existing.append(
+                {
+                    "job_id": job.job_id,
+                    "model_id": job.model_id,
+                    "model_name": job.model_name,
+                    "state": job.state,
+                    "created_at": job.created_at,
+                    "updated_at": job.updated_at,
+                    "disk_bytes": job.disk_bytes,
+                    "pinned": job.pinned,
+                }
+            )
+            # 索引本身也有上限，避免无界增长。
+            existing = existing[-self._max_memory_jobs :]
+            import json
+
+            self._history_index_path.write_text(
+                json.dumps(existing, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def history_index(self) -> list[dict[str, Any]]:
+        """读取历史索引（供审计/展示）。"""
+        import json
+
+        if not self._history_index_path.is_file():
+            return []
+        try:
+            data = json.loads(self._history_index_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+        return data if isinstance(data, list) else []
 
     # -- 状态机 ----------------------------------------------------------
     def set_state(self, job_id: str, new_state: str) -> RenderJob:
@@ -243,6 +369,20 @@ class RenderJobManager:
         self._active[job_id] = proc
 
     def detach_proc(self, job_id: str) -> None:
+        self._active.pop(job_id, None)
+
+    def set_pinned(self, job_id: str, pinned: bool) -> RenderJob:
+        """固定/取消固定任务。固定后的任务**绝不**被自动清理。"""
+        job = self._must(job_id)
+        job.pinned = bool(pinned)
+        job.updated_at = _now()
+        return job
+
+    def purge(self, job_id: str) -> None:
+        """从内存中移除任务记录（磁盘清理由调用方负责）。"""
+        job = self._jobs.pop(job_id, None)
+        if job is not None and self._by_fingerprint.get(job.fingerprint) == job_id:
+            self._by_fingerprint.pop(job.fingerprint, None)
         self._active.pop(job_id, None)
 
     def active_procs(self) -> list[Any]:

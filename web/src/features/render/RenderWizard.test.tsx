@@ -135,4 +135,55 @@ describe("一键渲染向导", () => {
     expect(queryAllByTestId(/^model-pick-/)).toHaveLength(0);
     expect((getByTestId("render-start") as HTMLButtonElement).disabled).toBe(true);
   });
+
+  it("展示输出总容量与可清理空间，预演清理调用 dry_run", async () => {
+    const { controller, endpoints } = setup({
+      storage: async () => ({
+        ok: true as const,
+        job_count: 7,
+        pinned_count: 2,
+        total_bytes: 3 * 1024 * 1024,
+        max_total_bytes: 20 * 1024 ** 3,
+        max_jobs: 30,
+        max_age_days: 14,
+        evictable_jobs: 3,
+        reclaimable_bytes: 2 * 1024 * 1024,
+        roots: ["out"],
+      }),
+    });
+    const { getByTestId } = render(<RenderWizard controller={controller} />);
+    await settle();
+    await settle();
+
+    expect(getByTestId("storage-total").textContent).toContain("3");
+    expect(getByTestId("storage-reclaimable").textContent).toContain("3");
+    fireEvent.click(getByTestId("storage-cleanup-preview"));
+    await settle();
+    expect(endpoints.cleanupStorage).toHaveBeenCalledWith(true);
+  });
+
+  it("成功结果展示产物大小、保留状态与固定开关", async () => {
+    const { controller, endpoints } = setup({
+      createJob: async () =>
+        renderJobFixture({ state: "success", is_terminal: true, step: 5, disk_bytes: 4096 }),
+      getJob: async (jobId: string) =>
+        renderJobFixture({ job_id: jobId, state: "success", is_terminal: true, step: 5, disk_bytes: 4096 }),
+      artifacts: async (jobId: string) => ({
+        ok: true as const,
+        job_id: jobId,
+        artifacts: [{ artifact_id: "art-result.png", name: "result.png", size: 4096 }],
+      }),
+    });
+    const { getByTestId } = render(<RenderWizard controller={controller} />);
+    await settle();
+    fireEvent.click(getByTestId("render-start"));
+    await settle();
+    await settleTimers(12);
+
+    expect(getByTestId("render-disk-bytes").textContent).toContain("4.0 KB");
+    expect(getByTestId("render-retention")).toBeTruthy();
+    fireEvent.click(getByTestId("render-pin"));
+    await settle();
+    expect(endpoints.pinJob).toHaveBeenCalledWith(expect.any(String), true);
+  });
 });

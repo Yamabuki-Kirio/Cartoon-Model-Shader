@@ -78,8 +78,10 @@ from .binder import BlenderBinder, preview_dir, preview_png_name
 from .blender_mcp import BlenderMCPClient
 from .commit import CommitService
 from .models_scan import ModelRegistry
+from .proc_cleanup import ProcessRegistry
 from .render_jobs import RenderJobManager
 from .render_pipeline_adapter import RenderPipelineService
+from .render_storage import StorageService
 from pathlib import Path
 import os
 from .config import AppConfig, ConfigError, load_config
@@ -266,8 +268,17 @@ def create_app(
     # 在 lifespan 之前构建，便于常驻 worker 随服务生命周期启停。
     _render_rt = cfg.render.runtime_dir or (config_module.REPO_ROOT / "runtime")
     _registry_path = Path(_render_rt) / ".model_registry.json"
+    _output_root = cfg.render.output_dir or (config_module.REPO_ROOT / "output")
     registry = ModelRegistry(cfg.render.model_root, _registry_path)
-    job_manager = RenderJobManager(cfg.render.output_dir or (config_module.REPO_ROOT / "output"))
+    job_manager = RenderJobManager(
+        _output_root,
+        max_memory_jobs=cfg.render.max_memory_jobs,
+        history_index_path=Path(_render_rt) / ".jobs_index.json",
+    )
+    # 资源治理：允许删除的根目录只有服务端配置的 output/ 与 runtime/。
+    _allowed_roots = [str(_output_root), str(_render_rt)]
+    storage = StorageService(job_manager, cfg.render.retention_policy, _allowed_roots)
+    proc_registry = ProcessRegistry()
     pipeline = RenderPipelineService(
         job_manager,
         registry,
@@ -277,11 +288,18 @@ def create_app(
         blender=cfg.render.blender,
         runtime_dir=cfg.render.runtime_dir,
         maps_dir=cfg.render.maps_dir,
-        output_root=cfg.render.output_dir or (config_module.REPO_ROOT / "output"),
+        output_root=_output_root,
+        storage=storage,
+        proc_registry=proc_registry,
     )
     try:
         registry.scan()
     except Exception:  # noqa: BLE001 - 扫描失败不阻断服务启动
+        pass
+    # 启动时清理上次异常退出遗留的临时目录（work/），避免无界增长。
+    try:
+        storage.cleanup_stale_work()
+    except Exception:  # noqa: BLE001 - 清理失败不阻断启动
         pass
 
     @asynccontextmanager
@@ -291,7 +309,12 @@ def create_app(
         try:
             yield
         finally:
+            # 退出：先终止任务进程树，再停 worker，最后做一次轻量清理。
             await pipeline.stop_worker()
+            try:
+                storage.cleanup(dry_run=False)
+            except Exception:  # noqa: BLE001 - 关闭阶段吞掉清理异常
+                pass
             await preview.stop()
 
     app = FastAPI(
@@ -312,6 +335,8 @@ def create_app(
     app.state.registry = registry
     app.state.jobs = job_manager
     app.state.pipeline = pipeline
+    app.state.storage = storage
+    app.state.proc_registry = proc_registry
 
     # 写接口统一的依赖：缺失/错误令牌一律 401 拒绝。
     require_token = [Depends(security.require_session_token)]
@@ -881,6 +906,39 @@ def create_app(
         except Exception:
             opened = False
         return {"ok": True, "opened": opened, "directory": out.name}
+
+    # -- 资源治理（规格《资源治理》第 6 节） ------------------------------
+    @app.get("/api/render/storage", tags=["render"])
+    async def render_storage() -> dict[str, Any]:
+        """容量、任务数、可清理空间。只读，不带令牌。"""
+        return app.state.storage.usage()
+
+    @app.post(
+        "/api/render/storage/cleanup",
+        tags=["render"],
+        dependencies=require_token,
+    )
+    async def render_storage_cleanup(dry_run: bool = False) -> dict[str, Any]:
+        """执行安全清理。``dry_run=true`` 只预演不删除。"""
+        report = app.state.storage.cleanup(dry_run=dry_run)
+        payload = report.to_public()
+        payload["ok"] = True
+        payload["dry_run"] = dry_run
+        return payload
+
+    @app.post(
+        "/api/render/jobs/{job_id}/pin",
+        response_model=RenderJobResponse,
+        tags=["render"],
+        dependencies=require_token,
+    )
+    async def pin_render_job(job_id: str, pinned: bool = True) -> dict[str, Any]:
+        """固定/取消固定任务。固定后的任务**绝不**被自动清理。"""
+        try:
+            job = app.state.jobs.set_pinned(job_id, pinned)
+        except KeyError:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        return job.to_public()
 
     # -- 工作台页面（构建产物，挂在 /）------------------------------------
     #: 构建产物目录：`web/dist`。只影响服务端自己；接口层不接受任何路径参数。

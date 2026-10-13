@@ -4,13 +4,16 @@ import type { ApiClient } from "./client";
 import type {
   CreateRenderJobBody,
   RenderArtifactsResponse,
+  RenderCleanupReport,
   RenderJob,
   RenderMaterialsResponse,
   RenderModelsResponse,
+  RenderStorageUsage,
 } from "./render-types";
 
 const MODELS_PATH = "/api/render/models";
 const JOBS_PATH = "/api/render/jobs";
+const STORAGE_PATH = "/api/render/storage";
 
 export class RenderEndpoints {
   constructor(private readonly client: ApiClient) {}
@@ -61,5 +64,31 @@ export class RenderEndpoints {
 
   openOutput(jobId: string, options: { signal?: AbortSignal } = {}): Promise<{ ok: true; opened: boolean }> {
     return this.client.post(`${JOBS_PATH}/${encodeURIComponent(jobId)}/open-output`, {}, options);
+  }
+
+  /** 固定 / 取消固定任务（写接口）。固定后不会被自动清理。 */
+  pinJob(
+    jobId: string,
+    pinned: boolean,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<RenderJob> {
+    return this.client.post(
+      `${JOBS_PATH}/${encodeURIComponent(jobId)}/pin`,
+      {},
+      { ...options, query: { pinned } }
+    );
+  }
+
+  /** 存储用量（只读）。 */
+  storage(options: { signal?: AbortSignal } = {}): Promise<RenderStorageUsage> {
+    return this.client.get(STORAGE_PATH, options);
+  }
+
+  /** 执行安全清理（写接口）。dryRun=true 只预演。 */
+  cleanupStorage(
+    dryRun: boolean,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<RenderCleanupReport> {
+    return this.client.post(`${STORAGE_PATH}/cleanup`, {}, { ...options, query: { dry_run: dryRun } });
   }
 }

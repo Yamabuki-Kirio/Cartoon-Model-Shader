@@ -33,6 +33,9 @@ export function renderJobFixture(overrides: Partial<RenderJob> = {}): RenderJob 
     confirm_url: null,
     confirmed_count: 0,
     required_count: 0,
+    pinned: false,
+    disk_bytes: 0,
+    retention_state: "kept",
     logs: [],
     artifacts: [],
     ...overrides,
@@ -65,6 +68,28 @@ export function makeTestRenderEndpoints(overrides: Partial<RenderEndpoints> = {}
     artifactUrl: (jobId: string, artifactId: string) =>
       `/api/render/jobs/${jobId}/artifacts/${artifactId}`,
     openOutput: vi.fn(async () => ({ ok: true as const, opened: true })),
+    pinJob: vi.fn(async (jobId: string, pinned: boolean) =>
+      renderJobFixture({ job_id: jobId, pinned, retention_state: pinned ? "pinned" : "kept" })
+    ),
+    storage: vi.fn(async () => ({
+      ok: true as const,
+      job_count: 0,
+      pinned_count: 0,
+      total_bytes: 0,
+      max_total_bytes: 20 * 1024 ** 3,
+      max_jobs: 30,
+      max_age_days: 14,
+      evictable_jobs: 0,
+      reclaimable_bytes: 0,
+      roots: ["out"],
+    })),
+    cleanupStorage: vi.fn(async (dryRun: boolean) => ({
+      ok: true as const,
+      dry_run: dryRun,
+      removed_jobs: [],
+      released_bytes: 0,
+      failed: [],
+    })),
     ...overrides,
   } as RenderEndpoints;
 }

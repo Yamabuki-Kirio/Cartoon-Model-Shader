@@ -517,6 +517,10 @@ class RenderJobResponse(BaseModel):
     confirm_url: str | None = None
     confirmed_count: int = 0
     required_count: int = 0
+    #: 资源治理：是否被用户固定、占用字节数、保留状态。
+    pinned: bool = False
+    disk_bytes: int = 0
+    retention_state: str = "kept"
     logs: list[str] | None = None
     artifacts: list[dict[str, Any]] | None = None
 

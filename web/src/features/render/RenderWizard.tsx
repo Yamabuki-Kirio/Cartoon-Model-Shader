@@ -1,7 +1,7 @@
 import { useEffect } from "preact/hooks";
 import { useStore } from "../../state/useStore";
 import { Chip } from "../../components/chips";
-import type { RenderStore } from "../../state/render-store";
+import { formatBytes, type RenderStore } from "../../state/render-store";
 import { RENDER_STEPS, isTerminalState, type RenderJob } from "../../api/render-types";
 
 /**
@@ -37,6 +37,8 @@ export function RenderWizard({ controller }: { controller: RenderStore }) {
 
       <Steps current={step} />
 
+      <StoragePanel controller={controller} />
+
       {state.jobError ? (
         <div class="banner banner-error" data-testid="render-error">
           <b>错误：{state.jobError.code}</b>
@@ -63,6 +65,56 @@ export function RenderWizard({ controller }: { controller: RenderStore }) {
     </section>
   );
 }
+function StoragePanel({ controller }: { controller: RenderStore }) {
+  const state = useStore(controller.store, (snapshot) => snapshot);
+  const usage = state.storage;
+
+  return (
+    <div class="storage-panel" data-testid="render-storage">
+      {usage ? (
+        <>
+          <span data-testid="storage-total">
+            输出总容量：<b>{formatBytes(usage.total_bytes)}</b> / 上限 {formatBytes(usage.max_total_bytes)}
+          </span>
+          <span class="muted">
+            任务 {usage.job_count}（固定 {usage.pinned_count}）· 保留 {usage.max_age_days} 天 · 最多 {usage.max_jobs} 个
+          </span>
+          <span class="muted" data-testid="storage-reclaimable">
+            可清理 {usage.evictable_jobs} 个 · 约 {formatBytes(usage.reclaimable_bytes)}
+          </span>
+        </>
+      ) : (
+        <span class="muted">正在读取存储用量…</span>
+      )}
+      <div class="storage-actions">
+        <button
+          type="button"
+          class="chip"
+          data-testid="storage-cleanup-preview"
+          onClick={() => void controller.actions.cleanupStorage(true)}
+        >
+          预演清理
+        </button>
+        <button
+          type="button"
+          class="chip"
+          data-testid="storage-cleanup-run"
+          onClick={() => {
+            // 清理前必须明确确认：列出预计释放容量。
+            const reclaim = usage ? formatBytes(usage.reclaimable_bytes) : "未知";
+            const count = usage ? usage.evictable_jobs : 0;
+            if (globalThis.confirm(`将清理最多 ${count} 个未固定任务，预计释放 ${reclaim}。正在运行或被固定的任务不会被动。继续？`)) {
+              void controller.actions.cleanupStorage(false);
+            }
+          }}
+        >
+          清理历史任务
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Steps({ current }: { current: number }) {
   return (
     <ol class="steps" data-testid="render-steps">
@@ -274,6 +326,25 @@ function ResultStep({ job, controller }: { job: RenderJob; controller: RenderSto
   return (
     <div class="render-result" data-testid="render-result">
       <h3>渲染结果</h3>
+      <div class="result-meta">
+        <span class="muted" data-testid="render-disk-bytes">
+          产物占用：{formatBytes(job.disk_bytes)}
+        </span>
+        <span class="muted" data-testid="render-retention">
+          保留状态：{job.retention_state}
+        </span>
+        <label class="checkbox" title="固定后不会被自动清理">
+          <input
+            type="checkbox"
+            checked={job.pinned}
+            data-testid="render-pin"
+            onChange={(event) =>
+              void controller.actions.pinJob((event.currentTarget as HTMLInputElement).checked)
+            }
+          />
+          <span>保留此任务</span>
+        </label>
+      </div>
       {state.artifacts.length === 0 ? (
         <p class="muted">尚未发现产物文件。</p>
       ) : (
@@ -288,7 +359,7 @@ function ResultStep({ job, controller }: { job: RenderJob; controller: RenderSto
               >
                 {artifact.name}
               </a>
-              <span class="muted"> {Math.round(artifact.size / 1024)} KB</span>
+              <span class="muted"> {formatBytes(artifact.size)}</span>
             </li>
           ))}
         </ul>

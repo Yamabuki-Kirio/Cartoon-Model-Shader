@@ -11,7 +11,13 @@
 import { AppError, isAbortError } from "../api/types";
 import type { ErrorDetail } from "../api/types";
 import type { RenderEndpoints } from "../api/render-endpoints";
-import type { RenderJob, RenderModel, RenderState } from "../api/render-types";
+import type {
+  RenderCleanupReport,
+  RenderJob,
+  RenderModel,
+  RenderState,
+  RenderStorageUsage,
+} from "../api/render-types";
 import { createStore, type Store } from "./store";
 
 export interface RenderUiState {
@@ -33,6 +39,10 @@ export interface RenderUiState {
   artifacts: { artifact_id: string; name: string; size: number }[];
   busy: boolean;
   notice: string | null;
+  /** 资源治理：存储用量（容量 / 任务数 / 可清理空间）。 */
+  storage: RenderStorageUsage | null;
+  /** 最近一次清理预演/执行的结果。 */
+  lastCleanup: RenderCleanupReport | null;
 }
 
 function toDetail(error: unknown): ErrorDetail {
@@ -80,6 +90,8 @@ export function createRenderStore(options: RenderStoreOptions) {
     artifacts: [],
     busy: false,
     notice: null,
+    storage: null,
+    lastCleanup: null,
   });
 
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -271,10 +283,59 @@ export function createRenderStore(options: RenderStoreOptions) {
     }
   }
 
+  async function loadStorage(): Promise<void> {
+    try {
+      const usage = await endpoints.storage();
+      store.setState({ storage: usage });
+    } catch {
+      // 存储用量读取失败不影响主流程。
+    }
+  }
+
+  async function pinJob(pinned: boolean): Promise<void> {
+    const job = store.getState().job;
+    if (!job) {
+      return;
+    }
+    try {
+      const next = await endpoints.pinJob(job.job_id, pinned);
+      store.setState({
+        job: next,
+        notice: pinned ? "已固定该任务，自动清理不会删除它。" : "已取消固定。",
+      });
+      void loadStorage();
+    } catch (error) {
+      store.setState({ jobError: toDetail(error) });
+    }
+  }
+
+  async function cleanupStorage(dryRun: boolean): Promise<RenderCleanupReport | null> {
+    store.setState({ busy: true });
+    try {
+      const report = await endpoints.cleanupStorage(dryRun);
+      store.setState({
+        busy: false,
+        lastCleanup: report,
+        notice: dryRun
+          ? `预演：可清理 ${report.removed_jobs.length} 个任务，释放约 ${formatBytes(report.released_bytes)}。`
+          : `已清理 ${report.removed_jobs.length} 个任务，释放 ${formatBytes(report.released_bytes)}。`,
+      });
+      await loadStorage();
+      return report;
+    } catch (error) {
+      store.setState({ busy: false, jobError: toDetail(error) });
+      return null;
+    }
+  }
+
   const actions = {
     bootstrap(): void {
       void loadModels();
+      void loadStorage();
     },
+    loadStorage,
+    pinJob,
+    cleanupStorage,
     loadModels,
     refreshModels,
     startJob,
@@ -320,3 +381,18 @@ export function createRenderStore(options: RenderStoreOptions) {
 }
 
 export type RenderStore = ReturnType<typeof createRenderStore>;
+
+/** 人类可读的字节数。 */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+}

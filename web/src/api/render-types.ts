@@ -62,8 +62,33 @@ export interface RenderJob {
   confirm_url: string | null;
   confirmed_count: number;
   required_count: number;
+  /** 资源治理：是否被用户固定、占用字节数、保留状态。 */
+  pinned: boolean;
+  disk_bytes: number;
+  retention_state: string;
   logs?: string[] | null;
   artifacts?: RenderArtifact[] | null;
+}
+
+export interface RenderStorageUsage {
+  ok: true;
+  job_count: number;
+  pinned_count: number;
+  total_bytes: number;
+  max_total_bytes: number;
+  max_jobs: number;
+  max_age_days: number;
+  evictable_jobs: number;
+  reclaimable_bytes: number;
+  roots: string[];
+}
+
+export interface RenderCleanupReport {
+  ok: true;
+  dry_run: boolean;
+  removed_jobs: string[];
+  released_bytes: number;
+  failed: { job_id: string; error: string }[];
 }
 
 export interface RenderMaterialsResponse {

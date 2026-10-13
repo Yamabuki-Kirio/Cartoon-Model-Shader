@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 import uuid
@@ -59,6 +60,8 @@ class RenderPipelineService:
         runtime_dir: str | Path | None = None,
         maps_dir: str | Path | None = None,
         output_root: str | Path | None = None,
+        storage: Any = None,
+        proc_registry: Any = None,
     ) -> None:
         self._manager = job_manager
         self._registry = registry
@@ -70,6 +73,10 @@ class RenderPipelineService:
         self._maps_dir = Path(maps_dir) if maps_dir else None
         self._output_root = Path(output_root) if output_root else Path("output")
         self._holders: dict[str, Any] = {}
+        #: 资源治理（可选注入）：任务结束后的轻量清理。
+        self._storage = storage
+        #: 进程登记表（可选注入）：登记入口脚本 PID，供取消/关闭时终止。
+        self._proc_registry = proc_registry
         #: 渲染在**常驻后台 worker**里串行执行：由 lifespan 启动，不依赖单个请求的
         #: 事件循环（`asyncio.create_task` 在请求上下文中不可靠）。同一时刻只跑一个渲染，
         #: 跨模型的并发由各模型的跨进程文件锁再兜一层。
@@ -315,6 +322,19 @@ class RenderPipelineService:
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
         )
         self._manager.attach_proc(job.job_id, proc)
+        # 登记入口脚本进程（PID/父 PID/任务/启动时间/可执行文件身份），供取消与关闭时
+        # 终止整棵进程树（含 Blender / 确认服务）。
+        if self._proc_registry is not None:
+            try:
+                self._proc_registry.register(
+                    proc.pid,
+                    job_id=job.job_id,
+                    exe=str(self._fixed),
+                    parent_pid=os.getpid(),
+                    kind="entry",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("登记渲染进程失败：%s", exc)
         assert proc.stdout is not None
         async for raw_line in proc.stdout:
             line = raw_line.decode("utf-8", "replace").rstrip("\n")
@@ -323,6 +343,8 @@ class RenderPipelineService:
                 self._observe_line(job.job_id, line, fp)
         code = await proc.wait()
         self._manager.detach_proc(job.job_id)
+        if self._proc_registry is not None:
+            self._proc_registry.unregister(proc.pid)
         self._manager.append_log(job.job_id, f"[render] subprocess exit code = {code}")
         self._finalize(job.job_id, out_dir, code)
 
@@ -361,21 +383,38 @@ class RenderPipelineService:
             # 固定脚本给出了明确终态：以它为准。
             if done_token == "SUCCESS" and artifacts and code == 0:
                 self._manager.succeed(job_id)
+                self._after_terminal(job_id)
                 return
             self._manager.append_log(
                 job_id,
                 f"[render] 固定脚本终态={done_token}（退出码 {code}），产物 {len(artifacts)} 个，判定为失败。",
             )
             self._manager.fail(job_id, "failed")
+            self._after_terminal(job_id)
             return
 
         # 没有 render.done：退化为「退出码 0 且确有产物」，否则失败。
         if code == 0 and artifacts:
             self._manager.succeed(job_id)
+            self._after_terminal(job_id)
             return
         if not artifacts:
             self._manager.append_log(job_id, "[render] 渲染结束但未产出任何产物文件，判定为失败。")
         self._manager.fail(job_id, "failed")
+        self._after_terminal(job_id)
+
+    def _after_terminal(self, job_id: str) -> None:
+        """任务结束后的轻量清理：成功删 work/、失败/取消删大文件（保留诊断摘要）。"""
+        job = self._manager.get(job_id)
+        if job is None:
+            return
+        if self._storage is not None:
+            try:
+                self._storage.cleanup_after_terminal(job)
+            except Exception as exc:  # noqa: BLE001 - 清理失败不得影响任务结果
+                logger.warning("任务 %s 结束后清理失败：%s", job_id, exc)
+        # 刷新占用字节，供容量治理与前端展示（不含中间目录后应更准确）。
+        job.refresh_disk_bytes()
 
     # -- 辅助 ------------------------------------------------------------
     def _safe_transition(self, job_id: str, new_state: str) -> None:

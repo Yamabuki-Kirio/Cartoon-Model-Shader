@@ -425,6 +425,22 @@ body {
   .render-wizard { max-width: none; }
   .steps { flex-direction: column; }
 }
+
+/* 资源治理面板 */
+.storage-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  align-items: center;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-alt);
+  font-size: 13px;
+}
+.storage-actions { display: flex; gap: 8px; margin-left: auto; }
+.result-meta { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.result-meta .checkbox { display: inline-flex; align-items: center; gap: 4px; }
 .save-status-skip { color: var(--muted); }
 .save-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 

@@ -66,12 +66,31 @@ class RenderConfig:
     maps_dir: Path | None = None
     output_dir: Path | None = None
     pipeline_script: Path | None = None
+    # 资源治理默认保留策略（规格《资源治理》第 2 节）
+    max_jobs: int = 30
+    max_age_days: int = 14
+    max_total_gb: float = 20.0
+    max_memory_jobs: int = 200
+    keep_failed_logs: bool = True
 
     @property
     def pipeline_script_path(self) -> Path:
         if self.pipeline_script is not None:
             return Path(self.pipeline_script)
         return REPO_ROOT / "render_pipeline" / "开始渲染.py"
+
+    @property
+    def retention_policy(self):
+        """构造保留策略对象（延迟导入避免循环依赖）。"""
+        from .render_storage import RetentionPolicy
+
+        return RetentionPolicy(
+            max_jobs=self.max_jobs,
+            max_age_days=self.max_age_days,
+            max_total_gb=self.max_total_gb,
+            max_memory_jobs=self.max_memory_jobs,
+            keep_failed_logs=self.keep_failed_logs,
+        )
 
 
 @dataclass(frozen=True)
@@ -112,6 +131,16 @@ def _as_float(value: object, field: str) -> float:
         raise ConfigError(f"{field} 必须是数字，收到 {value!r}") from exc
     if parsed <= 0:
         raise ConfigError(f"{field} 必须为正数，收到 {parsed}")
+    return parsed
+
+
+def _as_int(value: object, field: str, *, minimum: int = 0) -> int:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field} 必须是整数，收到 {value!r}") from exc
+    if parsed < minimum:
+        raise ConfigError(f"{field} 必须 >= {minimum}，收到 {parsed}")
     return parsed
 
 
@@ -181,6 +210,19 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
         maps_dir=Path(str(raw_maps_dir)).expanduser() if raw_maps_dir else None,
         output_dir=Path(str(raw_output_dir)).expanduser() if raw_output_dir else None,
         pipeline_script=Path(str(raw_pipeline_script)).expanduser() if raw_pipeline_script else None,
+        max_jobs=_as_int(_env_render("MAX_JOBS") or render_raw.get("max_jobs", 30), "max_jobs", minimum=0),
+        max_age_days=_as_int(
+            _env_render("MAX_AGE_DAYS") or render_raw.get("max_age_days", 14), "max_age_days", minimum=0
+        ),
+        max_total_gb=float(_env_render("MAX_TOTAL_GB") or render_raw.get("max_total_gb", 20.0)),
+        max_memory_jobs=_as_int(
+            _env_render("MAX_MEMORY_JOBS") or render_raw.get("max_memory_jobs", 200),
+            "max_memory_jobs",
+            minimum=1,
+        ),
+        keep_failed_logs=bool(
+            int(_env_render("KEEP_FAILED_LOGS") or render_raw.get("keep_failed_logs", 1))
+        ),
     )
 
     mcp = BlenderMCPConfig(
