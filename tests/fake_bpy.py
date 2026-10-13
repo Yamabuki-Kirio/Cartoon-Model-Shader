@@ -174,6 +174,9 @@ class FakeNode:
         inputs: dict[str, Any] | None = None,
         color_ramp: FakeColorRamp | None = None,
         bl_idname: str | None = None,
+        outputs: dict[str, str] | None = None,
+        uuid: str | None = None,
+        node_tree: "FakeNodeGroup | None" = None,
     ) -> None:
         self.name = name
         self.label = name
@@ -183,7 +186,36 @@ class FakeNode:
         self.bl_idname = bl_idname or ("CompositorNode" + node_type.title())
         self.mute = False
         self.inputs = FakeInputs(inputs or {})
+        #: 输出插座：``{名称: 类型}``；探针的图结构会读它。
+        self.outputs = FakeOutputs(outputs or {})
         self.color_ramp = color_ramp
+        #: 工具写入的自定义 UUID（稳定身份首选）；未设置时为 None。
+        self.uuid = uuid
+        #: 若本节点是一个节点组实例，指向组定义（探针据此报告 group_name）。
+        self.node_tree = node_tree
+
+
+class FakeSocketOut:
+    def __init__(self, name: str, sock_type: str = "") -> None:
+        self.name = name
+        self.type = sock_type
+        self.is_linked = False
+
+
+class FakeOutputs:
+    """输出插座集合：可迭代，且能按名取（贴近 bpy 的 ``node.outputs``）。"""
+
+    def __init__(self, spec: dict[str, str] | None = None) -> None:
+        self._items = [FakeSocketOut(name, sock_type) for name, sock_type in (spec or {}).items()]
+
+    def __iter__(self) -> Iterator["FakeSocketOut"]:
+        return iter(self._items)
+
+    def __getitem__(self, index: int) -> "FakeSocketOut":
+        return self._items[index]
+
+    def __len__(self) -> int:
+        return len(self._items)
 
 
 class FakeLink:
@@ -1262,6 +1294,28 @@ class FakeBpy:
         material = FakeMaterial(
             name, blend_method=blend_method, nodes=[bsdf, *output_nodes], links=links
         )
+        self.data.materials.add(material)
+        for obj in users:
+            slot = FakeMaterialSlot(name)
+            slot.material = material
+            obj.material_slots.append(slot)
+        return material
+
+    def add_material_graph(
+        self,
+        name: str,
+        *,
+        nodes: list[FakeNode],
+        links: list[FakeLink],
+        users: Iterable["FakeObject"] = (),
+        blend_method: str = "OPAQUE",
+    ) -> FakeMaterial:
+        """用**任意节点图**建材质（用于节点链追踪测试）。
+
+        ``nodes`` / ``links`` 由调用方构造，因此可以复现 Value / RGB / ColorRamp /
+        Math / 节点组等拓扑，以及循环、多输出等降级场景。
+        """
+        material = FakeMaterial(name, blend_method=blend_method, nodes=list(nodes), links=list(links))
         self.data.materials.add(material)
         for obj in users:
             slot = FakeMaterialSlot(name)

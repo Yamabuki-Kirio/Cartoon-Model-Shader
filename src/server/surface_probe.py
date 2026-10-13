@@ -200,6 +200,98 @@ def _material_users():
     return out
 
 
+def _link_report(link):
+    """一条连线：从 (from_node, from_socket) 到 (to_node, to_socket)。
+
+    只用节点/插座**名称**做拓扑标识，不含任何值；名称由 Blender 侧读出，
+    客户端永远无法提交节点路径。
+    """
+    from_node = _safe(lambda l=link: l.from_node)
+    to_node = _safe(lambda l=link: l.to_node)
+    from_sock = _safe(lambda l=link: l.from_socket)
+    to_sock = _safe(lambda l=link: l.to_socket)
+    if from_node is None or to_node is None:
+        return None
+    return {{
+        "from_node": str(_safe(lambda n=from_node: n.name, "") or ""),
+        "from_socket": str(_safe(lambda s=from_sock: getattr(s, "name", ""), "") or ""),
+        "to_node": str(_safe(lambda n=to_node: n.name, "") or ""),
+        "to_socket": str(_safe(lambda s=to_sock: getattr(s, "name", ""), "") or ""),
+    }}
+
+
+def _node_graph_report(node):
+    """单个节点的**图结构**描述：类型/名称/输入输出插座/色带/所属节点组。
+
+    与 ``_node_report`` 的区别：这份是给「反向追踪」用的，包含输出插座与连线端点，
+    因此需要每个插座的名称与连线状态。仍然**不含任何路径**。
+    """
+    outs = []
+    for sock in _safe(lambda: list(node.outputs), None) or []:
+        outs.append({{
+            "name": str(_safe(lambda s=sock: s.name, "") or ""),
+            "type": str(_safe(lambda s=sock: s.type, "") or ""),
+            "linked": bool(_safe(lambda s=sock: s.is_linked, False)),
+        }})
+    group_tree = _safe(lambda: node.node_tree)
+    group_name = ""
+    if group_tree is not None:
+        group_name = str(_safe(lambda t=group_tree: t.name, "") or "")
+    return {{
+        "name": str(_safe(lambda: node.name, "") or ""),
+        "type": str(_safe(lambda: node.type, "") or ""),
+        "bl_idname": str(_safe(lambda: node.bl_idname, "") or ""),
+        "mute": bool(_safe(lambda: node.mute, False)),
+        "label": str(_safe(lambda: node.label, "") or ""),
+        "group_name": group_name,
+        "inputs": _socket_report(node),
+        "outputs": outs,
+        "color_ramp": _ramp_report(node),
+        "input_count": len(_safe(lambda: list(node.inputs), None) or []),
+        "output_count": len(outs),
+    }}
+
+
+def _material_graph_report(mat):
+    """材质的完整节点图：节点 + 连线。用于从输出反向追踪。
+
+    **只读**：不写任何数据。图里只有名称/类型/结构，没有任何值语义之外的字段，
+    也没有路径。共享节点组的影响范围由节点组的 ``name`` 反查其它材质得出。
+    """
+    use_nodes = bool(_safe(lambda m=mat: m.use_nodes, False))
+    tree = _safe(lambda m=mat: m.node_tree) if use_nodes else None
+    if tree is None:
+        return None
+    nodes = _safe(lambda t=tree: list(t.nodes), None) or []
+    links = _safe(lambda t=tree: list(t.links), None) or []
+    return {{
+        "nodes": [_node_graph_report(n) for n in nodes],
+        "links": [entry for entry in (_link_report(l) for l in links) if entry is not None],
+    }}
+
+
+def _shared_group_users():
+    """节点组名 -> 引用它的材质名列表（用于「共享影响范围」）。"""
+    out = {{}}
+    for mat in _safe(lambda: list(bpy.data.materials), None) or []:
+        name = str(_safe(lambda m=mat: m.name, "") or "")
+        if not name:
+            continue
+        if not bool(_safe(lambda m=mat: m.use_nodes, False)):
+            continue
+        tree = _safe(lambda m=mat: m.node_tree)
+        if tree is None:
+            continue
+        for node in _safe(lambda t=tree: list(t.nodes), None) or []:
+            group = _safe(lambda n=node: n.node_tree)
+            if group is None:
+                continue
+            gname = str(_safe(lambda g=group: g.name, "") or "")
+            if gname:
+                out.setdefault(gname, []).append(name)
+    return {{key: sorted(set(value)) for key, value in out.items()}}
+
+
 def _shader_socket_report(node, candidates):
     """只报告候选插座：材质节点上其余插座一律不进载荷（收敛暴露面，也收敛体积）。"""
     out = []
@@ -280,6 +372,7 @@ def _material_inventory(candidates):
             ),
             "users": used_by,
             "shader": _surface_shader(tree, candidates) if tree is not None else None,
+            "graph": _material_graph_report(mat),
         }})
     return out
 
@@ -319,6 +412,7 @@ for _name in {list(REFERENCE_NODE_GROUPS)!r}:
 _PAYLOAD["objects"] = _object_inventory()
 _PAYLOAD["materials"] = _material_inventory({list(MATERIAL_SOCKET_CANDIDATES)!r})
 _PAYLOAD["images"] = _image_inventory()
+_PAYLOAD["shared_groups"] = _shared_group_users()
 
 print({DESCRIBE_MARKER!r} + json.dumps(_PAYLOAD, ensure_ascii=False, default=str))
 '''.strip()
@@ -450,6 +544,11 @@ def describe_groups(payload: dict[str, Any]) -> dict[str, Any]:
         "objects": payload.get("objects") or {},
         "materials": [_normalise_material(item) for item in (payload.get("materials") or [])],
         "images": list(payload.get("images") or []),
+        #: 节点组名 -> 引用它的材质名（共享影响范围；由 Blender 侧采集）
+        "shared_groups": {
+            str(key): [str(item) for item in (value or [])]
+            for key, value in (payload.get("shared_groups") or {}).items()
+        },
     }
 
 
@@ -487,4 +586,59 @@ def _normalise_material(raw: Any) -> dict[str, Any]:
         "structure_signature": [str(entry) for entry in (item.get("structure_signature") or [])],
         "users": sorted(str(entry) for entry in (item.get("users") or [])),
         "shader": shader_out,
+        "graph": _normalise_graph(item.get("graph")),
     }
+
+
+def _normalise_graph(raw: Any) -> dict[str, Any] | None:
+    """收敛节点图：只保留追踪真正会读的字段。"""
+    if not isinstance(raw, dict):
+        return None
+    nodes: list[dict[str, Any]] = []
+    for node in raw.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        ramp = node.get("color_ramp")
+        nodes.append(
+            {
+                "name": str(node.get("name") or ""),
+                "type": str(node.get("type") or ""),
+                "bl_idname": str(node.get("bl_idname") or ""),
+                "mute": bool(node.get("mute")),
+                "label": str(node.get("label") or ""),
+                "group_name": str(node.get("group_name") or ""),
+                "inputs": [
+                    {
+                        "name": str(sock.get("name") or ""),
+                        "type": str(sock.get("type") or ""),
+                        "linked": bool(sock.get("linked")),
+                        "value": sock.get("value"),
+                    }
+                    for sock in (node.get("inputs") or [])
+                    if isinstance(sock, dict)
+                ],
+                "outputs": [
+                    {
+                        "name": str(sock.get("name") or ""),
+                        "type": str(sock.get("type") or ""),
+                        "linked": bool(sock.get("linked")),
+                    }
+                    for sock in (node.get("outputs") or [])
+                    if isinstance(sock, dict)
+                ],
+                "color_ramp": ramp if isinstance(ramp, dict) else None,
+            }
+        )
+    links: list[dict[str, str]] = []
+    for link in raw.get("links") or []:
+        if not isinstance(link, dict):
+            continue
+        links.append(
+            {
+                "from_node": str(link.get("from_node") or ""),
+                "from_socket": str(link.get("from_socket") or ""),
+                "to_node": str(link.get("to_node") or ""),
+                "to_socket": str(link.get("to_socket") or ""),
+            }
+        )
+    return {"nodes": nodes, "links": links}
