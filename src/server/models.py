@@ -521,6 +521,18 @@ class RenderJobResponse(BaseModel):
     pinned: bool = False
     disk_bytes: int = 0
     retention_state: str = "kept"
+    #: 运行终态（run_contract 词表：success / rejected / diagnostic / failed）。
+    #: 终态任务才有值；取消（cancelled）不是正式终态，故为 None。
+    #: 前端据此区分四种终态 —— 不再把 rejected/diagnostic 显示成「渲染失败」。
+    outcome: str | None = None
+    #: 是否可交付。**只有 success 为 True**（规格 §3.3 硬约束）。
+    shippable: bool = False
+    #: 稳定错误码（非成功时）。前端据此给出可操作提示，不展示裸 traceback。
+    error_code: str | None = None
+    #: 兼容降级判定：未收到 render.done，但退出码 0 且确有成品图（规格 §3.2）。
+    degraded: bool = False
+    #: 取消原因（仅 cancelled 有值；供结果区说明为什么被取消）。
+    cancel_reason: str | None = None
     logs: list[str] | None = None
     artifacts: list[dict[str, Any]] | None = None
 

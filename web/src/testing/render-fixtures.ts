@@ -15,6 +15,13 @@ export function modelFixture(overrides: Partial<RenderModel> = {}): RenderModel 
 }
 
 export function renderJobFixture(overrides: Partial<RenderJob> = {}): RenderJob {
+  // 终态契约字段按 state 推导默认值：只有 success 默认可交付。
+  // 这样既有用例（只传 state）不会被新字段破坏，而新用例又能显式覆盖。
+  const state = overrides.state ?? "queued";
+  const outcome: RenderJob["outcome"] =
+    state === "success" || state === "rejected" || state === "diagnostic" || state === "failed"
+      ? state
+      : null;
   return {
     ok: true,
     job_id: "rj-3f7a91c4d20b-5e68",
@@ -36,6 +43,11 @@ export function renderJobFixture(overrides: Partial<RenderJob> = {}): RenderJob 
     pinned: false,
     disk_bytes: 0,
     retention_state: "kept",
+    outcome,
+    shippable: state === "success",
+    error_code: null,
+    degraded: false,
+    cancel_reason: null,
     logs: [],
     artifacts: [],
     ...overrides,

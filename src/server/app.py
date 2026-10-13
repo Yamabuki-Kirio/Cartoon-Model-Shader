@@ -810,7 +810,16 @@ def create_app(
         dependencies=require_token,
     )
     async def retry_render_job(job_id: str) -> dict[str, Any]:
-        job = app.state.jobs.retry(job_id)
+        try:
+            job = app.state.jobs.retry(job_id)
+        except KeyError:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        except ValueError as exc:
+            # 不可重试的终态（如 success / cancelled）走到这里。必须转成人话错误码，
+            # 否则 ValueError 会以 500 + 裸 traceback 冒到用户面前。
+            raise errors.ToonTunerError(
+                errors.PARAM_INVALID, str(exc) or "当前状态不可重试", retryable=False
+            )
         app.state.pipeline.enqueue(job.job_id)
         return job.to_public()
 

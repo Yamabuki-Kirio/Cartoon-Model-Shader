@@ -187,6 +187,10 @@ def test_safe_delete_rejects_symlink(tmp_path: Path) -> None:
         link.symlink_to(outside, target_is_directory=True)
     except (OSError, NotImplementedError):
         pytest.skip("当前环境不支持创建符号链接")
+    # **必须确认链接真的建成**：Windows 上某些配置下 ``symlink_to`` 不报错却落成一个
+    # 普通空目录，此时后面的断言毫无意义（还会假红）。宁可跳过，不可假绿/假红。
+    if not link.is_symlink():
+        pytest.skip("符号链接未被真实创建（缺少 Developer Mode 或管理员权限）")
 
     with pytest.raises(UnsafePathError):
         assert_safe_target(link / "f.bin", [str(out)])

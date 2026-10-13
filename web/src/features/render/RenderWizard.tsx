@@ -2,7 +2,16 @@ import { useEffect } from "preact/hooks";
 import { useStore } from "../../state/useStore";
 import { Chip } from "../../components/chips";
 import { formatBytes, type RenderStore } from "../../state/render-store";
-import { RENDER_STEPS, isTerminalState, type RenderJob } from "../../api/render-types";
+import {
+  RENDER_CANCEL_LOCKED_MESSAGE,
+  RENDER_STATE_LABELS,
+  RENDER_STEPS,
+  RENDER_TERMINAL_LABELS,
+  canCancelJob,
+  isShippableJob,
+  isTerminalState,
+  type RenderJob,
+} from "../../api/render-types";
 
 /**
  * 一键渲染向导：选择模型 → 材质分析 → 材质确认 → 渲染设置 → 执行渲染 → 查看结果。
@@ -209,35 +218,35 @@ function ModelStep({ controller }: { controller: RenderStore }) {
   );
 }
 
-const STATE_LABELS: Record<string, string> = {
-  queued: "排队中",
-  preflight: "预检中",
-  analyzing_materials: "材质分析中",
-  waiting_confirmation: "等待材质确认",
-  preparing: "准备渲染",
-  rendering: "渲染中",
-  verifying: "校验产物",
-  success: "渲染成功",
-  failed: "渲染失败",
-  rejected: "已被拒绝",
-  diagnostic: "仅诊断",
-  cancelled: "已取消",
-};
+const STATE_LABELS: Record<string, string> = { ...RENDER_STATE_LABELS, ...RENDER_TERMINAL_LABELS };
+
+/** 终态 Chip 的色调：只有 success 用 ok；diagnostic 用 warn（不是普通失败）。 */
+function terminalTone(state: string): "ok" | "warn" | "bad" {
+  if (state === "success") return "ok";
+  if (state === "diagnostic") return "warn";
+  return "bad";
+}
 
 function ProgressStep({ job, controller }: { job: RenderJob; controller: RenderStore }) {
   const terminal = isTerminalState(job.state);
   const waiting = job.state === "waiting_confirmation";
+  const cancelable = canCancelJob(job);
 
   return (
     <div class="wizard-body" data-testid="render-progress">
       <div class="progress-head" data-testid="render-state">
         <Chip
-          tone={job.state === "success" ? "ok" : terminal ? "bad" : "info"}
+          tone={terminal ? terminalTone(job.state) : "info"}
           label={STATE_LABELS[job.state] ?? job.state}
         />
         <span class="muted">
           {job.model_name} · {job.fingerprint}
         </span>
+        {job.shippable ? (
+          <span class="chip chip-ok" data-testid="render-shippable">
+            可交付
+          </span>
+        ) : null}
       </div>
 
       {waiting ? (
@@ -291,15 +300,23 @@ function ProgressStep({ job, controller }: { job: RenderJob; controller: RenderS
 
       <div class="wizard-actions">
         {!terminal ? (
-          <button
-            type="button"
-            class="chip"
-            data-testid="render-cancel"
-            onClick={() => void controller.actions.cancelJob()}
-          >
-            取消任务
-          </button>
-        ) : (
+          cancelable ? (
+            <button
+              type="button"
+              class="chip"
+              data-testid="render-cancel"
+              onClick={() => void controller.actions.cancelJob()}
+            >
+              取消任务
+            </button>
+          ) : (
+            // 规格 §7.3：正式渲染阶段不可取消。**先禁用并说明原因**，
+            // 而不是发一个注定被服务端拒绝的请求。
+            <div class="banner banner-info" data-testid="render-cancel-locked">
+              {RENDER_CANCEL_LOCKED_MESSAGE}
+            </div>
+          )
+        ) : isTerminalRetryable(job) ? (
           <button
             type="button"
             class="chip"
@@ -308,70 +325,164 @@ function ProgressStep({ job, controller }: { job: RenderJob; controller: RenderS
           >
             重新渲染
           </button>
-        )}
+        ) : null}
       </div>
     </div>
   );
 }
 
+/** 可重试的终态（与服务端 RETRYABLE_STATES 一致；取消后也允许重跑）。 */
+function isTerminalRetryable(job: RenderJob): boolean {
+  return (
+    job.state === "failed" ||
+    job.state === "rejected" ||
+    job.state === "diagnostic" ||
+    job.state === "cancelled"
+  );
+}
+
 function ResultStep({ job, controller }: { job: RenderJob; controller: RenderStore }) {
   const state = useStore(controller.store, (snapshot) => snapshot);
-  if (job.state !== "success") {
+
+  // ---- 可交付：只有 success 且服务端说 shippable -----------------------
+  if (isShippableJob(job)) {
     return (
-      <div class="banner banner-error" data-testid="render-result-failed">
-        本次未产出可交付结果（{STATE_LABELS[job.state] ?? job.state}）。日志与输出目录已保留，可修正后重试。
+      <div class="render-result" data-testid="render-result">
+        <h3>渲染结果</h3>
+        {job.degraded ? (
+          <div class="banner banner-warn" data-testid="render-result-degraded">
+            本次未收到固定脚本的终态标记，按兼容规则判定成功（退出码 0 且确有成品图）。
+            这是<b>降级判定</b>，建议更新渲染脚本以获得完整终态信息。
+          </div>
+        ) : null}
+        <div class="result-meta">
+          <span class="muted" data-testid="render-disk-bytes">
+            产物占用：{formatBytes(job.disk_bytes)}
+          </span>
+          <span class="muted" data-testid="render-retention">
+            保留状态：{job.retention_state}
+          </span>
+          <label class="checkbox" title="固定后不会被自动清理">
+            <input
+              type="checkbox"
+              checked={job.pinned}
+              data-testid="render-pin"
+              onChange={(event) =>
+                void controller.actions.pinJob((event.currentTarget as HTMLInputElement).checked)
+              }
+            />
+            <span>保留此任务</span>
+          </label>
+        </div>
+        {state.artifacts.length === 0 ? (
+          <p class="muted">尚未发现产物文件。</p>
+        ) : (
+          <ul class="artifact-list">
+            {state.artifacts.map((artifact) => (
+              <li key={artifact.artifact_id}>
+                <a
+                  href={controller.actions.artifactUrl(job.job_id, artifact.artifact_id)}
+                  target="_blank"
+                  rel="noreferrer"
+                  data-testid={`render-artifact-${artifact.artifact_id}`}
+                >
+                  {artifact.name}
+                </a>
+                <span class="muted"> {formatBytes(artifact.size)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+        <button
+          type="button"
+          class="chip"
+          data-testid="render-open-output"
+          onClick={() => void controller.actions.openOutput()}
+        >
+          打开输出目录
+        </button>
       </div>
     );
   }
-  return (
-    <div class="render-result" data-testid="render-result">
-      <h3>渲染结果</h3>
-      <div class="result-meta">
-        <span class="muted" data-testid="render-disk-bytes">
-          产物占用：{formatBytes(job.disk_bytes)}
-        </span>
-        <span class="muted" data-testid="render-retention">
-          保留状态：{job.retention_state}
-        </span>
-        <label class="checkbox" title="固定后不会被自动清理">
-          <input
-            type="checkbox"
-            checked={job.pinned}
-            data-testid="render-pin"
-            onChange={(event) =>
-              void controller.actions.pinJob((event.currentTarget as HTMLInputElement).checked)
-            }
-          />
-          <span>保留此任务</span>
-        </label>
+
+  // ---- 需要材质确认：绝不是「渲染失败」 --------------------------------
+  if (job.state === "rejected") {
+    return (
+      <div class="banner banner-warn" data-testid="render-result-rejected">
+        <b>需要材质确认</b>
+        <div class="muted">
+          渲染前的材质准入检查未通过，尚未开始正式渲染，因此没有产出可交付成品。
+          这不是渲染失败。请按下面的提示完成材质确认后重新渲染。
+        </div>
+        {job.error_code ? <div class="muted">错误码：{job.error_code}</div> : null}
+        {job.confirm_url ? (
+          <a
+            class="chip"
+            href={job.confirm_url}
+            target="_blank"
+            rel="noreferrer"
+            data-testid="render-result-confirm-link"
+          >
+            打开确认页
+          </a>
+        ) : null}
       </div>
-      {state.artifacts.length === 0 ? (
-        <p class="muted">尚未发现产物文件。</p>
-      ) : (
-        <ul class="artifact-list">
-          {state.artifacts.map((artifact) => (
-            <li key={artifact.artifact_id}>
-              <a
-                href={controller.actions.artifactUrl(job.job_id, artifact.artifact_id)}
-                target="_blank"
-                rel="noreferrer"
-                data-testid={`render-artifact-${artifact.artifact_id}`}
-              >
-                {artifact.name}
-              </a>
-              <span class="muted"> {formatBytes(artifact.size)}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-      <button
-        type="button"
-        class="chip"
-        data-testid="render-open-output"
-        onClick={() => void controller.actions.openOutput()}
-      >
-        打开输出目录
-      </button>
+    );
+  }
+
+  // ---- 诊断图：明确不可交付 ----
+  if (job.state === "diagnostic") {
+    return (
+      <div class="banner banner-warn" data-testid="render-result-diagnostic">
+        <b>诊断图（不可交付）</b>
+        <div class="muted">
+          本次产出的是诊断图：未识别材质以洋红标识，图上带「诊断预览」水印。
+          它不是正式成品，不能作为交付结果使用。
+        </div>
+        {job.error_code ? <div class="muted">错误码：{job.error_code}</div> : null}
+        {state.artifacts.length > 0 ? (
+          <ul class="artifact-list" data-testid="render-diagnostic-artifacts">
+            {state.artifacts.map((artifact) => (
+              <li key={artifact.artifact_id}>
+                <a
+                  href={controller.actions.artifactUrl(job.job_id, artifact.artifact_id)}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {artifact.name}
+                </a>
+                <span class="muted"> {formatBytes(artifact.size)}（诊断图，非成品）</span>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (job.state === "cancelled") {
+    return (
+      <div class="banner banner-info" data-testid="render-result-cancelled">
+        <b>已取消</b>
+        <div class="muted">
+          {job.cancel_reason ?? "任务已被取消"}。半成品不会标记为正式结果，可修正后重新渲染。
+        </div>
+      </div>
+    );
+  }
+
+  // ---- 失败：错误码 + 可操作提示，绝不展示裸 traceback -------------------
+  return (
+    <div class="banner banner-error" data-testid="render-result-failed">
+      <b>渲染失败</b>
+      <div class="muted">
+        本次未产出可交付结果。日志与输出目录已保留，可修正后重试。
+      </div>
+      {job.error_code ? (
+        <div class="muted" data-testid="render-result-error-code">
+          错误码：{job.error_code}
+        </div>
+      ) : null}
     </div>
   );
 }

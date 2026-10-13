@@ -76,6 +76,13 @@ RENDER_PREFLIGHT_FAILED = "RENDER_PREFLIGHT_FAILED"
 RENDER_OUTPUT_MISSING = "RENDER_OUTPUT_MISSING"
 RENDER_SUBPROCESS_FAILED = "RENDER_SUBPROCESS_FAILED"
 RENDER_EXECUTOR_LOCKED = "RENDER_EXECUTOR_LOCKED"
+#: 固定脚本写出了**四个正式终态之外**的 token。单独一个码：契约升级时必须被发现，
+#: 而不是被静默归成「普通失败」。（规格 §3.3：未知终态 token 一律失败。）
+RENDER_UNKNOWN_TERMINAL = "RENDER_UNKNOWN_TERMINAL"
+#: 固定脚本终态为 DIAGNOSTIC：产出的是诊断图，**不是成品**。（规格 §3.2）
+RENDER_DIAGNOSTIC = "RENDER_DIAGNOSTIC"
+#: 固定脚本终态为 REJECTED：渲染前被准入检查拦下，需完成材质确认后重试。（规格 §3.2）
+RENDER_REJECTED = "RENDER_REJECTED"
 
 #: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，
 #: 便于调用方直接读到 ``parameter`` / ``value`` / ``depends_on`` / ``allowed``。
@@ -346,6 +353,23 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         409,
         True,
         "同一模型已有渲染在进行，已拒绝重复启动（跨进程锁保证单渲染者）。请等待当前任务结束或先取消。",
+    ),
+    RENDER_UNKNOWN_TERMINAL: (
+        502,
+        True,
+        "固定脚本返回了无法识别的运行终态。这通常是版本不匹配：请更新渲染脚本后重试，"
+        "并把这个任务的日志反馈给维护者。",
+    ),
+    RENDER_DIAGNOSTIC: (
+        200,
+        False,
+        "本次只产出了诊断图（含未识别材质的洋红标识），不是正式成品。"
+        "请先在材质确认里逐项选择，确认完成后重新渲染。",
+    ),
+    RENDER_REJECTED: (
+        200,
+        True,
+        "渲染前的材质准入检查未通过，尚未开始正式渲染。请按页面提示完成材质确认后重试。",
     ),
 }
 

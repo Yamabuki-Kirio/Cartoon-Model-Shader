@@ -12,6 +12,8 @@
     cancelled    用户取消
 
 取消只允许在 queued / analyzing_materials / waiting_confirmation。
+**正式渲染阶段（preparing / rendering / verifying）一律不可取消**（规格 §7.2~§7.3：
+第一版不冒险扩大杀进程范围；避免在 Blender 写入正式产物时损坏工程）。
 重试只允许在 failed / rejected / diagnostic。
 """
 
@@ -35,6 +37,8 @@ ALL_STATES = (
 
 # ---- 终止 / 可取消 / 可重试 --------------------------------------------
 TERMINAL_STATES = {"success", "failed", "rejected", "diagnostic", "cancelled"}
+#: 可交付白名单：**只有 success**。rejected / diagnostic / failed / cancelled 一律不可交付。
+SHIPPABLE_STATES = {"success"}
 CANCELABLE_STATES = {"queued", "analyzing_materials", "waiting_confirmation"}
 RETRYABLE_STATES = {"failed", "rejected", "diagnostic"}
 
@@ -68,8 +72,12 @@ _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
         "cancelled",
     },
     "waiting_confirmation": {"preparing", "failed", "rejected", "diagnostic", "cancelled"},
-    "preparing": {"rendering", "failed", "rejected", "diagnostic", "cancelled"},
-    "rendering": {"verifying", "failed", "rejected", "diagnostic", "cancelled"},
+    # preparing / rendering / verifying：**不含 cancelled**。
+    # `cancel()` 已由 `can_cancel()` 拦住，这里再从迁移表上删一次是纵深防御 ——
+    # 即便将来有人绕过 `can_cancel` 直接 `set_state(..., "cancelled")`，
+    # 也不会把正在写正式产物的 Blender 置成「已取消」（那会让用户误以为中断成功）。
+    "preparing": {"rendering", "failed", "rejected", "diagnostic"},
+    "rendering": {"verifying", "failed", "rejected", "diagnostic"},
     "verifying": {"success", "failed", "rejected", "diagnostic"},
     "success": set(),
     "failed": set(),
@@ -85,6 +93,11 @@ def is_terminal(state: str) -> bool:
 
 def is_success(state: str) -> bool:
     return state == "success"
+
+
+def is_shippable(state: str) -> bool:
+    """该状态是否可交付。**只有 success**（规格 §3.3 硬约束）。"""
+    return state in SHIPPABLE_STATES
 
 
 def can_cancel(state: str) -> bool:

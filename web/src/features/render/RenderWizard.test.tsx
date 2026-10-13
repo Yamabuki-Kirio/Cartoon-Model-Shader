@@ -4,6 +4,7 @@ import { RenderWizard } from "./RenderWizard";
 import { createRenderStore } from "../../state/render-store";
 import { makeTestRenderEndpoints, renderJobFixture } from "../../testing/render-fixtures";
 import type { RenderEndpoints } from "../../api/render-endpoints";
+import type { RenderJob } from "../../api/render-types";
 
 afterEach(cleanup);
 
@@ -185,5 +186,162 @@ describe("一键渲染向导", () => {
     fireEvent.click(getByTestId("render-pin"));
     await settle();
     expect(endpoints.pinJob).toHaveBeenCalledWith(expect.any(String), true);
+  });
+});
+
+/**
+ * 运行终态契约（规格 §3）。
+ *
+ * 关键不变量：四种终态的**文案与按钮必须互不相同**，且只有 success 显示成品区。
+ * 这里逐态钉死，防止回归成「除 success 外一律渲染失败」。
+ */
+describe("一键渲染：四种运行终态", () => {
+  async function runToTerminal(
+    state: "success" | "rejected" | "diagnostic" | "failed",
+    extra: Partial<RenderJob> = {},
+  ) {
+    const job = () =>
+      renderJobFixture({
+        state,
+        is_terminal: true,
+        step: 5,
+        stage: "查看结果",
+        ...extra,
+      });
+    const { controller } = setup({
+      createJob: async () => job(),
+      getJob: async () => job(),
+      artifacts: async (jobId: string) => ({
+        ok: true as const,
+        job_id: jobId,
+        artifacts: [{ artifact_id: "art-result.png", name: "result.png", size: 1024 }],
+      }),
+    });
+    const view = render(<RenderWizard controller={controller} />);
+    await settle();
+    fireEvent.click(view.getByTestId("render-start"));
+    await settle();
+    await settleTimers(8);
+    return view;
+  }
+
+  it("SUCCESS：显示成品区、可交付标记与打开输出目录", async () => {
+    const { getByTestId, queryByTestId } = await runToTerminal("success", {
+      outcome: "success",
+      shippable: true,
+    });
+    expect(getByTestId("render-result")).toBeTruthy();
+    expect(getByTestId("render-shippable").textContent).toContain("可交付");
+    expect(getByTestId("render-open-output")).toBeTruthy();
+    // 成功态不显示「降级判定」横幅
+    expect(queryByTestId("render-result-degraded")).toBeNull();
+  });
+
+  it("REJECTED：显示「需要材质确认」，绝不显示「渲染失败」", async () => {
+    const { getByTestId, queryByTestId } = await runToTerminal("rejected", {
+      outcome: "rejected",
+      shippable: false,
+      error_code: "RENDER_REJECTED",
+      confirm_url: "http://127.0.0.1:8770/",
+    });
+    expect(getByTestId("render-result-rejected")).toBeTruthy();
+    expect(getByTestId("render-result-rejected").textContent).toContain("需要材质确认");
+    // 状态徽标必须是「需要材质确认」，不能是「渲染失败」
+    expect(getByTestId("render-state").textContent).toContain("需要材质确认");
+    expect(getByTestId("render-state").textContent).not.toContain("渲染失败");
+    // 且不得出现失败结果区
+    expect(queryByTestId("render-result-failed")).toBeNull();
+    // 非成功态：不得出现成品区 / 可交付标记 / 打开输出目录
+    expect(queryByTestId("render-result")).toBeNull();
+    expect(queryByTestId("render-shippable")).toBeNull();
+    expect(queryByTestId("render-open-output")).toBeNull();
+    // 有确认入口与重试
+    expect(getByTestId("render-result-confirm-link")).toBeTruthy();
+    expect(getByTestId("render-retry")).toBeTruthy();
+  });
+
+  it("DIAGNOSTIC：明确「诊断图（不可交付）」，图被标为非成品", async () => {
+    const { getByTestId, queryByTestId } = await runToTerminal("diagnostic", {
+      outcome: "diagnostic",
+      shippable: false,
+      error_code: "RENDER_DIAGNOSTIC",
+    });
+    expect(getByTestId("render-result-diagnostic")).toBeTruthy();
+    expect(getByTestId("render-result-diagnostic").textContent).toContain("不可交付");
+    expect(getByTestId("render-state").textContent).toContain("诊断图");
+    // 诊断图确实被列出，但每个都带「非成品」标注
+    expect(getByTestId("render-diagnostic-artifacts").textContent).toContain("诊断图，非成品");
+    expect(queryByTestId("render-result")).toBeNull();
+    expect(queryByTestId("render-shippable")).toBeNull();
+  });
+
+  it("FAILED：显示错误码与重试，不展示裸 traceback", async () => {
+    const { getByTestId, queryByTestId } = await runToTerminal("failed", {
+      outcome: "failed",
+      shippable: false,
+      error_code: "RENDER_SUBPROCESS_FAILED",
+    });
+    expect(getByTestId("render-result-failed")).toBeTruthy();
+    expect(getByTestId("render-result-error-code").textContent).toContain(
+      "RENDER_SUBPROCESS_FAILED",
+    );
+    expect(getByTestId("render-retry")).toBeTruthy();
+    expect(queryByTestId("render-result")).toBeNull();
+    expect(queryByTestId("render-open-output")).toBeNull();
+  });
+
+  it("降级成功：额外提示这是兼容降级判定", async () => {
+    const { getByTestId } = await runToTerminal("success", {
+      outcome: "success",
+      shippable: true,
+      degraded: true,
+    });
+    expect(getByTestId("render-result")).toBeTruthy();
+    expect(getByTestId("render-result-degraded")).toBeTruthy();
+    expect(getByTestId("render-result-degraded").textContent).toContain("降级");
+  });
+});
+
+/**
+ * 取消策略（规格 §7）。
+ *
+ * 正式渲染阶段**不可取消**：按钮必须消失并换成说明文案，而不是发一个注定被拒的请求。
+ */
+describe("一键渲染：取消策略", () => {
+  async function runTo(state: RenderJob["state"], extra: Partial<RenderJob> = {}) {
+    const job = () => renderJobFixture({ state, step: 4, ...extra });
+    const { controller, endpoints } = setup({
+      createJob: async () => job(),
+      getJob: async () => job(),
+    });
+    const view = render(<RenderWizard controller={controller} />);
+    await settle();
+    fireEvent.click(view.getByTestId("render-start"));
+    await settle();
+    await settleTimers(6);
+    return { view, endpoints };
+  }
+
+  it("可取消阶段显示「取消任务」", async () => {
+    const { view, endpoints } = await runTo("waiting_confirmation");
+    expect(view.getByTestId("render-cancel")).toBeTruthy();
+    fireEvent.click(view.getByTestId("render-cancel"));
+    await settle();
+    expect(endpoints.cancelJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("正式渲染中：按钮禁用并说明原因，且不发起取消请求", async () => {
+    const { view, endpoints } = await runTo("rendering");
+    expect(view.queryByTestId("render-cancel")).toBeNull();
+    const locked = view.getByTestId("render-cancel-locked");
+    expect(locked.textContent).toContain("暂不支持取消");
+    expect(locked.textContent).toContain("损坏工程");
+    expect(endpoints.cancelJob).not.toHaveBeenCalled();
+  });
+
+  it("verifying 阶段同样不可取消", async () => {
+    const { view } = await runTo("verifying");
+    expect(view.queryByTestId("render-cancel")).toBeNull();
+    expect(view.getByTestId("render-cancel-locked")).toBeTruthy();
   });
 });

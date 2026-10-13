@@ -53,6 +53,16 @@ class RenderJob:
     disk_bytes: int = 0
     #: 取消原因（取消时需要保留，供诊断）。
     cancel_reason: str | None = None
+    #: 归一化运行终态（run_contract 词表：success / rejected / diagnostic / failed）。
+    #: 仅终态任务有值；None 表示尚未落定。前端据此区分四种终态，**不再靠猜**。
+    outcome: str | None = None
+    #: 是否可交付。**只有 success 为 True**（规格 §3.3）。
+    shippable: bool = False
+    #: 稳定错误码（非成功时；成功为 None）。供前端给出可操作提示而非裸 traceback。
+    error_code: str | None = None
+    #: 是否为「兼容降级判定」：render.done 缺失，但退出码 0 且确有合法产物
+    #: （规格 §3.2 第五行）。降级不等于造假，但必须如实披露。
+    degraded: bool = False
     _proc: Any = field(default=None, repr=False, compare=False)
 
     # -- 派生属性 --------------------------------------------------------
@@ -110,6 +120,11 @@ class RenderJob:
             "pinned": self.pinned,
             "disk_bytes": self.disk_bytes,
             "retention_state": self.retention_state,
+            "outcome": self.outcome,
+            "shippable": self.shippable,
+            "error_code": self.error_code,
+            "degraded": self.degraded,
+            "cancel_reason": self.cancel_reason,
         }
         if include_logs:
             out["logs"] = list(self.logs)
@@ -309,15 +324,60 @@ class RenderJobManager:
         job.updated_at = _now()
         return job
 
-    def succeed(self, job_id: str) -> RenderJob:
-        return self._force_terminal(job_id, "success")
+    def succeed(self, job_id: str, *, error_code: str | None = None) -> RenderJob:
+        return self.settle(job_id, "success", error_code=error_code)
 
-    def fail(self, job_id: str, reason: str = "failed") -> RenderJob:
+    def fail(
+        self,
+        job_id: str,
+        reason: str = "failed",
+        *,
+        error_code: str | None = None,
+    ) -> RenderJob:
         state = reason if reason in render_state.TERMINAL_STATES else "failed"
-        return self._force_terminal(job_id, state)
+        return self.settle(job_id, state, error_code=error_code)
+
+    def settle(
+        self,
+        job_id: str,
+        outcome: str,
+        *,
+        error_code: str | None = None,
+        degraded: bool = False,
+    ) -> RenderJob:
+        """按 run_contract 归一化终态落定任务，并同步 ``outcome`` / ``shippable``。
+
+        ``outcome`` 接受大写 token（``SUCCESS`` / ``REJECTED`` / ``DIAGNOSTIC`` /
+        ``FAILED``）或小写终态名；内部一律过 ``render_contract.normalize``，
+        **未知 token 归为 failed**（规格 §3.3：未知终态 token 一律失败）。
+
+        ``shippable`` 只由契约决定：**只有 success 为 True**。调用方无法用参数把它
+        抬成 True —— 这正是 §3.3 硬约束要的「绝不以文件存在或退出码 0 单独判成功」。
+
+        注意：``cancelled`` 不是 run_contract 的正式终态，取消走 ``cancel()`` →
+        ``_force_terminal()``，**不经过本方法**（否则会被 normalize 成 failed）。
+        """
+        from . import render_contract
+
+        job = self._must(job_id)
+        if job.is_terminal:
+            return job
+        normalized = render_contract.normalize(outcome)
+        job.state = normalized  # success/rejected/diagnostic/failed 与 render_state 同名
+        job.outcome = normalized
+        job.shippable = render_contract.is_shippable(normalized)
+        job.error_code = None if normalized == "success" else (error_code or None)
+        # 降级披露只对 success 有意义：非成功态本身就是失败，无需再标注降级。
+        job.degraded = bool(degraded) and normalized == "success"
+        job.updated_at = _now()
+        return job
 
     def _force_terminal(self, job_id: str, state: str) -> RenderJob:
-        """直接落到终止态：终止态是所有正常路径的合法终点，不受迁移表限制。"""
+        """直接落到终止态：终止态是所有正常路径的合法终点，不受迁移表限制。
+
+        仅用于 **cancelled**（run_contract 没有这个终态，不能走 ``settle``）。
+        不写 ``outcome``：取消不是一次「运行终态」，前端据此不显示四种正式终态文案。
+        """
         job = self._must(job_id)
         if job.is_terminal:
             return job
@@ -341,8 +401,14 @@ class RenderJobManager:
         job = self._must(job_id)
         if not render_state.is_retryable(job.state):
             raise ValueError(f"当前状态 {job.state} 不可重试")
-        # 重置为排队，交还给编排层重新执行
+        # 重置为排队，交还给编排层重新执行。终态字段必须一并清空：
+        # 否则旧 outcome/shippable 会在新跑完成前就把任务标成可交付。
         job.state = "queued"
+        job.outcome = None
+        job.shippable = False
+        job.error_code = None
+        job.degraded = False
+        job.cancel_reason = None
         job.logs = []
         job.updated_at = _now()
         return job

@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import errors
+from . import errors, render_contract
 from .file_lock import FileLockHolder, LockBusy
 from .proc_cleanup import WindowsJobObject, terminate_job_processes
 from .render_jobs import RenderJobManager
@@ -30,6 +30,19 @@ logger = logging.getLogger("toon_tuner")
 CONFIRM_PORT = 8770
 _VALID_MODES = ("faithful", "enhanced")
 _WHITELIST = {"mode", "auto_frame"}
+
+#: 可视为「合法成品图」的扩展名（规格 §6.4：成功必须至少存在一张成品图）。
+#: 视频不算成品图：先出图再出视频的管线里，视频缺失不应阻断交付判定。
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _deliverable_images(job: Any) -> list[dict[str, Any]]:
+    """任务输出目录里的成品图（规格 §6.4 的「至少一张合法成品图」）。"""
+    return [
+        art
+        for art in job.list_artifacts()
+        if Path(str(art.get("name", ""))).suffix.lower() in _IMAGE_SUFFIXES
+    ]
 
 
 def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
@@ -455,39 +468,134 @@ class RenderPipelineService:
         )
 
     def _finalize(self, job_id: str, out_dir: str, code: int) -> None:
-        """终态判定：**只有固定脚本自己说 SUCCESS、或退出码 0 且确有产物**才算成功。
+        """终态判定：规格 §3.2 映射表的**唯一实现点**。
 
-        绝不允许「退出码 0 就算成功」（规格 §11）。`render.done` 是固定脚本的权威
-        终态标记；当它明确给出非 SUCCESS 时，即便目录里存在零散文件也判失败。
+        权威来源是固定脚本写在 ``render.done`` 首行的 token；词表与可交付白名单来自
+        ``render_contract``（即 ``render_pipeline/run_contract.py``），**不在本地复制**。
+
+        硬约束（规格 §3.3）：
+        * 只有 ``success`` 可 ``shippable=True``，且本方法没有任何参数能把它抬真；
+        * ``diagnostic`` 绝不显示为成品，``rejected`` 绝不显示为「渲染失败」；
+        * 未知 token 一律失败，并单独标 ``RENDER_UNKNOWN_TERMINAL``；
+        * **绝不**以「文件存在」或「退出码 0」单独判断成功 —— token 说 SUCCESS
+          但退出码非 0、或没有成品图时，同样判失败。
         """
         job = self._manager.get(job_id)
         if job is None:
             return
-        done_token = self._read_done_token(out_dir)
+        raw_token = self._read_done_token(out_dir)
+        images = _deliverable_images(job)
         artifacts = job.list_artifacts()
 
-        if done_token is not None:
-            # 固定脚本给出了明确终态：以它为准。
-            if done_token == "SUCCESS" and artifacts and code == 0:
-                self._manager.succeed(job_id)
+        if raw_token is not None:
+            token = raw_token.strip().upper()
+            if not render_contract.is_known_token(token):
+                self._settle(
+                    job_id,
+                    "failed",
+                    errors.RENDER_UNKNOWN_TERMINAL,
+                    "固定脚本返回无法识别的终态 %r（合法值：%s；退出码 %d，产物 %d 个），"
+                    "判定为失败。"
+                    % (raw_token, sorted(render_contract.valid_tokens()), code, len(artifacts)),
+                )
+                return
+            outcome = render_contract.token_to_outcome(token)
+            if outcome == "success":
+                # token 与事实冲突：token 说成功也不行，必须退出码 0 且有成品图。
+                if code != 0:
+                    self._settle(
+                        job_id,
+                        "failed",
+                        errors.RENDER_SUBPROCESS_FAILED,
+                        "固定脚本终态=SUCCESS 但退出码为 %d（token 与退出码冲突），判定为失败。" % code,
+                    )
+                    return
+                if not images:
+                    self._settle(
+                        job_id,
+                        "failed",
+                        errors.RENDER_OUTPUT_MISSING,
+                        "固定脚本终态=SUCCESS 但未产出任何合法成品图，判定为失败。",
+                    )
+                    return
+                self._manager.append_log(
+                    job_id, f"[render] 终态 SUCCESS：成品图 {len(images)} 张，可交付。"
+                )
+                self._manager.settle(job_id, "success")
                 self._after_terminal(job_id)
                 return
-            self._manager.append_log(
+            if outcome == "rejected":
+                self._settle(
+                    job_id,
+                    "rejected",
+                    errors.RENDER_REJECTED,
+                    "固定脚本终态=REJECTED（退出码 %d，产物 %d 个）：渲染前被材质准入检查拦下，"
+                    "尚未开始正式渲染。需完成材质确认后重试。" % (code, len(artifacts)),
+                )
+                return
+            if outcome == "diagnostic":
+                self._settle(
+                    job_id,
+                    "diagnostic",
+                    errors.RENDER_DIAGNOSTIC,
+                    "固定脚本终态=DIAGNOSTIC（退出码 %d）：本次产出的是诊断图，不是成品。"
+                    % code,
+                )
+                return
+            # 明确的 FAILED。
+            self._settle(
                 job_id,
-                f"[render] 固定脚本终态={done_token}（退出码 {code}），产物 {len(artifacts)} 个，判定为失败。",
+                "failed",
+                errors.RENDER_SUBPROCESS_FAILED,
+                "固定脚本终态=FAILED（退出码 %d，产物 %d 个），判定为失败。" % (code, len(artifacts)),
             )
-            self._manager.fail(job_id, "failed")
-            self._after_terminal(job_id)
             return
 
-        # 没有 render.done：退化为「退出码 0 且确有产物」，否则失败。
-        if code == 0 and artifacts:
-            self._manager.succeed(job_id)
+        # ---- 没有 render.done：按规格 §3.2 后两行做兼容降级 -----------------
+        # 旧版入口可能不写 token。此时**只有退出码 0 且确有成品图**才判成功，
+        # 且必须如实记录「这是降级判定」；缺任一条件即失败。
+        if code == 0 and images:
+            self._manager.append_log(
+                job_id,
+                "[render] 未收到 render.done 终态标记；按兼容规则判定为成功"
+                f"（退出码 0，成品图 {len(images)} 张）。这是降级判定，已记录。",
+            )
+            self._manager.settle(job_id, "success", degraded=True)
             self._after_terminal(job_id)
             return
-        if not artifacts:
-            self._manager.append_log(job_id, "[render] 渲染结束但未产出任何产物文件，判定为失败。")
-        self._manager.fail(job_id, "failed")
+        if code != 0 and not images:
+            self._settle(
+                job_id,
+                "failed",
+                errors.RENDER_SUBPROCESS_FAILED,
+                "渲染结束：退出码 %d 且未产出任何合法成品图，判定为失败。" % code,
+            )
+            return
+        if not images:
+            self._settle(
+                job_id,
+                "failed",
+                errors.RENDER_OUTPUT_MISSING,
+                "渲染结束：退出码 0 但未产出任何合法成品图，判定为失败。",
+            )
+            return
+        self._settle(
+            job_id,
+            "failed",
+            errors.RENDER_SUBPROCESS_FAILED,
+            "渲染结束：退出码 %d 且未收到终态标记，判定为失败。" % code,
+        )
+
+    def _settle(
+        self,
+        job_id: str,
+        outcome: str,
+        error_code: str,
+        message: str,
+    ) -> None:
+        """落终态 + 记日志 + 收尾清理。三件事必须一起做，避免任一步漏掉。"""
+        self._manager.append_log(job_id, "[render] " + message)
+        self._manager.settle(job_id, outcome, error_code=error_code)
         self._after_terminal(job_id)
 
     def _after_terminal(self, job_id: str) -> None:
