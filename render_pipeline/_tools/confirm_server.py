@@ -419,6 +419,9 @@ def _run_one(tgt, out_dir, job, timeout=1800):
             "--pmx", tgt["pmx"], "--out", out_dir,
             "--mode", job.get("mode", "faithful"),
             "--material-policy", "strict",
+            "--lighting", job.get("lighting") or "volume_fog",
+            "--fog-density", str(job.get("fog_density")
+                                 if job.get("fog_density") is not None else 0.018),
             "--resolve", job.get("source_blend") or SOURCE_BLEND,
             "--script", job.get("script") or SCRIPT,
             "--auto-frame", str(int(job.get("auto_frame") or 0)),
@@ -427,6 +430,13 @@ def _run_one(tgt, out_dir, job, timeout=1800):
             #   现在两条路都给：显式文件优先，目录兜底（渲染时按指纹重查）。
             "--maps-dir", job.get("maps_dir") or STATE.get("maps_dir") or DEFAULT_MAPS_DIR,
             "--log", logp, "--done", done]
+    # 辉光微调来自 job 文件（入口脚本写入；不传则用主脚本默认修复值）。
+    for key, flag in (("Threshold", "--glow-threshold"), ("Strength", "--glow-strength"),
+                      ("Size", "--glow-size"), ("Smoothness", "--glow-smoothness"),
+                      ("Quality", "--glow-quality")):
+        v = (job.get("glow") or {}).get(key)
+        if v is not None:
+            argv += [flag, str(v)]
     mf = tgt.get("map_file")
     if mf and os.path.isfile(mf):
         argv += ["--material-map", mf]

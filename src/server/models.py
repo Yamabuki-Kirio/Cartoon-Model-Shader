@@ -484,7 +484,11 @@ class CommitResponse(BaseModel):
 class RenderSettingsRequest(BaseModel):
     """提交渲染任务：只接受 opaque model_id + 白名单设置；绝不接受路径/脚本/命令。
 
-    ``mode`` 仅 faithful | enhanced；``auto_frame`` 是否自动构图。其余字段一律 422 拒绝。
+    ``mode`` 仅 faithful | enhanced；``auto_frame`` 是否自动构图。
+    ``lighting`` / ``fog_density`` / ``glow_*`` 是 2026-10-11 体积雾灯光与辉光修复增量
+    （自 Z:/B-Model/渲染方法复刻 新版脚本移植）：辉光项只在 enhanced 模式有意义，
+    不传则用主脚本默认修复值（阈值 0.55 / 平滑度 0.35 / 强度 0.85 / 尺寸 0.62 / High）。
+    其余字段一律 422 拒绝。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -492,6 +496,13 @@ class RenderSettingsRequest(BaseModel):
     model_id: str
     mode: Literal["faithful", "enhanced"] = "faithful"
     auto_frame: bool = False
+    lighting: Literal["volume_fog", "legacy"] = "volume_fog"
+    fog_density: float = Field(default=0.018, ge=0.0, le=0.1)
+    glow_threshold: float | None = Field(default=None, ge=0.0, le=10.0)
+    glow_strength: float | None = Field(default=None, ge=0.0, le=10.0)
+    glow_size: float | None = Field(default=None, ge=0.0, le=10.0)
+    glow_smoothness: float | None = Field(default=None, ge=0.0, le=1.0)
+    glow_quality: Literal["High", "Medium", "Low"] | None = None
 
 
 class ModelInfoResponse(BaseModel):

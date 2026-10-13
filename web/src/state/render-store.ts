@@ -30,6 +30,16 @@ export interface RenderUiState {
   /** 渲染设置。 */
   mode: "faithful" | "enhanced";
   autoFrame: boolean;
+  /** 灯光配置（2026-10-11 体积雾灯光增量）。 */
+  lighting: "volume_fog" | "legacy";
+  /** 体积雾雾密度 0.0–0.1（仅 volume_fog 有意义）。 */
+  fogDensity: number;
+  /** 辉光微调（仅 enhanced 有意义；null = 用主脚本默认修复值）。 */
+  glowThreshold: number | null;
+  glowStrength: number | null;
+  glowSize: number | null;
+  glowSmoothness: number | null;
+  glowQuality: "High" | "Medium" | "Low" | null;
   /** 当前任务（活跃或最近一次）。 */
   job: RenderJob | null;
   jobLoading: boolean;
@@ -89,6 +99,13 @@ export function createRenderStore(options: RenderStoreOptions) {
     selectedModelId: null,
     mode: "faithful",
     autoFrame: false,
+    lighting: "volume_fog",
+    fogDensity: 0.018,
+    glowThreshold: null,
+    glowStrength: null,
+    glowSize: null,
+    glowSmoothness: null,
+    glowQuality: null,
     job: null,
     jobLoading: false,
     jobError: null,
@@ -251,6 +268,13 @@ export function createRenderStore(options: RenderStoreOptions) {
         model_id: state.selectedModelId,
         mode: state.mode,
         auto_frame: state.autoFrame,
+        lighting: state.lighting,
+        fog_density: state.fogDensity,
+        glow_threshold: state.glowThreshold,
+        glow_strength: state.glowStrength,
+        glow_size: state.glowSize,
+        glow_smoothness: state.glowSmoothness,
+        glow_quality: state.glowQuality,
       });
       store.setState({ job, busy: false, stepOverride: null });
       trackJob(job.job_id);
@@ -393,6 +417,21 @@ export function createRenderStore(options: RenderStoreOptions) {
     },
     setAutoFrame(enabled: boolean): void {
       store.setState({ autoFrame: enabled });
+    },
+    setLighting(lighting: "volume_fog" | "legacy"): void {
+      store.setState({ lighting });
+    },
+    setFogDensity(density: number): void {
+      store.setState({ fogDensity: density });
+    },
+    setGlow(key: "threshold" | "strength" | "size" | "smoothness", value: number | null): void {
+      if (key === "threshold") store.setState({ glowThreshold: value });
+      else if (key === "strength") store.setState({ glowStrength: value });
+      else if (key === "size") store.setState({ glowSize: value });
+      else store.setState({ glowSmoothness: value });
+    },
+    setGlowQuality(quality: "High" | "Medium" | "Low" | null): void {
+      store.setState({ glowQuality: quality });
     },
     gotoStep(step: number): void {
       store.setState({ stepOverride: step });

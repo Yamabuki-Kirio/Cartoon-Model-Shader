@@ -20,7 +20,8 @@
    [5] 合成器：Glare Bloom 辉光 → 输出
    [6] 材质装配：按 MMD 材质名自动归类到对应 Cel 组，重建 贴图→组→Alpha→输出
    [7] 反壳法描边：给每个网格挂几何节点修改器（线宽 0.91mm）
-   [8] 灯光装置：21 盏启用灯 + 6 盏备用灯，参数与源工程逐项一致
+   [8] 灯光装置：默认体积雾冷暖灯光组（7 灯 + 程序化体积雾，总控整体可调）；
+                --lighting legacy 可切回 21 盏启用灯 + 6 盏备用灯的旧版复刻灯组
    [9] 相机：78mm 特写（带 shift 偏构图）
    [10] 一键渲染输出
 =====================================================================================
@@ -197,6 +198,19 @@ LOOK = "AgX - High Contrast"
 WORLD_STRENGTH = 0.12
 HDRI_NAME = "sunset.exr"
 
+# 灯光配置（体积雾灯光增量：2026-10-11 按《体积雾灯光增量更新报告》从外部新版脚本
+# 差异移植，只移植灯光与辉光增量，不覆盖本文件的 v3 材质政策 / 终态契约等安全逻辑）：
+#   volume_fog —— 默认。7 灯冷暖体积雾方案 + 程序化体积雾 + 黑色无环境光世界，
+#                 全部挂在总控 TOON_灯光总控 下（移动/旋转/缩放整体调整），
+#                 并按目标模型世界包围盒自动缩放平移；重复运行会刷新整个灯组。
+#   legacy     —— 保留原 21 盏启用灯 + 6 盏备用灯，参数与源工程逐项一致，方便回退比较。
+# 原场景的灯不删除、只停用，原隐藏状态记入集合自定义属性「旧灯光状态」。
+# 环境变量：TOON_LIGHTING_PROFILE / TOON_FOG_DENSITY（由驱动 --lighting / --fog-density 传入）。
+LIGHTING_PROFILE = os.environ.get("TOON_LIGHTING_PROFILE", "volume_fog").strip().lower()
+VOLUME_FOG_DENSITY = float(os.environ.get("TOON_FOG_DENSITY", "0.018"))
+VOLUME_FOG_COLLECTION = "TOON_体积雾灯光组"
+VOLUME_FOG_CONTROLLER = "TOON_灯光总控"
+
 # ★ 基准贴图的色彩空间。
 #
 #   ⚠ 口径修正（审计整改项 2）：原文写「源工程实测全部是 Filmic sRGB」是错的。
@@ -234,9 +248,12 @@ PIPELINE_MODE = os.environ.get("TOON_PIPELINE_MODE", "faithful")
 #  同名变量保留只为兼容旧调用点，语义等价于 strict。
 STRICT_MATERIAL_MATCH = (MATERIAL_POLICY == "strict")
 
-# 辉光（源工程实测值）
-GLOW = {"Type": "Bloom", "Quality": "Medium", "Threshold": 1.0,
-        "Smoothness": 0.1, "Strength": 2.0, "Size": 0.5, "Maximum": 10.0}
+# 辉光（2026-10-11 辉光修复值）。源工程那套 Bloom / 阈值1.0 / 强度2.0 / 尺寸0.5
+# 在其工程里是被旁路的、从未真正生效；卡通材质输出值压在 0..1，旧阈值会筛掉全部像素。
+# 修复口径：降阈值捕获卡通色阶高光，同时把强度收敛到 0.85，避免整幅画面泛白。
+# 饱和度一栏按用户裁决【不移植】（新版报告原值 1.08）；其余逐项取自新版脚本。
+GLOW = {"Type": "Bloom", "Quality": "High", "Threshold": 0.55,
+        "Smoothness": 0.35, "Strength": 0.85, "Size": 0.62, "Maximum": 8.0}
 
 # 相机
 CAMERA = dict(name="Toon_Face_Closeup_Camera", lens=78.0, sensor=36.0,
@@ -586,6 +603,8 @@ def write_run_manifest(out_dir, pre_existing, extra_inputs=(), extra_info=None):
             "film_transparent": FILM_TRANSPARENT,
             "auto_frame": AUTO_FRAME, "enable_outline": ENABLE_OUTLINE,
             "outline_impl": OUTLINE_IMPL, "outline_width_mm": OUTLINE_WIDTH_MM,
+            "lighting_profile": LIGHTING_PROFILE,
+            "volume_fog_density": VOLUME_FOG_DENSITY,
             "glow": GLOW,
         },
         "run_info": dict(RUN_INFO),
@@ -1017,7 +1036,8 @@ def setup_view_layer_props(scene):
 
 
 def _apply_glow_settings(gl):
-    for name, val in (("Type", "Bloom"), ("Quality", "Medium"),
+    # Type / Quality 也走 GLOW 字典（以前硬编码 "Bloom"/"Medium"，改了字典不生效）。
+    for name, val in (("Type", GLOW["Type"]), ("Quality", GLOW["Quality"]),
                       ("Threshold", GLOW["Threshold"]), ("Smoothness", GLOW["Smoothness"]),
                       ("Strength", GLOW["Strength"]), ("Size", GLOW["Size"]),
                       ("Maximum", GLOW["Maximum"]), ("Clamp", False)):
@@ -1027,7 +1047,7 @@ def _apply_glow_settings(gl):
                 s.default_value = val
             except Exception:
                 pass
-    for attr, val in (("glare_type", "BLOOM"), ("quality", "MEDIUM"),
+    for attr, val in (("glare_type", GLOW["Type"].upper()), ("quality", GLOW["Quality"].upper()),
                       ("threshold", GLOW["Threshold"]), ("size", GLOW["Size"]),
                       ("strength", GLOW["Strength"]), ("smoothness", GLOW["Smoothness"]),
                       ("maximum", GLOW["Maximum"])):
@@ -1671,7 +1691,7 @@ def add_outline(obj, group, material, width_mm):
 #  步骤 6：灯光 / 相机
 # =====================================================================================
 
-def setup_lights(scene):
+def setup_legacy_lights(scene):
     cache = {}
     made = []
     reused = 0
@@ -1729,8 +1749,168 @@ def setup_lights(scene):
             if o.name not in target_coll.objects:
                 target_coll.objects.link(o)
             made.append(o)
-    setup_lights.reused = reused
+    setup_legacy_lights.reused = reused
     return made
+
+
+def setup_volumetric_lights(scene, targets):
+    """建立竖屏角色近景中验证过的冷暖体积雾灯光组（2026-10-11 增量移植）。"""
+    from mathutils import Vector
+
+    center, size = world_bbox(targets)
+    ref_center = Vector((0.0, 0.15, 0.64))
+    if center is None:
+        center, size = ref_center.copy(), Vector((0.94, 0.84, 1.36))
+    scale = max(0.05, float(size.z) / 1.36)
+
+    old_coll = bpy.data.collections.get(VOLUME_FOG_COLLECTION)
+    if old_coll:
+        for obj in list(old_coll.objects):
+            bpy.data.objects.remove(obj, do_unlink=True)
+        bpy.data.collections.remove(old_coll)
+    coll = bpy.data.collections.new(VOLUME_FOG_COLLECTION)
+    scene.collection.children.link(coll)
+
+    # 原场景的灯不删除、只停用；原隐藏状态写进集合自定义属性，便于恢复。
+    old_state = {}
+    for obj in scene.objects:
+        if obj.type == "LIGHT":
+            old_state[obj.name] = [bool(obj.hide_viewport), bool(obj.hide_render)]
+            obj.hide_viewport = True
+            obj.hide_render = True
+    coll["旧灯光状态"] = json.dumps(old_state, ensure_ascii=False)
+    coll["配置版本"] = "volume_fog_v1"
+    coll["参考来源"] = "笨蛋的体积雾练习 + 偷懒用打光 + Blender混沌的打光预设"
+
+    aim = center + Vector((0.0, -0.07, 0.38)) * scale
+    ctrl = bpy.data.objects.new(VOLUME_FOG_CONTROLLER, None)
+    coll.objects.link(ctrl)
+    ctrl.location = aim
+    ctrl.empty_display_type = "CIRCLE"
+    ctrl.empty_display_size = 0.42 * scale
+    ctrl.show_in_front = True
+    ctrl["使用说明"] = "移动/旋转/缩放本对象可整体调整灯光与体积雾；单灯能量仍可独立修改"
+
+    def p(ref_location):
+        return center + (Vector(ref_location) - ref_center) * scale
+
+    def add(name, light_type, ref_location, energy, color, spot_deg=75.0,
+            spot_blend=1.0, radius=0.12, area_size=1.0):
+        data = bpy.data.lights.get(name)
+        if data is None or data.type != light_type:
+            data = bpy.data.lights.new(name, light_type)
+        data.energy = energy * scale * scale
+        data.color = color
+        data.use_shadow = True
+        if hasattr(data, "shadow_soft_size"):
+            data.shadow_soft_size = radius * scale
+        if light_type == "AREA":
+            data.shape = "DISK"
+            data.size = area_size * scale
+        elif light_type == "SPOT":
+            data.spot_size = math.radians(spot_deg)
+            data.spot_blend = spot_blend
+        obj = bpy.data.objects.new(name, data)
+        coll.objects.link(obj)
+        obj.location = p(ref_location)
+        if light_type in {"AREA", "SPOT", "SUN"}:
+            obj.rotation_euler = (aim - obj.location).to_track_quat("-Z", "Y").to_euler()
+        world = obj.matrix_world.copy()
+        obj.parent = ctrl
+        obj.matrix_parent_inverse = ctrl.matrix_world.inverted()
+        obj.matrix_world = world
+        obj.hide_viewport = False
+        obj.hide_render = False
+        obj["基础能量"] = float(data.energy)
+        return obj
+
+    lights = [
+        add("LGT_01_正面暖主光", "SPOT", (-0.30, -2.35, 2.22), 115.0,
+            (1.0, 0.91, 0.80), 74.0, 0.72, 0.18),
+        add("LGT_02_左后冷轮廓", "SPOT", (-1.75, 1.60, 2.38), 520.0,
+            (0.40, 0.66, 1.0), 72.0, 1.0, 0.10),
+        add("LGT_03_右后暖轮廓", "SPOT", (1.55, 1.20, 2.24), 220.0,
+            (1.0, 0.30, 0.11), 70.0, 1.0, 0.10),
+        add("LGT_04_左侧冷辅光", "POINT", (-0.82, 0.02, 1.22), 24.0,
+            (0.54, 0.68, 1.0), radius=0.22),
+        add("LGT_05_右侧红辅光", "POINT", (0.72, 0.02, 1.26), 34.0,
+            (1.0, 0.10, 0.035), radius=0.20),
+        add("LGT_06_正面肤色补光", "POINT", (0.10, -0.72, 1.30), 10.0,
+            (1.0, 0.78, 0.62), radius=0.25),
+        add("LGT_07_脚底暖柔光", "AREA", (0.0, 0.0, -0.18), 5.0,
+            (1.0, 0.42, 0.25), area_size=1.20),
+    ]
+
+    # 黑色无环境光世界：避免原 HDRI 与冷暖灯组重复补光。
+    world = bpy.data.worlds.get("TOON_体积雾黑场世界") or bpy.data.worlds.new("TOON_体积雾黑场世界")
+    world.use_nodes = True
+    ntw = world.node_tree
+    ntw.nodes.clear()
+    bg = ntw.nodes.new("ShaderNodeBackground")
+    bg.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+    bg.inputs["Strength"].default_value = 0.0
+    outw = ntw.nodes.new("ShaderNodeOutputWorld")
+    ntw.links.new(bg.outputs["Background"], outw.inputs["Surface"])
+    scene.world = world
+
+    # 程序化体积雾：4D Noise → Power → Multiply(密度) → Principled Volume。
+    bpy.ops.mesh.primitive_cube_add(location=p((0.0, 0.10, 1.10)))
+    fog = bpy.context.object
+    fog.name = "VOLUME_01_程序化体积雾"
+    fog.dimensions = tuple(v * scale for v in (5.2, 5.2, 4.2))
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    for owner in list(fog.users_collection):
+        owner.objects.unlink(fog)
+    coll.objects.link(fog)
+    fog.display_type = "WIRE"
+    mat = bpy.data.materials.get("MAT_程序化体积雾") or bpy.data.materials.new("MAT_程序化体积雾")
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    nodes.clear()
+    links = mat.node_tree.links
+    outm = nodes.new("ShaderNodeOutputMaterial")
+    vol = nodes.new("ShaderNodeVolumePrincipled")
+    vol.inputs["Color"].default_value = (0.50, 0.52, 0.58, 1.0)
+    vol.inputs["Anisotropy"].default_value = 0.14
+    noise = nodes.new("ShaderNodeTexNoise")
+    noise.noise_dimensions = "4D"
+    noise.inputs["W"].default_value = 5.2
+    noise.inputs["Scale"].default_value = 19.7
+    noise.inputs["Detail"].default_value = 2.0
+    power = nodes.new("ShaderNodeMath")
+    power.operation = "POWER"
+    power.inputs[1].default_value = 2.2
+    mult = nodes.new("ShaderNodeMath")
+    mult.operation = "MULTIPLY"
+    mult.inputs[1].default_value = VOLUME_FOG_DENSITY
+    links.new(noise.outputs["Fac"], power.inputs[0])
+    links.new(power.outputs[0], mult.inputs[0])
+    links.new(mult.outputs[0], vol.inputs["Density"])
+    links.new(vol.outputs["Volume"], outm.inputs["Volume"])
+    fog.data.materials.append(mat)
+    world_matrix = fog.matrix_world.copy()
+    fog.parent = ctrl
+    fog.matrix_parent_inverse = ctrl.matrix_world.inverted()
+    fog.matrix_world = world_matrix
+    fog.hide_select = True
+
+    ctrl["灯光数量"] = len(lights)
+    ctrl["雾密度"] = VOLUME_FOG_DENSITY
+    ctrl["灯光顺序"] = json.dumps([o.name for o in lights], ensure_ascii=False)
+    setup_volumetric_lights.reused = 0
+    return lights
+
+
+def setup_lights(scene, targets=None):
+    if LIGHTING_PROFILE == "legacy":
+        result = setup_legacy_lights(scene)
+        setup_lights.reused = getattr(setup_legacy_lights, "reused", 0)
+        return result
+    if LIGHTING_PROFILE != "volume_fog":
+        raise ValueError("LIGHTING_PROFILE 必须是 volume_fog 或 legacy，收到：%s" % LIGHTING_PROFILE)
+    result = setup_volumetric_lights(scene, targets or [])
+    setup_lights.reused = getattr(setup_volumetric_lights, "reused", 0)
+    return result
 
 
 def world_bbox(objs):
@@ -2039,10 +2219,11 @@ def main():
     log(f"[6/9] 描边：{'新挂 ' + str(outlined) + ' 个网格（线宽 ' + str(OUTLINE_WIDTH_MM) + 'mm）' if ENABLE_OUTLINE else '已跳过（ENABLE_OUTLINE=False）'}")
 
     # ---- 7 灯光
-    lights = setup_lights(scene)
+    lights = setup_lights(scene, targets)
     log(f"[7/9] 灯光：共 {len(lights)} 盏（新建 {len(lights) - getattr(setup_lights, 'reused', 0)} / "
         f"复用 {getattr(setup_lights, 'reused', 0)}），"
-        f"其中 {sum(1 for l in lights if not l.hide_render)} 盏参与渲染")
+        f"其中 {sum(1 for l in lights if not l.hide_render)} 盏参与渲染；配置={LIGHTING_PROFILE}"
+        + (f"，雾密度={VOLUME_FOG_DENSITY}" if LIGHTING_PROFILE == "volume_fog" else ""))
 
     # ---- 8 相机
     setup_camera(scene, targets)

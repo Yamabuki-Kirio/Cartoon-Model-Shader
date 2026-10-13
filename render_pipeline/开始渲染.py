@@ -28,6 +28,11 @@
 参数（除 --pmx/--fingerprint 外都有默认值）：
     --out <目录>          输出目录，默认 output/<模型名>_<时间戳>（每次运行都是新目录）
     --mode faithful|enhanced
+    --lighting volume_fog|legacy   灯光配置，默认 volume_fog（7 灯体积雾方案）
+    --fog-density <f>              体积雾雾密度，默认 0.018（范围 0.0–0.1）
+    --glow-threshold <f> --glow-strength <f> --glow-size <f>
+    --glow-smoothness <f> --glow-quality High|Medium|Low
+                                  辉光微调（仅 enhanced 模式生效；不传用主脚本修复默认值）
     --auto-frame 0|1      构图
     --no-confirm-ui       即使需要确认也不开页面（只打印缺什么）
     --port <n>            本地确认页端口，默认 8770
@@ -322,7 +327,8 @@ def ensure_previews(pmx, conf_path):
     return st.startswith("OK")
 
 
-def write_job(pmx, out_dir, mode, auto_frame, maps_dir=None):
+def write_job(pmx, out_dir, mode, auto_frame, maps_dir=None,
+              lighting="volume_fog", fog_density=0.018, glow=None):
     """把渲染任务写成 job 文件 —— 只有本地进程能写，浏览器无法提供。"""
     fp = sha256_of(pmx)
     os.makedirs(JOB_DIR, exist_ok=True)
@@ -332,6 +338,9 @@ def write_job(pmx, out_dir, mode, auto_frame, maps_dir=None):
         "auto_render": True,
         "mode": mode,
         "auto_frame": 1 if auto_frame else 0,
+        "lighting": lighting,
+        "fog_density": fog_density,
+        "glow": glow or {},
         "source_blend": SOURCE_BLEND,
         "blender": BLENDER,
         "driver": os.path.join(HERE, "一键渲染_通用驱动.py"),
@@ -347,7 +356,8 @@ def write_job(pmx, out_dir, mode, auto_frame, maps_dir=None):
     return job_path
 
 
-def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps_dir=None):
+def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps_dir=None,
+                           lighting="volume_fog", fog_density=0.018, glow=None):
     """
     启动确认页 → 等用户确认 → **服务端自动续跑渲染** → 轮询终态。
     本进程全程不启动渲染，因此不可能与页面按钮产生两个 Blender。
@@ -358,7 +368,8 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
     ok, err = ensure_out_dir(out_dir)
     if not ok:
         return "FAILED", {"status": "FAILED", "stage": "准备输出目录", "error": err}
-    job_path = write_job(pmx, out_dir, mode, auto_frame, maps_dir)
+    job_path = write_job(pmx, out_dir, mode, auto_frame, maps_dir,
+                         lighting=lighting, fog_density=fog_density, glow=glow)
     logp = os.path.join(out_dir, "confirm_server.log")
     buf = open(logp, "w", encoding="utf-8", errors="replace")
     srv = subprocess.Popen([PY, os.path.join(HERE, "_tools", "confirm_server.py"),
@@ -463,7 +474,8 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
             pass
 
 
-def render(pmx, out_dir, mode, auto_frame, maps_dir=None):
+def render(pmx, out_dir, mode, auto_frame, maps_dir=None,
+           lighting="volume_fog", fog_density=0.018, glow=None):
     """
     无需确认时的直接渲染。带跨进程锁，防止重复起 Blender。
 
@@ -499,6 +511,8 @@ def render(pmx, out_dir, mode, auto_frame, maps_dir=None):
                 os.path.join(HERE, "一键渲染_通用驱动.py"), "--",
                 "--pmx", pmx, "--out", out_dir, "--mode", mode,
                 "--material-policy", "strict",
+                "--lighting", lighting,
+                "--fog-density", str(fog_density),
                 "--resolve", SOURCE_BLEND,
                 "--script", os.path.join(HERE, "一键卡通渲染.py"),
                 "--auto-frame", "1" if auto_frame else "0",
@@ -506,6 +520,13 @@ def render(pmx, out_dir, mode, auto_frame, maps_dir=None):
                 #   （预检「映射命中 1 / 需确认 0」→ 走这条路）会把确认结果丢掉。
                 "--maps-dir", maps_dir or default_maps_dir(),
                 "--log", logp, "--done", done]
+        # 辉光微调（仅 enhanced 模式有意义；不传则用主脚本默认修复值）。
+        for key, flag in (("Threshold", "--glow-threshold"), ("Strength", "--glow-strength"),
+                          ("Size", "--glow-size"), ("Smoothness", "--glow-smoothness"),
+                          ("Quality", "--glow-quality")):
+            v = (glow or {}).get(key)
+            if v is not None:
+                argv += [flag, str(v)]
         out("  渲染中…（日志 %s）" % logp)
         r = launch_blender(argv, logp)
         if "@@LAUNCH@@" not in json.dumps(r):
@@ -540,6 +561,15 @@ def main():
     ap.add_argument("--name")
     ap.add_argument("--out")
     ap.add_argument("--mode", default="faithful", choices=("faithful", "enhanced"))
+    ap.add_argument("--lighting", default="volume_fog", choices=("volume_fog", "legacy"),
+                    help="灯光配置：volume_fog=7 灯体积雾方案（默认）；legacy=旧版 21+6 复刻灯组")
+    ap.add_argument("--fog-density", type=float, default=0.018,
+                    help="体积雾雾密度，默认 0.018（范围 0.0–0.1）")
+    ap.add_argument("--glow-threshold", type=float, default=None)
+    ap.add_argument("--glow-strength", type=float, default=None)
+    ap.add_argument("--glow-size", type=float, default=None)
+    ap.add_argument("--glow-smoothness", type=float, default=None)
+    ap.add_argument("--glow-quality", default=None, choices=("High", "Medium", "Low"))
     ap.add_argument("--auto-frame", type=int, default=0)
     ap.add_argument("--no-confirm-ui", action="store_true")
     ap.add_argument("--port", type=int, default=8770)
@@ -562,6 +592,14 @@ def main():
     BLENDER = os.path.abspath(a.blender) if a.blender else ""
     RUNTIME_DIR = os.path.abspath(a.runtime_dir)
     a.maps_dir = os.path.abspath(a.maps_dir) if a.maps_dir else default_maps_dir()
+    if not (0.0 <= a.fog_density <= 0.1):
+        out("--fog-density 必须在 0.0–0.1 之间，收到 %r" % a.fog_density)
+        return 2
+    glow = {k: v for k, v in (("Threshold", a.glow_threshold),
+                              ("Strength", a.glow_strength),
+                              ("Size", a.glow_size),
+                              ("Smoothness", a.glow_smoothness),
+                              ("Quality", a.glow_quality)) if v is not None}
     CONF_DIR = os.path.join(RUNTIME_DIR, "confirmation")
     PREVIEW_DIR = os.path.join(CONF_DIR, "previews")
     JOB_DIR = os.path.join(CONF_DIR, "jobs")
@@ -609,7 +647,8 @@ def main():
     requiring = [x for x in payload["items"] if x["requires_user"]]
     if not requiring:
         out("[2/3] 无需人工确认 —— 直接渲染")
-        rc, outcome = render(pmx, out_dir, a.mode, bool(a.auto_frame), a.maps_dir)
+        rc, outcome = render(pmx, out_dir, a.mode, bool(a.auto_frame), a.maps_dir,
+                             lighting=a.lighting, fog_density=a.fog_density, glow=glow)
         report_final(outcome, out_dir)
         return rc
 
@@ -629,7 +668,9 @@ def main():
 
     ensure_previews(pmx, conf_path)
     token, outcome = run_confirm_and_render(pmx, conf_path, out_dir, a.mode,
-                                            bool(a.auto_frame), a.port, a.maps_dir)
+                                            bool(a.auto_frame), a.port, a.maps_dir,
+                                            lighting=a.lighting,
+                                            fog_density=a.fog_density, glow=glow)
     report_final(outcome, out_dir, confirm_path=True)
     return 0 if token == "SUCCESS" else 1
 

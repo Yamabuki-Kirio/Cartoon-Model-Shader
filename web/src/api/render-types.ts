@@ -155,6 +155,16 @@ export interface CreateRenderJobBody {
   model_id: string;
   mode: "faithful" | "enhanced";
   auto_frame: boolean;
+  /** 灯光配置（2026-10-11 体积雾灯光增量）：volume_fog=7 灯体积雾方案（默认）；legacy=旧版 21+6 复刻灯组。 */
+  lighting?: "volume_fog" | "legacy";
+  /** 体积雾雾密度，范围 0.0–0.1，默认 0.018。 */
+  fog_density?: number;
+  /** 辉光微调（仅 enhanced 模式有意义；不传则用主脚本默认修复值 0.55/0.85/0.62/0.35/High）。 */
+  glow_threshold?: number | null;
+  glow_strength?: number | null;
+  glow_size?: number | null;
+  glow_smoothness?: number | null;
+  glow_quality?: "High" | "Medium" | "Low" | null;
 }
 
 /** 成功路径的 6 步（规格 §5）。 */

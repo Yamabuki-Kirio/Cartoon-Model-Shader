@@ -275,6 +275,14 @@ function ModelStep({ controller }: { controller: RenderStore }) {
   // 环境未就绪时禁用「开始渲染」：诊断还没读到时按未就绪处理（保守方向），
   // 避免在信息不足时放行一个必然失败的任务。
   const environmentReady = state.environment !== null && state.environment.ready === true;
+  const numOrNull = (raw: string): number | null => {
+    const t = raw.trim();
+    if (!t) {
+      return null;
+    }
+    const v = Number(t);
+    return Number.isFinite(v) ? v : null;
+  };
   return (
     <div class="wizard-body" data-testid="render-model-step">
       {state.modelsLoading ? <p class="muted">正在加载模型…</p> : null}
@@ -328,7 +336,134 @@ function ModelStep({ controller }: { controller: RenderStore }) {
           />
           <span>自动构图</span>
         </label>
+        <label>
+          <span>灯光配置</span>
+          <select
+            value={state.lighting}
+            data-testid="render-lighting"
+            onChange={(event) =>
+              controller.actions.setLighting(
+                (event.currentTarget as HTMLSelectElement).value as "volume_fog" | "legacy"
+              )
+            }
+          >
+            <option value="volume_fog">体积雾灯光组（默认）</option>
+            <option value="legacy">旧版复刻灯组</option>
+          </select>
+        </label>
+        {state.lighting === "volume_fog" ? (
+          <label>
+            <span>雾密度（0–0.1）</span>
+            <input
+              type="number"
+              min="0"
+              max="0.1"
+              step="0.001"
+              value={state.fogDensity}
+              data-testid="render-fog-density"
+              onInput={(event) =>
+                controller.actions.setFogDensity(
+                  Number((event.currentTarget as HTMLInputElement).value)
+                )
+              }
+            />
+          </label>
+        ) : null}
       </div>
+
+      {state.mode === "enhanced" ? (
+        <div class="settings-row" data-testid="render-glow-settings">
+          <span class="muted">
+            辉光微调（留空 = 用默认修复值：阈值 0.55 / 强度 0.85 / 尺寸 0.62 / 平滑度 0.35 / High）
+          </span>
+          <label>
+            <span>阈值</span>
+            <input
+              type="number"
+              min="0"
+              max="10"
+              step="0.01"
+              value={state.glowThreshold ?? ""}
+              data-testid="render-glow-threshold"
+              onInput={(event) =>
+                controller.actions.setGlow(
+                  "threshold",
+                  numOrNull((event.currentTarget as HTMLInputElement).value)
+                )
+              }
+            />
+          </label>
+          <label>
+            <span>强度</span>
+            <input
+              type="number"
+              min="0"
+              max="10"
+              step="0.01"
+              value={state.glowStrength ?? ""}
+              data-testid="render-glow-strength"
+              onInput={(event) =>
+                controller.actions.setGlow(
+                  "strength",
+                  numOrNull((event.currentTarget as HTMLInputElement).value)
+                )
+              }
+            />
+          </label>
+          <label>
+            <span>尺寸</span>
+            <input
+              type="number"
+              min="0"
+              max="10"
+              step="0.01"
+              value={state.glowSize ?? ""}
+              data-testid="render-glow-size"
+              onInput={(event) =>
+                controller.actions.setGlow(
+                  "size",
+                  numOrNull((event.currentTarget as HTMLInputElement).value)
+                )
+              }
+            />
+          </label>
+          <label>
+            <span>平滑度</span>
+            <input
+              type="number"
+              min="0"
+              max="1"
+              step="0.01"
+              value={state.glowSmoothness ?? ""}
+              data-testid="render-glow-smoothness"
+              onInput={(event) =>
+                controller.actions.setGlow(
+                  "smoothness",
+                  numOrNull((event.currentTarget as HTMLInputElement).value)
+                )
+              }
+            />
+          </label>
+          <label>
+            <span>质量</span>
+            <select
+              value={state.glowQuality ?? ""}
+              data-testid="render-glow-quality"
+              onChange={(event) => {
+                const v = (event.currentTarget as HTMLSelectElement).value;
+                controller.actions.setGlowQuality(
+                  v === "" ? null : (v as "High" | "Medium" | "Low")
+                );
+              }}
+            >
+              <option value="">默认（High）</option>
+              <option value="High">High</option>
+              <option value="Medium">Medium</option>
+              <option value="Low">Low</option>
+            </select>
+          </label>
+        </div>
+      ) : null}
 
       <div class="wizard-actions">
         <button

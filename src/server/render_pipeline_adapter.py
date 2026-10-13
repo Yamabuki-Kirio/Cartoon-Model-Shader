@@ -29,7 +29,17 @@ logger = logging.getLogger("toon_tuner")
 
 CONFIRM_PORT = 8770
 _VALID_MODES = ("faithful", "enhanced")
-_WHITELIST = {"mode", "auto_frame"}
+_VALID_LIGHTING = ("volume_fog", "legacy")
+_VALID_GLOW_QUALITY = ("High", "Medium", "Low")
+_WHITELIST = {"mode", "auto_frame", "lighting", "fog_density",
+              "glow_threshold", "glow_strength", "glow_size",
+              "glow_smoothness", "glow_quality"}
+#: 设置键 → 驱动 CLI 开关（辉光增量；仅 enhanced 模式有意义）。
+_GLOW_FLAGS = (("glow_threshold", "--glow-threshold"),
+               ("glow_strength", "--glow-strength"),
+               ("glow_size", "--glow-size"),
+               ("glow_smoothness", "--glow-smoothness"),
+               ("glow_quality", "--glow-quality"))
 
 #: 可视为「合法成品图」的扩展名（规格 §6.4：成功必须至少存在一张成品图）。
 #: 视频不算成品图：先出图再出视频的管线里，视频缺失不应阻断交付判定。
@@ -46,7 +56,7 @@ def _deliverable_images(job: Any) -> list[dict[str, Any]]:
 
 
 def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    """严格白名单：只允许 mode / auto_frame。多余键一律拒绝。"""
+    """严格白名单：mode / auto_frame + 灯光辉光增量参数。多余键一律拒绝。"""
     extra = set(settings) - _WHITELIST
     if extra:
         raise errors.ToonTunerError(
@@ -58,7 +68,45 @@ def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
             errors.PARAM_INVALID, f"mode 必须是 {_VALID_MODES}，收到 {mode!r}", retryable=False
         )
     auto_frame = bool(settings.get("auto_frame", False))
-    return {"mode": mode, "auto_frame": auto_frame}
+    lighting = settings.get("lighting", "volume_fog")
+    if lighting not in _VALID_LIGHTING:
+        raise errors.ToonTunerError(
+            errors.PARAM_INVALID,
+            f"lighting 必须是 {_VALID_LIGHTING}，收到 {lighting!r}", retryable=False,
+        )
+    try:
+        fog_density = float(settings.get("fog_density", 0.018))
+    except (TypeError, ValueError):
+        raise errors.ToonTunerError(
+            errors.PARAM_INVALID,
+            f"fog_density 必须是数字，收到 {settings.get('fog_density')!r}", retryable=False,
+        )
+    if not (0.0 <= fog_density <= 0.1):
+        raise errors.ToonTunerError(
+            errors.PARAM_INVALID,
+            f"fog_density 必须在 0.0–0.1 之间，收到 {fog_density!r}", retryable=False,
+        )
+    out: dict[str, Any] = {"mode": mode, "auto_frame": auto_frame,
+                           "lighting": lighting, "fog_density": fog_density}
+    for key in ("glow_threshold", "glow_strength", "glow_size", "glow_smoothness"):
+        v = settings.get(key)
+        if v is None:
+            continue
+        try:
+            out[key] = float(v)
+        except (TypeError, ValueError):
+            raise errors.ToonTunerError(
+                errors.PARAM_INVALID, f"{key} 必须是数字，收到 {v!r}", retryable=False
+            )
+    quality = settings.get("glow_quality")
+    if quality is not None:
+        if quality not in _VALID_GLOW_QUALITY:
+            raise errors.ToonTunerError(
+                errors.PARAM_INVALID,
+                f"glow_quality 必须是 {_VALID_GLOW_QUALITY}，收到 {quality!r}", retryable=False,
+            )
+        out["glow_quality"] = quality
+    return out
 
 
 class RenderPipelineService:
@@ -348,6 +396,10 @@ class RenderPipelineService:
             out_dir,
             "--mode",
             str(job.settings.get("mode", "faithful")),
+            "--lighting",
+            str(job.settings.get("lighting", "volume_fog")),
+            "--fog-density",
+            str(job.settings.get("fog_density", 0.018)),
             "--auto-frame",
             "1" if job.settings.get("auto_frame") else "0",
             "--port",
@@ -355,6 +407,11 @@ class RenderPipelineService:
             "--runtime-dir",
             str(self._runtime_dir) if self._runtime_dir else str(Path(out_dir).parent / "runtime"),
         ]
+        # 辉光增量：仅在设置了对应字段时透传（缺省让主脚本用默认修复值）。
+        for key, flag in _GLOW_FLAGS:
+            v = job.settings.get(key)
+            if v is not None:
+                cmd += [flag, str(v)]
         # 可选参数：仅在服务端确有配置时才透传（缺省让固定脚本回退到环境变量）。
         if self._model_root:
             cmd += ["--model-root", str(self._model_root)]

@@ -72,6 +72,45 @@ describe("一键渲染向导", () => {
     expect(getByTestId("render-artifact-art-result.png")).toBeTruthy();
   });
 
+  it("灯光与辉光增量：默认体积雾方案，enhanced 才显示辉光微调，提交体带上参数", async () => {
+    const { controller, endpoints } = setup();
+    const { getByTestId, queryByTestId } = render(<RenderWizard controller={controller} />);
+    await settle();
+
+    // 默认体积雾 + 雾密度可见；辉光区只在 enhanced 模式出现。
+    expect((getByTestId("render-lighting") as HTMLSelectElement).value).toBe("volume_fog");
+    expect(getByTestId("render-fog-density")).toBeTruthy();
+    expect(queryByTestId("render-glow-settings")).toBeNull();
+
+    fireEvent.change(getByTestId("render-mode"), { target: { value: "enhanced" } });
+    await settle();
+    expect(queryByTestId("render-glow-settings")).toBeTruthy();
+
+    // legacy 方案不需要雾密度：切过去后雾密度输入消失。
+    fireEvent.change(getByTestId("render-lighting"), { target: { value: "legacy" } });
+    await settle();
+    expect(queryByTestId("render-fog-density")).toBeNull();
+
+    fireEvent.change(getByTestId("render-lighting"), { target: { value: "volume_fog" } });
+    fireEvent.input(getByTestId("render-fog-density"), { target: { value: "0.03" } });
+    fireEvent.input(getByTestId("render-glow-threshold"), { target: { value: "0.6" } });
+    fireEvent.change(getByTestId("render-glow-quality"), { target: { value: "Low" } });
+    await settle();
+
+    fireEvent.click(getByTestId("render-start"));
+    await settle();
+    expect(endpoints.createJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model_id: "model-3f7a91c4d20b5e68",
+        mode: "enhanced",
+        lighting: "volume_fog",
+        fog_density: 0.03,
+        glow_threshold: 0.6,
+        glow_quality: "Low",
+      })
+    );
+  });
+
   it("等待确认状态：展示确认入口与材质表，不谎称完成", async () => {
     const waiting = (jobId: string) =>
       renderJobFixture({

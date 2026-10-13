@@ -23,13 +23,18 @@ v3 相对 v2 的变化：
       --allow-low-confidence               # 允许低置信度分类继续（默认不允许）
       --report-dir <目录>                  # 预检/台账落盘目录（默认 = --out）
       --mode faithful|enhanced
+      --lighting volume_fog|legacy         # 灯光配置，默认 volume_fog（7 灯体积雾方案）
+      --fog-density <f>                    # volume_fog 的雾密度，默认 0.018（范围 0.0–0.1）
       --resolve <源工程.blend> --script <主脚本.py>
       --scale 0.08 --min-polys 100 --auto-frame 0|1 --transparent 0|1 --hair-ref 0|1
       --glow-threshold <f> --glow-strength <f> --glow-size <f>
+      --glow-smoothness <f> --glow-quality High|Medium|Low   # 辉光微调（仅 enhanced 生效）
       --log <日志文件> --done <完成标记文件>
 
 关于辉光：源工程那套 Glare 参数在其工程里是被旁路的、从未生效，且 Blender 5.x 的
-Glare 节点已无 Mix 输入，照抄会明显过曝。用上面三个开关覆盖为实测可用的值。
+Glare 节点已无 Mix 输入，照抄会明显过曝。主脚本默认已换成 2026-10-11 辉光修复值
+（Bloom / High / 阈值 0.55 / 平滑度 0.35 / 强度 0.85 / 尺寸 0.62 / 最大值 8.0），
+上面五个开关可逐项覆盖；辉光只在 enhanced 模式下由脚本自动创建。
 
 关于 --maps-dir：侧车映射目录一律由外部贯穿（入口 → 确认服务 → 本驱动 → 主脚本）。
 默认值是**用户数据目录**（%LOCALAPPDATA%\\CartoonModelShader\\model_material_maps，
@@ -107,6 +112,11 @@ HAIR_REF = arg_flag("--hair-ref", True)
 GLOW_THRESHOLD = arg("--glow-threshold")
 GLOW_STRENGTH = arg("--glow-strength")
 GLOW_SIZE = arg("--glow-size")
+GLOW_SMOOTHNESS = arg("--glow-smoothness")
+GLOW_QUALITY = arg("--glow-quality")
+# 灯光配置（2026-10-11 体积雾灯光增量）：volume_fog=7 灯体积雾方案；legacy=旧版 21+6 灯。
+LIGHTING = (arg("--lighting", "volume_fog") or "volume_fog").strip().lower()
+FOG_DENSITY = float(arg("--fog-density", "0.018"))
 LOG_PATH = arg("--log", os.path.join(HERE, "一键渲染.stdout.log"))
 DONE = arg("--done", os.path.join(HERE, "一键渲染.done"))
 
@@ -131,6 +141,14 @@ if POLICY is None:
 POLICY = str(POLICY).strip().lower()
 if POLICY not in ("strict", "diagnostic"):
     raise SystemExit("--material-policy 只能是 strict 或 diagnostic，收到 %r" % POLICY)
+if LIGHTING not in ("volume_fog", "legacy"):
+    raise SystemExit("--lighting 必须是 volume_fog 或 legacy，收到 %r" % LIGHTING)
+if not (0.0 <= FOG_DENSITY <= 0.1):
+    raise SystemExit("--fog-density 必须在 0.0–0.1 之间，收到 %r" % FOG_DENSITY)
+if GLOW_QUALITY is not None:
+    GLOW_QUALITY = str(GLOW_QUALITY).strip().capitalize()
+    if GLOW_QUALITY not in ("High", "Medium", "Low"):
+        raise SystemExit("--glow-quality 必须是 High/Medium/Low，收到 %r" % GLOW_QUALITY)
 
 # ★ F6：侧车映射目录必须由外部贯穿进来，且**默认值不是仓库内的 model_material_maps/**。
 #   优先级：--maps-dir > TOON_MAPS_DIR > 用户数据目录（与预设存储同源）。
@@ -274,6 +292,7 @@ def main():
     log("blend    = %s" % BLEND)
     log("out      = %s" % OUT_DIR)
     log("mode     = %s" % MODE)
+    log("lighting = %s  fog_density=%s" % (LIGHTING, FOG_DENSITY))
     log("policy   = %s%s" % (POLICY, "（由已弃用的 --strict 映射而来）" if _deprecated else ""))
     if _deprecated:
         log("  ⚠ --strict 已弃用：请改用 --material-policy strict|diagnostic。"
@@ -361,6 +380,9 @@ def main():
     os.environ["TOON_MATERIAL_POLICY"] = POLICY
     os.environ["TOON_RULES"] = RULES_PATH
     os.environ["TOON_ALLOW_LOW_CONFIDENCE"] = "1" if ALLOW_LOW_CONF else "0"
+    # 灯光配置同样走环境变量（主脚本顶部读取，exec 前必须设好）。
+    os.environ["TOON_LIGHTING_PROFILE"] = LIGHTING
+    os.environ["TOON_FOG_DENSITY"] = str(FOG_DENSITY)
     # ★ F6：把映射目录贯穿到主脚本（它顶部读 TOON_MAPS_DIR），否则渲染侧只能去
     #        仓库内的 model_material_maps/ 找 —— 用户确认结果就永远到不了渲染侧。
     os.environ["TOON_MAPS_DIR"] = MAPS_DIR
@@ -392,14 +414,19 @@ def main():
         ns["GLOW"]["Strength"] = glow_over["Strength"] = float(GLOW_STRENGTH)
     if GLOW_SIZE is not None:
         ns["GLOW"]["Size"] = glow_over["Size"] = float(GLOW_SIZE)
+    if GLOW_SMOOTHNESS is not None:
+        ns["GLOW"]["Smoothness"] = glow_over["Smoothness"] = float(GLOW_SMOOTHNESS)
+    if GLOW_QUALITY is not None:
+        ns["GLOW"]["Quality"] = glow_over["Quality"] = GLOW_QUALITY
     ns["GLOW_OVERRIDE"] = glow_over
     ns["EXTRA_INPUTS"] = (
         ([("blend", BLEND)] if BLEND else [("pmx", PMX)]) +
         [("driver", os.path.abspath(__file__)), ("main_script", SCRIPT),
          ("rules", RULES_PATH)])
 
-    log("config: PIPELINE_MODE=%s POLICY=%s AUTO_FRAME=%s FILM_TRANSPARENT=%s HAIRREF=%s"
-        % (MODE, POLICY, AUTO_FRAME, TRANSPARENT, HAIR_REF))
+    log("config: PIPELINE_MODE=%s POLICY=%s LIGHTING=%s AUTO_FRAME=%s "
+        "FILM_TRANSPARENT=%s HAIRREF=%s"
+        % (MODE, POLICY, LIGHTING, AUTO_FRAME, TRANSPARENT, HAIR_REF))
 
     log("=== run one-click pipeline ===")
     ns["main"]()

@@ -29,6 +29,7 @@ FAKE_OK = Path(__file__).resolve().parent / "fake_render_ok.py"
 FAKE_NO_OUTPUT = Path(__file__).resolve().parent / "fake_render_no_output.py"
 FAKE_FAILED_TOKEN = Path(__file__).resolve().parent / "fake_render_failed_token.py"
 FAKE_SLOW = Path(__file__).resolve().parent / "fake_render_slow.py"
+FAKE_ARGV = Path(__file__).resolve().parent / "fake_render_argv.py"
 
 
 # -- 状态机 ---------------------------------------------------------------
@@ -114,7 +115,58 @@ def test_validate_settings_ok() -> None:
     assert validate_settings({"mode": "enhanced", "auto_frame": True}) == {
         "mode": "enhanced",
         "auto_frame": True,
+        "lighting": "volume_fog",
+        "fog_density": 0.018,
     }
+
+
+def test_validate_settings_lighting_and_glow_ok() -> None:
+    """2026-10-11 体积雾灯光与辉光增量：合法值原样通过（辉光项可缺省）。"""
+    assert validate_settings({
+        "mode": "enhanced",
+        "lighting": "legacy",
+        "fog_density": 0.05,
+        "glow_threshold": 0.6,
+        "glow_strength": 0.9,
+        "glow_size": 0.7,
+        "glow_smoothness": 0.4,
+        "glow_quality": "Low",
+    }) == {
+        "mode": "enhanced",
+        "auto_frame": False,
+        "lighting": "legacy",
+        "fog_density": 0.05,
+        "glow_threshold": 0.6,
+        "glow_strength": 0.9,
+        "glow_size": 0.7,
+        "glow_smoothness": 0.4,
+        "glow_quality": "Low",
+    }
+
+
+def test_validate_settings_rejects_bad_lighting() -> None:
+    with pytest.raises(errors.ToonTunerError) as excinfo:
+        validate_settings({"lighting": "neon"})
+    assert excinfo.value.code == errors.PARAM_INVALID
+
+
+def test_validate_settings_rejects_fog_density_out_of_range() -> None:
+    for bad in (-0.01, 0.11):
+        with pytest.raises(errors.ToonTunerError) as excinfo:
+            validate_settings({"fog_density": bad})
+        assert excinfo.value.code == errors.PARAM_INVALID
+
+
+def test_validate_settings_rejects_bad_glow_quality() -> None:
+    with pytest.raises(errors.ToonTunerError) as excinfo:
+        validate_settings({"glow_quality": "Ultra"})
+    assert excinfo.value.code == errors.PARAM_INVALID
+
+
+def test_validate_settings_rejects_non_numeric_glow() -> None:
+    with pytest.raises(errors.ToonTunerError) as excinfo:
+        validate_settings({"glow_threshold": "bright"})
+    assert excinfo.value.code == errors.PARAM_INVALID
 
 
 # -- 适配器：调用固定脚本 -------------------------------------------------
@@ -152,6 +204,39 @@ def test_adapter_success_when_artifacts_present(tmp_path: Path) -> None:
     assert final is not None
     assert final.state == "success"
     assert final.list_artifacts(), "应至少产出一个产物文件"
+
+
+def test_adapter_passes_lighting_and_glow_flags(tmp_path: Path) -> None:
+    """体积雾灯光与辉光增量：适配器必须把设置透传成固定脚本的命令行开关。"""
+    import asyncio
+    import json
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    manager, service, registry = _make_service(tmp_path, FAKE_ARGV, model_dir)
+    model_id = registry.to_public()[0]["model_id"]
+
+    job, created = service.create_job(model_id, {
+        "mode": "enhanced",
+        "lighting": "legacy",
+        "fog_density": 0.05,
+        "glow_threshold": 0.6,
+        "glow_quality": "Low",
+    })
+    assert created is True
+    asyncio.run(service.start(job.job_id))
+
+    final = manager.get(job.job_id)
+    assert final is not None
+    assert final.state == "success"
+    argv = json.loads((Path(final.output_dir) / "argv.json").read_text(encoding="utf-8"))
+    assert argv["lighting"] == "legacy"
+    assert argv["fog_density"] == 0.05
+    assert argv["glow_threshold"] == 0.6
+    assert argv["glow_quality"] == "Low"
+    # 未设置的辉光项不传（None），让主脚本用默认修复值。
+    assert argv["glow_strength"] is None
+    assert argv["glow_size"] is None
 
 
 def test_adapter_zero_exit_without_artifacts_is_failure(tmp_path: Path) -> None:
