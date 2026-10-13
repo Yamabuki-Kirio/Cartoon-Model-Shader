@@ -290,8 +290,9 @@ class RenderPipelineService:
                 details={"holder": exc.holder},
             )
         self._holders[job_id] = holder
-        # 为本次渲染建立进程树治理：Windows 下创建 Job Object 并绑定该任务，
-        # 之后入口脚本与其经 MCP 派发的真实 Blender 都会落在同一个 Job 内。
+        # 为本次渲染建立进程树治理：Windows 下创建 Job Object 并绑定该任务。
+        # 入口脚本会被 assign 进 Job；但真实 Blender 由**常驻 Blender 进程**经 MCP 拉起，
+        # 不是入口子进程，必须在解析到 @@BLENDER_PID@@ 后**显式 assign** 才能纳入。
         job_object = None
         if self._proc_registry is not None:
             try:
@@ -304,14 +305,17 @@ class RenderPipelineService:
         try:
             await self._run_fixed_script(job, fp, job.output_dir)
         finally:
-            # 正常结束后回收 Job（Job 内进程已自行退出，close 仅释放句柄）。
-            if self._proc_registry is not None:
-                self._proc_registry.release_job_object(job_id)
+            # 回收 Job（Job 内进程已自行退出，close 仅释放句柄）。
             if job_object is not None:
                 try:
                     job_object.close()
                 except Exception:  # noqa: BLE001
                     pass
+            # **清除该任务全部 PID 记录**（入口 + Blender + 确认服务）。必须在 Job 关闭
+            # 与进程回收之后：否则重试后可能对**已被系统复用**的旧 PID 再次 taskkill，
+            # 误杀无关进程。
+            if self._proc_registry is not None:
+                self._proc_registry.unregister_job(job_id)
             try:
                 holder.release()
             except Exception:

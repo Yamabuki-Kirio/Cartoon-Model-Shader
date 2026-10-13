@@ -439,17 +439,19 @@ def test_cancel_terminates_process_tree(tmp_path: Path) -> None:
     assert app.state.proc_registry.for_job(job_id) == []
 
 
-def test_pid_contract_registers_real_blender(tmp_path: Path) -> None:
+def test_pid_contract_registers_real_blender(tmp_path: Path, monkeypatch) -> None:
     """真实固定脚本契约：入口脚本 stdout 上报的 @@BLENDER_PID@@ 必须被登记。
 
     走完整适配器路径（真的起子进程 + 真的解析 stdout），不手工调用 _observe_line。
     """
     import asyncio
-    import sys
 
     from src.server.models_scan import ModelRegistry
     from src.server.render_pipeline_adapter import RenderPipelineService
     from src.server.proc_cleanup import ProcessRegistry, _pid_alive
+
+    # 让替身挂住，使「取消」发生在渲染途中。
+    monkeypatch.setenv("TOON_FAKE_HOLD", "30")
 
     contract = Path(__file__).resolve().parent / "fake_render_pid_contract.py"
     model_dir = tmp_path / "models"
@@ -570,3 +572,108 @@ def test_evictions_prioritize_but_respect_thresholds(tmp_path: Path) -> None:
     tight = RetentionPolicy(max_jobs=1, max_age_days=3650, max_total_gb=1000)
     evict = choose_evictions(manager.list_jobs(), tight)
     assert evict == ["c1", "f1"], f"取消/失败应优先且顺序正确，实际 {evict}"
+
+
+# -- P1：PID 复用安全（终态清除记录） -------------------------------------
+
+
+def test_registry_unregister_job_clears_all_pids(tmp_path: Path) -> None:
+    """unregister_job 必须清除该任务全部 PID（入口 + Blender + 确认服务）。"""
+    from src.server.proc_cleanup import ProcessRegistry
+
+    registry = ProcessRegistry()
+    registry.register(1001, job_id="j1", exe="python", kind="entry")
+    registry.register(1002, job_id="j1", exe="blender", kind="blender")
+    registry.register(1003, job_id="j1", exe="python", kind="confirm")
+    registry.register(2001, job_id="j2", exe="python", kind="entry")
+
+    removed = registry.unregister_job("j1")
+    assert set(removed) == {1001, 1002, 1003}
+    assert registry.for_job("j1") == []
+    # 其他任务不受影响
+    assert [r.pid for r in registry.for_job("j2")] == [2001]
+
+
+def test_completed_job_leaves_no_stale_pids(tmp_path: Path) -> None:
+    """任务成功跑完后，注册表不得残留该任务的任何 PID（防止重试时误杀）。"""
+    from src.server.models_scan import ModelRegistry
+    from src.server.render_pipeline_adapter import RenderPipelineService
+    from src.server.proc_cleanup import ProcessRegistry
+
+    contract = Path(__file__).resolve().parent / "fake_render_pid_contract.py"
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "m.pmx").write_bytes(b"model")
+    registry = ModelRegistry(model_dir, tmp_path / ".reg.json")
+    registry.scan()
+    manager = RenderJobManager(tmp_path / "out")
+    proc_registry = ProcessRegistry()
+    service = RenderPipelineService(
+        manager,
+        registry,
+        fixed_render_script=contract,
+        model_root=model_dir,
+        runtime_dir=tmp_path / "runtime",
+        output_root=tmp_path / "out",
+        proc_registry=proc_registry,
+    )
+    model_id = registry.to_public()[0]["model_id"]
+    job, _ = service.create_job(model_id, {"mode": "faithful"})
+
+    import asyncio
+
+    async def scenario():
+        await service.start_worker()
+        service.enqueue(job.job_id)
+        # 等任务终态
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not manager.get(job.job_id).is_terminal:
+            await asyncio.sleep(0.05)
+        # 终态在 _finalize 里到达，而 PID 清理由 start() 的 finally 执行 —— 轮询等它收尾。
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and proc_registry.for_job(job.job_id):
+            await asyncio.sleep(0.05)
+        assert proc_registry.for_job(job.job_id) == [], "完成后不得残留 PID 记录"
+        await service.stop_worker()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_after_stale_pid_reuse_does_not_kill_completed(tmp_path: Path) -> None:
+    """模拟旧 PID 被系统复用：已完成任务遗留的记录不得再被取消流程处理。"""
+    import subprocess
+    import sys
+
+    from src.server.proc_cleanup import ProcessRegistry, terminate_job_processes
+
+    registry = ProcessRegistry()
+    # 任务 A 已完成并清空记录
+    registry.register(1111, job_id="done-job", exe="blender", kind="blender")
+    registry.unregister_job("done-job")
+
+    # 起一个**无关**进程，模拟「系统把 1111 复用给了别的进程」
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        # done-job 已无记录 ⇒ 取消它不得触碰任何进程
+        unresolved = terminate_job_processes(registry, "done-job", grace_seconds=0.5)
+        assert unresolved == []
+        assert bystander.poll() is None, "已完成任务的取消不得误杀无关进程"
+    finally:
+        bystander.terminate()
+
+
+def test_cancel_active_pid_still_terminates_and_clears(tmp_path: Path) -> None:
+    """取消中的活动 PID 仍能被终止并清除记录。"""
+    import subprocess
+    import sys
+
+    from src.server.proc_cleanup import ProcessRegistry, terminate_job_processes
+
+    registry = ProcessRegistry()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    registry.register(child.pid, job_id="live-job", exe="blender", kind="blender")
+
+    unresolved = terminate_job_processes(registry, "live-job", grace_seconds=5.0)
+    assert unresolved == []
+    assert child.poll() is not None, "活动进程必须被终止"
+    assert registry.for_job("live-job") == [], "终止后记录必须被清除"

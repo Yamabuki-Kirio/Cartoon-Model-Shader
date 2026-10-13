@@ -44,8 +44,13 @@ class ProcessRegistry:
     """内存中的进程登记表（服务生命周期内有效）。
 
     每个任务可绑定一个 Windows Job Object（``KILL_ON_JOB_CLOSE``）：登记入口脚本
-    PID 后 assign 进 Job，Job 关闭即终止该任务**整棵进程树**。真实 Blender 由入口脚本
-    经 MCP 派发，是入口的子进程，因此同样落在 Job 内。
+    PID 后 assign 进 Job，Job 关闭即终止该任务**整棵进程树**。
+
+    ⚠ 真实 Blender **不是**入口脚本的子进程 —— 它由**常驻 Blender 进程**经 MCP 执行
+    ``Popen`` 拉起。因此它不会自动落进入口进程的 Job Object：必须先从入口脚本 stdout
+    的 ``@@BLENDER_PID@@{"pid": N}`` 取得真实 PID，再 ``assign`` 显式纳入；
+    assign 失败（``assigned=False``）时取消须走 PID/treekill 兜底。
+    **请勿删除这段显式 PID 接线**。
     """
 
     records: dict[int, ProcRecord] = field(default_factory=dict)
@@ -96,6 +101,18 @@ class ProcessRegistry:
 
     def unregister(self, pid: int) -> None:
         self.records.pop(pid, None)
+
+    def unregister_job(self, job_id: str) -> list[int]:
+        """清除该任务**全部**进程记录（入口 + Blender + 确认服务），返回被清除的 PID。
+
+        必须在确认 Job Object 已关闭且进程已回收之后调用：否则残留的 PID 记录会在
+        重试后被再次 ``taskkill`` —— 若 Windows 已复用该 PID，可能误杀无关进程。
+        """
+        removed = [pid for pid, rec in self.records.items() if rec.job_id == job_id]
+        for pid in removed:
+            self.records.pop(pid, None)
+        self.release_job_object(job_id)
+        return removed
 
     def for_job(self, job_id: str) -> list[ProcRecord]:
         return [r for r in self.records.values() if r.job_id == job_id]
