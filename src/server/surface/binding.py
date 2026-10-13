@@ -130,13 +130,28 @@ BINDING_WHITELIST: dict[str, frozenset[str]] = {
             "cel_override",
         }
     ),
+    #: 材质图（Material Graph，PR #7 提交 3）：材质节点树内的**任意已确认**输入插座。
+    #:
+    #: ``object_id`` 形如 ``材质名/节点名/插座名`` —— 三段**全部由服务端探测结果拼出**
+    #: （``material_graph/schema.py``），客户端永远不能提交节点路径或插座名。
+    #: 只写 ``default_value``，且写入前由 Blender 侧拒绝已连线插座。
+    "MATERIAL_GRAPH_SOCKET": frozenset({"default_value"}),
+    #: 材质节点树内的 ColorRamp（同一材质图竖切）。``object_id`` = ``材质名/节点名``。
+    #: 色标数量属结构信息（只读）；本执行器只做整体替换、绝不增删色标。
+    "MATERIAL_GRAPH_RAMP": frozenset({"elements", "interpolation"}),
     "IMAGE": frozenset({"colorspace_settings.name"}),
     "ASSET": frozenset({"id"}),
 }
 
 #: 只读字段：允许出现在 schema 里（用于展示与结构判定），但不接受写入。
 READONLY_FIELDS: frozenset[str] = frozenset(
-    {"SCENE.frame_current", "NODE_GROUP.topology", "COLOR_RAMP.element_count"}
+    {
+        "SCENE.frame_current",
+        "NODE_GROUP.topology",
+        "COLOR_RAMP.element_count",
+        # 材质图色带的色标数量同样属结构信息（增删色标属结构改动）。
+        "MATERIAL_GRAPH_RAMP.element_count",
+    }
 )
 
 

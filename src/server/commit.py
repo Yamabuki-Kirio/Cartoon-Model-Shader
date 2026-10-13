@@ -101,6 +101,28 @@ def draft_fingerprint(coerced: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def composite_draft_fingerprint(
+    coerced: dict[str, Any],
+    surface_values: dict[str, Any] | None,
+    material_values: dict[str, Any] | None,
+) -> str:
+    """把 L0 / Cel / 材质图三份草稿合成**一份**指纹。
+
+    三者合成同一把指纹（而不是各自一把）是有意的：规格要求「保存确认令牌必须绑定
+    完整 L0 草稿 + 完整 Cel 草稿 + Material Graph 草稿 + 结构哈希」。合成一把之后，
+    任何一份草稿在 prepare 与 commit 之间被改动都会让指纹对不上，令牌立即作废 ——
+    这正是「用户确认过的那份草稿」与「实际落盘的内容」必须同一份的含义。
+    """
+    if surface_values is None and material_values is None:
+        return draft_fingerprint(coerced)
+    payload: dict[str, Any] = {"l0": coerced}
+    if surface_values is not None:
+        payload["surface"] = surface_values
+    if material_values is not None:
+        payload["material_graph"] = material_values
+    return draft_fingerprint(payload)
+
+
 @dataclass
 class CommitTicket:
     """一次性的保存确认票据。"""
@@ -120,6 +142,10 @@ class CommitTicket:
     surface_bound: bool = False
     #: v4：签发时的结构指纹。结构一变，令牌立即失效。
     structure_hash: str | None = None
+    #: 材质图（PR #7）：令牌是否绑定了材质图草稿。
+    material_bound: bool = False
+    #: 材质图结构指纹（与 Cel 的结构指纹相互独立）。
+    material_structure_hash: str | None = None
 
     @property
     def expired(self) -> bool:
@@ -161,6 +187,9 @@ class SaveConfirmation:
     issued_at: float
     expires_at: float
     used: bool = False
+    #: 材质图（PR #7）：确认上下文同样绑定材质图草稿与其结构指纹。
+    material_bound: bool = False
+    material_structure_hash: str | None = None
 
     @property
     def expired(self) -> bool:
@@ -187,12 +216,19 @@ class CommitService:
         surface_draft: Any = None,
         structure_hash: Any = None,
         confirmation_id: Any = None,
+        material_draft: Any = None,
+        confirmed_shared_groups: Any = None,
+        expected_material_structure_hash: Any = None,
     ) -> dict[str, Any]:
         """准备保存。
 
         带 ``confirmation_id`` = **第二段**（用户看过路径后点确认）：服务端沿用第一次
         冻结的备份路径签发令牌，并复核基线 / 草稿 / 模式 / 目标都没变。
         不带 = **第一段**：创建确认上下文；需要覆盖时只展示路径、不签发令牌。
+
+        ``material_draft``（PR #7）与 Cel 草稿走**同一条绑定路径**：编译成参数值
+        映射后并入同一把草稿指纹，因此「用户确认过的那份草稿」与实际落盘内容
+        必然是同一份。没带材质草稿时这条新路径完全不参与，旧客户端行为不变。
         """
         if confirmation_id is not None and str(confirmation_id).strip():
             return await self._prepare_confirmed(
@@ -202,6 +238,9 @@ class CommitService:
                 target_path=target_path,
                 surface_draft=surface_draft,
                 structure_hash=structure_hash,
+                material_draft=material_draft,
+                confirmed_shared_groups=confirmed_shared_groups,
+                expected_material_structure_hash=expected_material_structure_hash,
             )
         return await self._prepare_first(
             mode=mode,
@@ -210,6 +249,9 @@ class CommitService:
             confirm=confirm,
             surface_draft=surface_draft,
             structure_hash=structure_hash,
+            material_draft=material_draft,
+            confirmed_shared_groups=confirmed_shared_groups,
+            expected_material_structure_hash=expected_material_structure_hash,
         )
 
     async def _prepare_first(
@@ -221,6 +263,9 @@ class CommitService:
         confirm: bool,
         surface_draft: Any,
         structure_hash: Any,
+        material_draft: Any = None,
+        confirmed_shared_groups: Any = None,
+        expected_material_structure_hash: Any = None,
     ) -> dict[str, Any]:
         normalised_mode = self._normalise_mode(mode)
         baseline = self._require_baseline()
@@ -241,6 +286,21 @@ class CommitService:
             surface_plan = self._surface().plan(surface_draft or {})
             surface_values = param_values(surface_plan)
 
+        # 材质图（PR #7）：与 Cel 同一套绑定纪律。没带材质草稿时完全不参与。
+        material_plan: list[Any] | None = None
+        material_values: dict[str, Any] | None = None
+        token_material_structure: str | None = None
+        if material_draft:
+            token_material_structure = self._require_material_structure_match(
+                expected_material_structure_hash
+            )
+            material_plan = self._material_plan(
+                material_draft,
+                confirmed_shared=confirmed_shared_groups,
+                expected_hash=token_material_structure,
+            )
+            material_values = param_values(material_plan)
+
         target, warnings, needs_backup = await self._resolve_target(
             normalised_mode, target_path
         )
@@ -248,11 +308,7 @@ class CommitService:
         #   预计路径，也用于绑进票据。两处各算一次的话，跨过整秒边界就会得到两个名字，
         #   「用户看到的位置」与「实际会写的位置」立刻就对不上了。
         planned_backup = project_ops.backup_path_for(target) if needs_backup else None
-        draft_hash = (
-            draft_fingerprint(coerced)
-            if surface_values is None
-            else draft_fingerprint({"l0": coerced, "surface": surface_values})
-        )
+        draft_hash = composite_draft_fingerprint(coerced, surface_values, material_values)
 
         # 冻结确认上下文：备份路径**就在这一刻定死**，第二次确认只能沿用这一条。
         confirmation = self._open_confirmation(
@@ -265,6 +321,8 @@ class CommitService:
             warnings=warnings,
             surface_bound=surface_values is not None,
             structure_hash=token_structure,
+            material_bound=material_values is not None,
+            material_structure_hash=token_material_structure,
         )
 
         # 覆盖（含「另存为」落到已存在文件）必须二次确认：第一次调用只把
@@ -295,6 +353,8 @@ class CommitService:
             warnings=warnings,
             surface_bound=surface_values is not None,
             structure_hash=token_structure,
+            material_bound=material_values is not None,
+            material_structure_hash=token_material_structure,
         )
         payload = dict(ticket.to_public())
         payload.update(
@@ -303,6 +363,7 @@ class CommitService:
                 "baseline_id": baseline.baseline_id,
                 "parameter_count": len(effective),
                 "surface_parameter_count": len(surface_values or {}),
+                "material_graph_parameter_count": len(material_values or {}),
                 "normalized": notes,
                 "draft_hash": ticket.draft_hash,
                 "confirmation_id": confirmation.confirmation_id,
@@ -319,6 +380,9 @@ class CommitService:
         target_path: Any,
         surface_draft: Any,
         structure_hash: Any,
+        material_draft: Any = None,
+        confirmed_shared_groups: Any = None,
+        expected_material_structure_hash: Any = None,
     ) -> dict[str, Any]:
         """第二段：用户看过路径后确认。**沿用第一次冻结的备份路径**签发令牌。"""
         confirmation = self._load_confirmation(confirmation_id)
@@ -352,10 +416,28 @@ class CommitService:
                 "准备阶段绑定了参数面草稿，确认时必须原样带上。请重新准备。",
             )
 
-        draft_hash = (
-            draft_fingerprint(coerced)
-            if surface_values is None
-            else draft_fingerprint({"l0": coerced, "surface": surface_values})
+        # 材质图（PR #7）：与 Cel 同一套绑定纪律。没带材质草稿时完全不参与。
+        material_plan: list[Any] | None = None
+        material_values: dict[str, Any] | None = None
+        token_material_structure: str | None = None
+        if material_draft:
+            token_material_structure = self._require_material_structure_match(
+                expected_material_structure_hash
+            )
+            material_plan = self._material_plan(
+                material_draft,
+                confirmed_shared=confirmed_shared_groups,
+                expected_hash=token_material_structure,
+            )
+            material_values = param_values(material_plan)
+        elif confirmation.material_bound:
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_MISMATCH,
+                "准备阶段绑定了材质图草稿，确认时必须原样带上。请重新准备。",
+            )
+
+        draft_hash = composite_draft_fingerprint(
+            coerced, surface_values, material_values
         )
         if not hmac.compare_digest(draft_hash, confirmation.draft_hash):
             raise errors.ToonTunerError(
@@ -371,6 +453,18 @@ class CommitService:
             raise errors.ToonTunerError(
                 errors.COMMIT_TOKEN_MISMATCH,
                 "结构指纹与准备阶段不一致。请刷新基线后重新准备。",
+            )
+        if (material_values is not None) != confirmation.material_bound:
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_MISMATCH,
+                "材质图草稿的绑定情况与准备阶段不一致。请重新准备。",
+            )
+        if (token_material_structure or None) != (
+            confirmation.material_structure_hash or None
+        ):
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_MISMATCH,
+                "材质图结构指纹与准备阶段不一致。请刷新基线后重新准备。",
             )
         if normalised_mode != confirmation.mode:
             raise errors.ToonTunerError(
@@ -416,6 +510,8 @@ class CommitService:
             warnings=confirmation.warnings,
             surface_bound=confirmation.surface_bound,
             structure_hash=confirmation.structure_hash,
+            material_bound=confirmation.material_bound,
+            material_structure_hash=confirmation.material_structure_hash,
         )
         payload = dict(ticket.to_public())
         payload.update(
@@ -424,6 +520,7 @@ class CommitService:
                 "baseline_id": baseline.baseline_id,
                 "parameter_count": len(effective),
                 "surface_parameter_count": len(surface_values or {}),
+                "material_graph_parameter_count": len(material_values or {}),
                 "normalized": notes,
                 "draft_hash": ticket.draft_hash,
                 "confirmation_id": confirmation.confirmation_id,
@@ -444,6 +541,8 @@ class CommitService:
         warnings: list[str],
         surface_bound: bool,
         structure_hash: str | None,
+        material_bound: bool = False,
+        material_structure_hash: str | None = None,
     ) -> SaveConfirmation:
         now = time.monotonic()
         confirmation = SaveConfirmation(
@@ -457,6 +556,8 @@ class CommitService:
             warnings=list(warnings),
             surface_bound=surface_bound,
             structure_hash=structure_hash,
+            material_bound=material_bound,
+            material_structure_hash=material_structure_hash,
             issued_at=now,
             expires_at=now + CONFIRMATION_TTL_SECONDS,
         )
@@ -495,6 +596,31 @@ class CommitService:
     def _surface(self):
         return self._preview.surface
 
+    def _material_graph(self):
+        """材质图参数面（PR #7）。与 ``_surface`` 平行且独立。"""
+        return self._preview.material_graph
+
+    def _material_plan(
+        self,
+        material_draft: Any,
+        *,
+        confirmed_shared: Any = None,
+        expected_hash: Any = None,
+    ) -> list[Any]:
+        """编译材质图草稿。
+
+        **只有真的带了材质参数才会要求材质图基线存在** —— 没提交材质参数就不牵连
+        这条新路径，旧客户端行为完全不变。共享组确认名单与草稿**分开**传，绝不
+        混进草稿字典（否则会被当成参数 id）。
+        """
+        if not material_draft:
+            return []
+        return self._material_graph().plan(
+            material_draft,
+            expected_structure_hash=expected_hash,
+            confirmed_shared=[str(item) for item in (confirmed_shared or [])],
+        )
+
     def _require_structure_match(self, provided: Any) -> str:
         """v4 结构指纹对账（**本地比较**，不调 Blender）。
 
@@ -514,6 +640,52 @@ class CommitService:
                 details={"expected": str(provided), "current": current.structure_hash},
             )
         return current.structure_hash
+
+    def _require_material_structure_match(self, provided: Any) -> str:
+        """材质图结构指纹对账（**本地比较**，不调 Blender）。
+
+        与 ``_require_structure_match`` 同一条纪律，但**指纹相互独立**：Cel 的结构
+        变了不代表材质节点图变了，反之亦然。分开才能给出准确的失败原因。
+        """
+        current = self._material_graph().baseline
+        if current is None:
+            raise errors.ToonTunerError(
+                errors.NO_BASELINE,
+                "尚未建立材质图基线，无法绑定材质图结构指纹。请先建立基线。",
+            )
+        if provided and str(provided) != current.structure_hash:
+            raise errors.ToonTunerError(
+                errors.STRUCTURE_CHANGED,
+                "客户端持有的材质图结构指纹与当前基线不一致：材质节点图已变化，请刷新基线。",
+                details={
+                    "expected": str(provided),
+                    "current": current.structure_hash,
+                },
+            )
+        return current.structure_hash
+
+    async def _assert_material_graph_fresh(self) -> dict[str, Any]:
+        """写入之前的材质图结构闸门：用只读探针实测一次。
+
+        与 ``_assert_surface_fresh`` 同一条纪律。材质图结构哈希同样**只含结构**
+        （节点增删 / 连线 / 色标数量 / 节点组接口），不含数值，因此用户在
+        Blender 里调一个滑块不会把草稿作废。
+        """
+        verdict = await self._preview.check_material_graph_structure()
+        if verdict.get("identity_missing"):
+            raise errors.ToonTunerError(
+                errors.IDENTITY_MISSING,
+                "受管材质被重命名或删除："
+                + "、".join(verdict["identity_missing"][:4]),
+                details={"identity_missing": verdict["identity_missing"]},
+            )
+        if verdict.get("structure_changed"):
+            raise errors.ToonTunerError(
+                errors.STRUCTURE_CHANGED,
+                "材质节点图结构已变化：草稿与保存确认令牌已作废，请刷新基线后再继续。",
+                details={"structure_changed": verdict["structure_changed"]},
+            )
+        return verdict
 
     async def _assert_surface_fresh(self) -> dict[str, Any]:
         """写入之前的 v4 结构闸门：用只读探针实测一次，绝不只信本地指纹。"""
@@ -611,6 +783,8 @@ class CommitService:
         warnings: list[str],
         surface_bound: bool = False,
         structure_hash: str | None = None,
+        material_bound: bool = False,
+        material_structure_hash: str | None = None,
     ) -> CommitTicket:
         now = time.monotonic()
         ticket = CommitTicket(
@@ -628,6 +802,8 @@ class CommitService:
             warnings=list(warnings),
             surface_bound=surface_bound,
             structure_hash=structure_hash,
+            material_bound=material_bound,
+            material_structure_hash=material_structure_hash,
         )
         self._tickets[ticket.token] = ticket
         self._trim()
@@ -651,6 +827,8 @@ class CommitService:
         target_path: Any = None,
         surface_draft: Any = None,
         structure_hash: Any = None,
+        material_draft: Any = None,
+        confirmed_shared_groups: Any = None,
     ) -> CommitTicket:
         """校验并**消费**令牌（一次性：校验通过即刻作废，防止重复落盘）。"""
         if not isinstance(token, str) or not token:
@@ -711,11 +889,27 @@ class CommitService:
         else:
             current_surface = None
 
+        # 材质图（PR #7）：与 Cel 同一套绑定纪律 —— 准备阶段绑了就必须原样带上。
+        if ticket.material_bound:
+            self._require_material_structure_match(ticket.material_structure_hash)
+            current_material: dict[str, Any] | None = param_values(
+                self._material_plan(
+                    material_draft or {},
+                    confirmed_shared=confirmed_shared_groups,
+                    expected_hash=ticket.material_structure_hash,
+                )
+            )
+        elif material_draft:
+            raise errors.ToonTunerError(
+                errors.COMMIT_TOKEN_MISMATCH,
+                "准备阶段未绑定材质图草稿，提交时却带了 material_draft。请重新准备。",
+            )
+        else:
+            current_material = None
+
         coerced = validate_draft(draft, baseline)
-        expected_hash = (
-            draft_fingerprint(coerced)
-            if current_surface is None
-            else draft_fingerprint({"l0": coerced, "surface": current_surface})
+        expected_hash = composite_draft_fingerprint(
+            coerced, current_surface, current_material
         )
         if not hmac.compare_digest(expected_hash, ticket.draft_hash):
             raise errors.ToonTunerError(
@@ -742,7 +936,9 @@ class CommitService:
 
     # -- 失败处理 ---------------------------------------------------------
     async def _rollback_to_baseline(
-        self, surface_ops: list[Any] | None = None
+        self,
+        surface_ops: list[Any] | None = None,
+        material_ops: list[Any] | None = None,
     ) -> dict[str, Any]:
         """把 Blender 恢复到提交前的基线取值，并**回读校验**（L0 与 Cel 两部分分开报）。
 
@@ -754,17 +950,73 @@ class CommitService:
         """
         l0 = await self._restore_l0()
         cel = await self._restore_cel(surface_ops)
-        verified = bool(l0["verified"]) and bool(cel["verified"])
+        material = await self._restore_material_graph(material_ops)
+        verified = (
+            bool(l0["verified"]) and bool(cel["verified"]) and bool(material["verified"])
+        )
         return {
-            "attempted": bool(l0["attempted"] or cel["attempted"]),
+            "attempted": bool(
+                l0["attempted"] or cel["attempted"] or material["attempted"]
+            ),
             "verified": verified,
-            "mismatches": list(l0["mismatches"]) + list(cel["mismatches"]),
+            "mismatches": (
+                list(l0["mismatches"])
+                + list(cel["mismatches"])
+                + list(material["mismatches"])
+            ),
             "code": None if verified else errors.ROLLBACK_FAILED,
-            "error": l0.get("error") or cel.get("error"),
-            "reason": l0.get("reason") or cel.get("reason"),
+            "error": l0.get("error") or cel.get("error") or material.get("error"),
+            "reason": l0.get("reason") or cel.get("reason") or material.get("reason"),
             "l0": l0,
             "cel": cel,
+            "material_graph": material,
         }
+
+    async def _restore_material_graph(
+        self, material_ops: list[Any] | None = None
+    ) -> dict[str, Any]:
+        """恢复材质图基线并回读校验（PR #7）。
+
+        与 ``_restore_cel`` 同一条纪律，独立成块：材质图写入失败时必须能说清
+        「Cel 恢复了、材质图没有」，而不是笼统一句「回滚失败」。
+        """
+        out: dict[str, Any] = {
+            "attempted": False,
+            "verified": False,
+            "mismatches": [],
+            "code": None,
+            "error": None,
+            "reason": None,
+        }
+        baseline = self._material_graph().baseline
+        if baseline is None or not baseline.baseline_ops:
+            out["verified"] = True
+            out["reason"] = "该任务没有材质图写入，无需恢复。"
+            return out
+        out["attempted"] = True
+        try:
+            payload = await self._call(
+                self._binder.apply_surface_ops, list(baseline.baseline_ops)
+            )
+        except errors.ToonTunerError as exc:
+            out["code"] = errors.ROLLBACK_FAILED
+            out["error"] = exc.to_payload()["error"]
+            return out
+        except Exception as exc:  # noqa: BLE001 - 回滚自身不得再抛
+            out["code"] = errors.ROLLBACK_FAILED
+            out["error"] = {
+                "code": errors.INTERNAL_ERROR,
+                "message": f"{type(exc).__name__}: {exc}",
+            }
+            return out
+        verified, mismatches = verify_ops(
+            list(baseline.baseline_ops), payload.get("values") or {}
+        )
+        out["verified"] = verified
+        out["mismatches"] = mismatches
+        if not verified:
+            out["code"] = errors.ROLLBACK_FAILED
+        return out
 
     async def _restore_l0(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -885,6 +1137,7 @@ class CommitService:
         notes: list[dict[str, Any]] | None = None,
         scene_touched: bool = True,
         surface_ops: list[Any] | None = None,
+        material_ops: list[Any] | None = None,
     ) -> errors.ToonTunerError:
         """构造失败响应：尝试回滚（仅当草稿确实写进过场景），并把四态 + 回滚结果带上。
 
@@ -892,9 +1145,7 @@ class CommitService:
         这样「一定会抛」在调用点可见，也便于把内层错误的 details 合并进来。
         """
         if scene_touched:
-            rollback = await self._rollback_to_baseline(surface_ops)
-        if scene_touched:
-            rollback = await self._rollback_to_baseline(surface_ops)
+            rollback = await self._rollback_to_baseline(surface_ops, material_ops)
             suffix = self._rollback_suffix(rollback)
         else:
             rollback = {
@@ -913,6 +1164,14 @@ class CommitService:
                     "reason": "尚未写入场景，无需回滚。",
                 },
                 "cel": {
+                    "attempted": False,
+                    "verified": False,
+                    "mismatches": [],
+                    "code": None,
+                    "error": None,
+                    "reason": "尚未写入场景，无需回滚。",
+                },
+                "material_graph": {
                     "attempted": False,
                     "verified": False,
                     "mismatches": [],
@@ -941,6 +1200,9 @@ class CommitService:
         target_path: Any = None,
         surface_draft: Any = None,
         structure_hash: Any = None,
+        material_draft: Any = None,
+        confirmed_shared_groups: Any = None,
+        expected_material_structure_hash: Any = None,
     ) -> dict[str, Any]:
         """消费令牌并执行保存。任一步失败都**不保存**，并回完整的四态状态块。"""
         ticket = self.consume(
@@ -950,7 +1212,13 @@ class CommitService:
             target_path=target_path,
             surface_draft=surface_draft,
             structure_hash=structure_hash,
+            material_draft=material_draft,
+            confirmed_shared_groups=confirmed_shared_groups,
         )
+        #: 材质图结构指纹在 prepare 阶段已绑进票据；这里再用客户端带的值对一次账，
+        #: 保证「客户端手里的指纹」与基线一致（与 Cel 的 ``structure_hash`` 同一条纪律）。
+        if expected_material_structure_hash is not None and ticket.material_bound:
+            self._require_material_structure_match(expected_material_structure_hash)
 
         baseline = self._require_baseline()
         coerced = validate_draft(draft, baseline)
@@ -964,6 +1232,18 @@ class CommitService:
         )
         if surface_ops is not None and not surface_ops:
             surface_ops = None
+        # 材质图（PR #7）：票据绑定后重新编译（与 prepare 用同一份基线，逐字节一致）。
+        material_ops: list[Any] | None = (
+            self._material_plan(
+                material_draft or {},
+                confirmed_shared=confirmed_shared_groups,
+                expected_hash=ticket.material_structure_hash,
+            )
+            if ticket.material_bound
+            else None
+        )
+        if material_ops is not None and not material_ops:
+            material_ops = None
         target = Path(ticket.target_path)
         # ★ 必须用**票据里已确认的那条**备份路径，不重新计算：
         #   跨过时间边界（哪怕只差 1 秒）算出来的名字就不同，备份就会落到
@@ -995,6 +1275,9 @@ class CommitService:
             "applied_surface": {},
             "surface_readback_verified": False,
             "surface_mismatches": [],
+            "applied_material_graph": {},
+            "material_graph_readback_verified": False,
+            "material_graph_mismatches": [],
         }
         steps: list[str] = []
 
@@ -1060,6 +1343,29 @@ class CommitService:
                         "Cel 草稿写入后回读不一致，已中止保存（磁盘上的工程文件未被写入）。",
                     )
 
+            if material_ops:
+                # 材质图结构闸门：与 Cel 同一条纪律 —— 本地指纹证明不了
+                # 「工程这一刻的材质节点图没变」，因此写之前用只读探针实测一次。
+                steps.append("复核材质图结构")
+                await self._assert_material_graph_fresh()
+
+                steps.append("应用材质图草稿")
+                applied_material = await self._call(
+                    self._binder.apply_surface_ops, material_ops
+                )
+                mg_verified, mg_mismatches = verify_ops(
+                    material_ops, applied_material.get("values") or {}
+                )
+                status["applied_material_graph"] = param_values(material_ops)
+                status["material_graph_readback_verified"] = mg_verified
+                status["material_graph_mismatches"] = mg_mismatches
+                if not mg_verified:
+                    raise errors.ToonTunerError(
+                        errors.APPLY_VERIFY_FAILED,
+                        "材质图草稿写入后回读不一致，已中止保存"
+                        "（磁盘上的工程文件未被写入）。",
+                    )
+
             if backup_path is not None:
                 steps.append("生成备份")
                 created = await self._call(project_ops.make_backup, target, backup_path)
@@ -1078,6 +1384,7 @@ class CommitService:
                 steps=steps,
                 notes=notes,
                 surface_ops=surface_ops,
+                material_ops=material_ops,
             )
             # 保留内层细节（例如 target_name / failure_type / stage），但不覆盖
             # 我们刚写好的 status / steps / normalized。
@@ -1100,6 +1407,7 @@ class CommitService:
                 steps=steps,
                 notes=notes,
                 surface_ops=surface_ops,
+                material_ops=material_ops,
             )
 
         status["saved"] = True

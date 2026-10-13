@@ -50,7 +50,7 @@ from ..surface.schema import (
     walk,
 )
 from .graph import Graph
-from .identity import identity_for, node_identity, path_hash
+from .identity import ParamIdentity, identity_for, node_identity, path_hash
 from .probe import MaterialGraph
 from .semantics import (
     CATEGORIES,
@@ -84,22 +84,60 @@ _SEMANTIC_COST = {semantic: COST_L1 for semantic in SEMANTIC_LABELS}
 
 
 def _binding(material_name: str, node_name: str, socket: str) -> Binding:
-    """节点参数统一走 ``NODE_SOCKET.default_value``（与 Cel 的 Emission 同一条）。
+    """材质图节点参数走 ``MATERIAL_GRAPH_SOCKET.default_value``。
 
     ``object_id`` = ``材质名/节点名/插座名``，三段**全部由服务端探测结果拼出**；
-    客户端永远不能提交节点路径或插座名。
+    客户端永远不能提交节点路径或插座名。与 Cel 的 ``NODE_SOCKET`` 分开：
+    后者定位的是节点组内节点，本工具不做「按名猜组」的迁移。
     """
-    return Binding("NODE_SOCKET", f"{material_name}/{node_name}/{socket}", "default_value")
+    return Binding(
+        "MATERIAL_GRAPH_SOCKET", f"{material_name}/{node_name}/{socket}", "default_value"
+    )
 
 
 def _display_name(item: TracedNode) -> str:
     return item.node.label or item.name.split(GROUP_SEP, 1)[-1]
 
 
-def _param_node_id(node_name: str, suffix: str) -> str:
-    """节点参数在 schema 里的展示 id（含节点名便于分组；节点名只作展示）。"""
-    safe = node_name.replace(GROUP_SEP, "/")
-    return f"{GROUP}.{safe}.{suffix}"
+def _fallback_identity(
+    graph: Graph, material: MaterialGraph, node_name: str, socket: str, field: str
+) -> ParamIdentity:
+    """``identity_for`` 找不到节点时的兜底身份（节点确实不在图里）。
+
+    仍然走同一套 ``ParamIdentity``，因此 id 依旧是 opaque 且稳定 ——
+    宁可给一个基于材质 + 字段的稳定占位 id，也不退回「用节点名当主键」。
+    """
+    return ParamIdentity(
+        material_id=material.material_id,
+        node_tree_id=f"NODE_TREE:{material.name}",
+        node_id=node_identity(graph.get(node_name) or _MissingNode(node_name)),
+        socket=socket,
+        field=field,
+        path_hash=path_hash(graph, node_name),
+    )
+
+
+class _MissingNode:
+    """图里不存在的节点占位：只提供 ``node_identity`` 需要的两个属性。"""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.type = ""
+        self.bl_idname = ""
+
+    inputs: dict[str, Any] = {}
+    outputs: tuple[str, ...] = ()
+    uuid: str | None = None
+
+
+def _param_node_id(identity) -> str:
+    """参数在 schema 里的 id = **opaque param_id**（规格 §5）。
+
+    刻意**不用节点名**：节点名会跨材质重复（两个材质都可能有 ``Value`` 节点），
+    用它做主键会导致 id 冲突；更重要的是规格要求「前端只拿到 opaque id」，
+    真实节点名 / 插座名只出现在 ``label`` 与 ``impact``（展示用）里。
+    """
+    return identity.param_id()
 
 
 def _shared(item: TracedNode, material: MaterialGraph) -> bool:
@@ -127,6 +165,8 @@ def _impact(item: TracedNode, material: MaterialGraph) -> dict[str, Any]:
     return {
         "session_id": item.identity,
         "path_hash": item.path_hash,
+        "material_id": material.material_id,
+        "node_tree_id": f"NODE_TREE:{material.name}",
         "source_node": item.name,
         "source_label": _display_name(item),
         "in_group": item.in_group,
@@ -144,12 +184,15 @@ def _impact(item: TracedNode, material: MaterialGraph) -> dict[str, Any]:
 def _degrade_reason(item: TracedNode, graph: Graph, material: MaterialGraph) -> str | None:
     """该节点当前**不可写**的原因；可写返回 None。
 
-    判定顺序：歧义路径 → 共享节点组 → 置信等级限制。任何一条命中即只读，绝不猜。
+    判定顺序：歧义路径 → 置信等级限制。
+
+    刻意**不在这里**拦截共享节点组：规格要求「共享参数修改前必须明确确认影响范围」，
+    而确认发生在**提交/执行**时（``SHARED_PARAMETER_CONFIRM_REQUIRED``）。若在 schema
+    阶段就一律只读，执行层的确认闸门将永远不可达，这条安全机制就成了死代码。
+    共享信息仍然如实带在 ``shared`` / ``affected_materials`` 上供界面提示。
     """
     if detect_ambiguous(graph, item.name):
         return "ambiguous_path"
-    if item.in_group:
-        return REASON_SHARED_GROUP
     recognition = item.recognition
     if recognition.level == LEVEL_UNSUPPORTED:
         return recognition.readonly_reason or "unsupported"
@@ -314,12 +357,14 @@ def _ramp_node(
         graph, item.name, "elements", "elements", material_id=material.material_id
     )
     binding = (
-        Binding("COLOR_RAMP", f"{material.name}/{item.name}", "elements")
+        Binding("MATERIAL_GRAPH_RAMP", f"{material.name}/{item.name}", "elements")
         if editable and identity is not None
         else None
     )
     return RampNode(
-        id=_param_node_id(item.name, "ramp"),
+        id=_param_node_id(identity) if identity is not None else _param_node_id(
+            _fallback_identity(graph, material, item.name, "elements", "elements")
+        ),
         kind="ramp",
         group=GROUP,
         cost=_SEMANTIC_COST[SEM_RAMP],
@@ -358,7 +403,9 @@ def _node_children(
     if semantic == SEM_GROUP:
         return [
             EnumNode(
-                id=_param_node_id(item.name, "group"),
+                id=_param_node_id(
+                    _fallback_identity(graph, material, item.name, item.node.group_name, "group")
+                ),
                 kind="enum",
                 group=GROUP,
                 cost=COST_L1,
@@ -390,11 +437,11 @@ def _node_children(
         used_fields.add(field)
         socket = item.node.inputs.get(socket_name)
         raw_value = socket.value if socket is not None else None
-        node_id = _param_node_id(item.name, field)
-        label = f"{_display_name(item)} · {socket_name}"
         identity = identity_for(
             graph, item.name, socket_name, field, material_id=material.material_id
-        )
+        ) or _fallback_identity(graph, material, item.name, socket_name, field)
+        node_id = _param_node_id(identity)
+        label = f"{_display_name(item)} · {socket_name}"
         impact = _base_extra(item, material, kind)
         if not writable or identity is None:
             children.append(
@@ -448,7 +495,9 @@ def _node_children(
     for socket_name, source_desc in linked_inputs(item.node):
         if socket_name in candidate_names:
             continue
-        node_id = _param_node_id(item.name, f"input.{socket_name}")
+        node_id = _param_node_id(
+                    _fallback_identity(graph, material, item.name, socket_name, "linked_input")
+                )
         children.append(
             _placeholder(
                 node_id=node_id,
@@ -465,7 +514,9 @@ def _node_children(
         # 探不到任何可编辑插座 ⇒ 只读占位，保持节点集合稳定。
         children.append(
             _placeholder(
-                node_id=_param_node_id(item.name, "unsupported"),
+                node_id=_param_node_id(
+                    _fallback_identity(graph, material, item.name, "unsupported", "unsupported")
+                ),
                 label=f"{_display_name(item)}（无可编辑参数）",
                 kind="float",
                 impact=_base_extra(item, material, "float"),
@@ -545,23 +596,10 @@ def _category_of(node: Node, impact: dict[str, Any]) -> str:
     return SEMANTIC_CATEGORY.get(semantic, "advanced")
 
 
-def build_parameter_schema(material: MaterialGraph) -> dict[str, Any]:
-    """为单个材质生成递归参数 schema。
-
-    返回内部节点树（``groups``）+ 规格形状的扁平参数（``parameters``）+ 分区索引。
-    """
+def _build_nodes(material: MaterialGraph) -> tuple[list[Node], TraceResult | None]:
+    """构造材质的内部参数节点树；不可用时返回空列表。"""
     if not material.available or material.graph is None:
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "material_id": material.material_id,
-            "material": material.name,
-            "available": False,
-            "error": material.error or "材质图不可用。",
-            "groups": [],
-            "parameters": [],
-            "categories": {name: [] for name in CATEGORIES},
-            "highest_cost": COST_L1,
-        }
+        return [], None
     graph = material.graph
     trace = trace_from_output(graph)
     children: list[Node] = []
@@ -592,7 +630,30 @@ def build_parameter_schema(material: MaterialGraph) -> dict[str, Any]:
                 reason="反向追踪无法唯一确定生效链路，整份参数面降级为只读。",
             )
         )
+    return children, trace
 
+
+def build_parameter_schema_with_nodes(
+    material: MaterialGraph,
+) -> tuple[dict[str, Any], list[Node]]:
+    """生成 schema 的对外形状 + 内部节点树（供参数索引构建）。"""
+    if not material.available or material.graph is None:
+        return (
+            {
+                "schema_version": SCHEMA_VERSION,
+                "material_id": material.material_id,
+                "material": material.name,
+                "available": False,
+                "error": material.error or "材质图不可用。",
+                "groups": [],
+                "parameters": [],
+                "categories": {name: [] for name in CATEGORIES},
+                "highest_cost": COST_L1,
+            },
+            [],
+        )
+    children, trace = _build_nodes(material)
+    assert trace is not None
     group_node = GroupNode(
         id=f"{GROUP}.{material.name}",
         kind="group",
@@ -613,7 +674,7 @@ def build_parameter_schema(material: MaterialGraph) -> dict[str, Any]:
     categories: dict[str, list[str]] = {name: [] for name in CATEGORIES}
     for spec in parameters:
         categories.setdefault(spec["category"], []).append(spec["id"])
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "material_id": material.material_id,
         "material": material.name,
@@ -633,6 +694,16 @@ def build_parameter_schema(material: MaterialGraph) -> dict[str, Any]:
         "categories": categories,
         "highest_cost": max_cost([group_node]),
     }
+    return payload, children
+
+
+def build_parameter_schema(material: MaterialGraph) -> dict[str, Any]:
+    """为单个材质生成递归参数 schema（对外形状）。
+
+    返回内部节点树（``groups``）+ 规格形状的扁平参数（``parameters``）+ 分区索引。
+    """
+    payload, _nodes = build_parameter_schema_with_nodes(material)
+    return payload
 
 
 def build_schemas(materials: list[MaterialGraph]) -> dict[str, Any]:
@@ -660,5 +731,6 @@ __all__ = [
     "SCHEMA_VERSION",
     "to_spec",
     "build_parameter_schema",
+    "build_parameter_schema_with_nodes",
     "build_schemas",
 ]

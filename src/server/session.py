@@ -32,6 +32,7 @@ from typing import Any, Callable
 
 from . import color_looks, errors, framing as framing_module, params, surface_probe
 from .binder import PREVIEW_FALLBACK_RESOLUTION, BlenderBinder, preview_resolution_for
+from .material_graph_service import MaterialGraphService
 from .surface_service import SurfaceService, param_values, verify_ops
 
 #: 保留的历史任务上限（防止长时间运行内存无界增长）
@@ -189,6 +190,14 @@ def preview_url_for(job_id: str) -> str:
     return f"/api/preview/{job_id}"
 
 
+def _material_hash_of(baseline: Any, name: str) -> str:
+    """某个材质的结构哈希（用于定位「到底是哪个材质变了」）。"""
+    for item in baseline.materials:
+        if item.name == name:
+            return item.structure_hash
+    return ""
+
+
 def _empty_restore(reason: str | None = None) -> dict[str, Any]:
     """失败/回滚状态块的统一形状（L0 与 Cel 两部分分开报）。"""
     return {
@@ -204,6 +213,13 @@ def _empty_restore(reason: str | None = None) -> dict[str, Any]:
             "error": None,
         },
         "cel": {
+            "attempted": False,
+            "verified": False,
+            "mismatches": [],
+            "code": None,
+            "error": None,
+        },
+        "material_graph": {
             "attempted": False,
             "verified": False,
             "mismatches": [],
@@ -307,10 +323,21 @@ class SurfacePlan:
     baseline_ops: list[Any] = field(default_factory=list)
     structure_hash: str = ""
     surface_baseline_id: str = ""
+    #: 材质图（Material Graph，PR #7）写入计划：与 Cel 同一生命周期、同一渲染。
+    material_ops: list[Any] = field(default_factory=list)
+    #: 恢复材质图基线用的计划（与 Cel 的 baseline_ops 同一条纪律）。
+    material_baseline_ops: list[Any] = field(default_factory=list)
+    material_structure_hash: str = ""
+    material_graph_baseline_id: str = ""
 
     @property
     def empty(self) -> bool:
-        return not self.ops and not self.baseline_ops
+        return (
+            not self.ops
+            and not self.baseline_ops
+            and not self.material_ops
+            and not self.material_baseline_ops
+        )
 
 
 @dataclass
@@ -428,10 +455,18 @@ def baseline_from_payload(
 class PreviewService:
     """基线与预览任务的唯一权威。"""
 
-    def __init__(self, binder: BlenderBinder, surface: SurfaceService | None = None) -> None:
+    def __init__(
+        self,
+        binder: BlenderBinder,
+        surface: SurfaceService | None = None,
+        material_graph: MaterialGraphService | None = None,
+    ) -> None:
         self._binder = binder
         #: v4 参数面状态。为 ``None`` 时本服务退化成纯 L0（旧行为不变）。
         self._surface = surface or SurfaceService()
+        #: 材质图参数面状态（PR #7）。独立于 ``_surface``，因此材质图探针失败
+        #: 不会影响 L0 / Cel 两条既有路径。
+        self._material_graph = material_graph or MaterialGraphService()
         self._baseline: Baseline | None = None
         self._jobs: OrderedDict[str, Job] = OrderedDict()
         self._seq = 0
@@ -541,6 +576,22 @@ class PreviewService:
             return
         describe = surface_probe.describe_groups(surface_probe.redact_describe(raw))
         self._surface.capture(describe)
+        # 材质图（PR #7）复用同一份 describe 载荷：探针已报告节点图与共享组，
+        # 这里只做服务端装配。失败**不影响** L0 / Cel 两条既有基线。
+        try:
+            self._material_graph.capture(
+                describe,
+                baseline_id=self._surface.baseline.baseline_id
+                if self._surface.baseline is not None
+                else "",
+            )
+        except Exception:  # noqa: BLE001 - 材质图是增量能力，绝不能拖垮基线
+            logger.warning("材质图基线装配失败（不影响 L0 / Cel）。", exc_info=True)
+
+    @property
+    def material_graph(self) -> MaterialGraphService:
+        """材质图参数面状态（只读端点用）。"""
+        return self._material_graph
 
     async def read_framing_context(self) -> dict[str, Any]:
         """读取当前取景上下文，并附带与基线的比对结论。"""
@@ -696,6 +747,9 @@ class PreviewService:
         surface_draft: dict[str, Any],
         framing_options: dict[str, Any] | None = None,
         expected_structure_hash: str | None = None,
+        material_draft: dict[str, Any] | None = None,
+        confirmed_shared: list[str] | None = None,
+        expected_material_structure_hash: str | None = None,
     ) -> Job:
         """提交一个 **v4 任务**：L0 与 Cel 在同一任务生命周期内应用、渲染、恢复。
 
@@ -744,6 +798,27 @@ class PreviewService:
             # 草稿在这里编译成计划；非法取值（越界 / 色标数量变化 / 只读项）直接抛出，
             # 不产生任务 —— 与既有 L0 路径的失败时机保持一致。
             ops = surface_service.plan(surface_draft)
+            # 材质图草稿（PR #7）：与 Cel 同一生命周期、同一渲染、同一回滚。
+            # 材质图基线不可用时**只在确实提交了材质参数**才报错 —— 没提交就不牵连旧路径。
+            material_ops: list[Any] = []
+            material_baseline_ops: list[Any] = []
+            material_structure_hash = ""
+            material_baseline_id = ""
+            if material_draft:
+                mg_baseline = self._material_graph.baseline
+                if mg_baseline is None:
+                    raise errors.ToonTunerError(
+                        errors.NO_BASELINE,
+                        "尚未建立材质图基线，无法提交材质图参数。请刷新基线后重试。",
+                    )
+                material_ops = self._material_graph.plan(
+                    material_draft,
+                    expected_structure_hash=expected_material_structure_hash,
+                    confirmed_shared=confirmed_shared or [],
+                )
+                material_baseline_ops = list(mg_baseline.baseline_ops)
+                material_structure_hash = mg_baseline.structure_hash
+                material_baseline_id = mg_baseline.baseline_id
 
             self._seq += 1
             now = _now_iso()
@@ -762,6 +837,10 @@ class PreviewService:
                     baseline_ops=list(surface_baseline.baseline_ops),
                     structure_hash=surface_baseline.structure_hash,
                     surface_baseline_id=surface_baseline.baseline_id,
+                    material_ops=list(material_ops),
+                    material_baseline_ops=list(material_baseline_ops),
+                    material_structure_hash=material_structure_hash,
+                    material_graph_baseline_id=material_baseline_id,
                 ),
             )
             for note in notes:
@@ -962,26 +1041,39 @@ class PreviewService:
             if self._is_superseded(job):
                 return self._finish(job, JOB_SUPERSEDED, note="恢复基线后被取代")
 
-            # 3) 应用完整草稿（L0 与 Cel 都在这一步，之后只渲染一次）
+            # 3) 应用完整草稿（L0、Cel 与材质图都在这一步，之后只渲染一次）
             steps.append("应用完整草稿")
             applied = await self._call(self._binder.apply_values, dict(job.effective))
             applied_surface = await self._call(self._binder.apply_surface_ops, plan.ops)
+            applied_material: dict[str, Any] = {}
+            if plan.material_baseline_ops:
+                applied_material = await self._call(
+                    self._binder.apply_surface_ops, plan.material_baseline_ops
+                )
+            if plan.material_ops:
+                applied_material = await self._call(
+                    self._binder.apply_surface_ops, plan.material_ops
+                )
             if self._is_superseded(job):
                 return self._finish(job, JOB_SUPERSEDED, note="应用草稿后被取代")
 
-            # 4) 回读校验：两部分都逐项一致才允许渲染
+            # 4) 回读校验：三部分都逐项一致才允许渲染
             steps.append("回读校验")
             verified, mismatches = verify_values(job.effective, applied)
             surface_verified, surface_mismatches = verify_ops(
                 plan.ops, applied_surface.get("values") or {}
             )
-            if not (verified and surface_verified):
+            material_verified, material_mismatches = verify_ops(
+                plan.material_ops, applied_material.get("values") or {}
+            )
+            if not (verified and surface_verified and material_verified):
                 raise errors.ToonTunerError(
                     errors.APPLY_VERIFY_FAILED,
                     "草稿写入后回读不一致，已中止本次预览（磁盘与工程文件未被写入）。",
                     details={
                         "mismatches": mismatches,
                         "surface_mismatches": surface_mismatches,
+                        "material_graph_mismatches": material_mismatches,
                     },
                 )
 
@@ -1013,6 +1105,16 @@ class PreviewService:
             surface_restore_verified, surface_restore_mismatches = verify_ops(
                 plan.baseline_ops, restored_surface.get("values") or {}
             )
+            restored_material: dict[str, Any] = {}
+            material_restore_verified = True
+            material_restore_mismatches: list[dict[str, Any]] = []
+            if plan.material_baseline_ops or plan.material_ops:
+                restored_material = await self._call(
+                    self._binder.apply_surface_ops, plan.material_baseline_ops
+                )
+                material_restore_verified, material_restore_mismatches = verify_ops(
+                    plan.material_baseline_ops, restored_material.get("values") or {}
+                )
 
             result = {
                 "preview_url": preview_url_for(job.job_id),
@@ -1029,6 +1131,11 @@ class PreviewService:
                 "restore_mismatches": restore_mismatches,
                 "surface_restore_verified": surface_restore_verified,
                 "surface_restore_mismatches": surface_restore_mismatches,
+                "applied_material_graph": param_values(plan.material_ops),
+                "material_graph_restore_verified": material_restore_verified,
+                "material_graph_restore_mismatches": material_restore_mismatches,
+                "material_graph_baseline_id": plan.material_graph_baseline_id,
+                "material_structure_hash": plan.material_structure_hash,
                 "external_changes": list(job.external_changes),
                 "parameters": _parameter_records(baseline, job, applied),
                 "view_transform": baseline.view_transform,
@@ -1086,6 +1193,58 @@ class PreviewService:
         """
         return await self._check_surface()
 
+    async def check_material_graph_structure(self) -> dict[str, Any]:
+        """材质图结构复核（保存流程在写入之前调用）。
+
+        与 Cel 的结构复核**分开**：两者指纹独立，混在一起报不出「到底是哪边变了」。
+        材质图基线缺失时返回空判定（``kind: ok``）—— 没有基线就没有草稿可作废。
+        """
+        if self._material_graph.baseline is None:
+            return {
+                "kind": "ok",
+                "fatal": False,
+                "identity_missing": [],
+                "identity_added": [],
+                "renamed": [],
+                "structure_changed": [],
+                "value_changed": [],
+            }
+        raw = await self._call(self._binder.describe_surface)
+        describe = surface_probe.describe_groups(surface_probe.redact_describe(raw))
+        baseline = self._material_graph.baseline
+        assert baseline is not None
+        current = MaterialGraphService().capture(
+            describe, baseline_id=baseline.baseline_id
+        )
+        out: dict[str, Any] = {
+            "kind": "ok",
+            "fatal": False,
+            "identity_missing": [],
+            "identity_added": [],
+            "renamed": [],
+            "structure_changed": [],
+            "value_changed": [],
+        }
+        baseline_names = {item.name for item in baseline.materials}
+        current_names = {item.name for item in current.materials}
+        missing = sorted(baseline_names - current_names)
+        added = sorted(current_names - baseline_names)
+        if missing:
+            out["kind"] = "identity_missing"
+            out["fatal"] = True
+            out["identity_missing"] = missing
+        elif baseline.structure_hash != current.structure_hash:
+            out["kind"] = "structure_changed"
+            out["fatal"] = True
+            out["structure_changed"] = sorted(
+                name
+                for name in baseline_names & current_names
+                if _material_hash_of(baseline, name) != _material_hash_of(current, name)
+            ) or ["<整体结构哈希变化>"]
+        if added:
+            out["identity_added"] = added
+        return out
+
     async def _restore_all(self, plan: SurfacePlan | None, *, scene_touched: bool) -> dict[str, Any]:
         """失败路径：恢复 L0 与 Cel 两条基线，并分别回读校验。"""
         block = _empty_restore(None if scene_touched else "尚未写入场景，无需回滚。")
@@ -1094,7 +1253,12 @@ class PreviewService:
         block["attempted"] = True
         block["l0"] = await self._restore_l0_block()
         block["cel"] = await self._restore_cel_block(plan)
-        verified = bool(block["l0"]["verified"]) and bool(block["cel"]["verified"])
+        block["material_graph"] = await self._restore_material_graph_block(plan)
+        verified = (
+            bool(block["l0"]["verified"])
+            and bool(block["cel"]["verified"])
+            and bool(block["material_graph"]["verified"])
+        )
         block["verified"] = verified
         block["code"] = None if verified else errors.ROLLBACK_FAILED
         return block
@@ -1168,6 +1332,45 @@ class PreviewService:
             }
             return out
         verified, mismatches = verify_ops(plan.baseline_ops, payload.get("values") or {})
+        out["verified"] = verified
+        out["mismatches"] = mismatches
+        if not verified:
+            out["code"] = errors.ROLLBACK_FAILED
+        return out
+
+    async def _restore_material_graph_block(self, plan: SurfacePlan | None) -> dict[str, Any]:
+        """失败路径：恢复材质图基线并回读校验（与 Cel 同一条纪律，独立成块）。"""
+        out: dict[str, Any] = {
+            "attempted": False,
+            "verified": False,
+            "mismatches": [],
+            "code": None,
+            "error": None,
+        }
+        if plan is None or not plan.material_baseline_ops:
+            out["verified"] = True
+            out["applicable"] = False
+            out["reason"] = "该任务没有材质图写入，无需恢复。"
+            return out
+        out["attempted"] = True
+        try:
+            payload = await self._call(
+                self._binder.apply_surface_ops, plan.material_baseline_ops
+            )
+        except errors.ToonTunerError as exc:
+            out["code"] = errors.ROLLBACK_FAILED
+            out["error"] = exc.to_payload()["error"]
+            return out
+        except Exception as exc:  # noqa: BLE001 - 同上
+            out["code"] = errors.ROLLBACK_FAILED
+            out["error"] = {
+                "code": errors.INTERNAL_ERROR,
+                "message": f"{type(exc).__name__}: {exc}",
+            }
+            return out
+        verified, mismatches = verify_ops(
+            plan.material_baseline_ops, payload.get("values") or {}
+        )
         out["verified"] = verified
         out["mismatches"] = mismatches
         if not verified:

@@ -607,7 +607,12 @@ def test_schema_bindings_all_whitelisted() -> None:
 
 
 def test_shared_group_marks_shared_and_affected_materials() -> None:
-    """共享节点组：参数标 shared=true，影响材质 = 组的使用者。"""
+    """共享节点组：参数标 shared=true，影响材质 = 组的使用者。
+
+    共享组内参数**不**在 schema 阶段一律只读 —— 规格要求「修改前必须明确确认
+    影响范围」，而确认发生在提交/执行时（``SHARED_PARAMETER_CONFIRM_REQUIRED``）。
+    若这里就置为只读，执行层的确认闸门将永远不可达。
+    """
     from src.server.material_graph.probe import build_material_graph as bmg
 
     fake, name = _group_graph(depth=1)
@@ -621,8 +626,11 @@ def test_shared_group_marks_shared_and_affected_materials() -> None:
     for spec in in_group:
         assert spec["shared"] is True
         assert set(spec["affected_materials"]) == {"皮肤_脸", "衣服"}
-        # 共享组内参数默认只读（需先确认影响范围）
+    # 组**实例**节点本身仍只读（没有可写 binding）
+    instance = [s for s in payload["parameters"] if s["semantic"] == semantics.SEM_GROUP]
+    for spec in instance:
         assert spec["editable"] is False
+        assert spec["readonly_reason"]
 
 
 # -- 桩工具 ----------------------------------------------------------------

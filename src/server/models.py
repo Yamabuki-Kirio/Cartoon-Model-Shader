@@ -241,6 +241,26 @@ class V4PreviewRequest(BaseModel):
     draft: dict[str, Any] = Field(default_factory=dict, description="完整草稿：参数 id 到取值的映射")
     framing: FramingOptions | None = None
     expected_structure_hash: str | None = None
+    #: 材质图草稿（PR #7）：**opaque 参数 id -> 取值**。
+    #:
+    #: 前端只提交服务端 schema 生成的参数 id，绝不提交节点路径、插座名或任何
+    #: 属性表达式；服务端用基线 schema 反查真实节点身份后才生成写入代码。
+    material_draft: dict[str, Any] = Field(default_factory=dict)
+    #: 客户端已确认影响范围的共享节点组名单。共享组参数未在此列出的会被拒绝
+    #: （``SHARED_PARAMETER_CONFIRM_REQUIRED``）。
+    confirmed_shared_groups: list[str] = Field(default_factory=list)
+    #: 材质图的结构指纹；与当前基线不一致时在提交阶段就拒绝。
+    expected_material_structure_hash: str | None = None
+
+
+class MaterialGraphPreviewRequest(BaseModel):
+    """材质图预览请求（PR #7）：只提交材质图草稿，L0 / Cel 保持基线不变。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    material_draft: dict[str, Any] = Field(default_factory=dict)
+    confirmed_shared_groups: list[str] = Field(default_factory=list)
+    expected_material_structure_hash: str | None = None
 
 
 class JobResponse(BaseModel):
@@ -425,6 +445,14 @@ class CommitPrepareRequest(BaseModel):
     surface_draft: dict[str, Any] | None = None
     #: v4（可选）：客户端持有的结构指纹。与基线不一致时在 prepare 阶段就拒绝。
     structure_hash: str | None = None
+    #: 材质图草稿（PR #7）：**opaque 参数 id -> 取值**。传了就一并绑进确认令牌，
+    #: 与 Cel 草稿走同一条绑定路径；prepare 与 commit 之间被改动即拒绝。
+    material_draft: dict[str, Any] | None = None
+    #: 已确认影响范围的共享节点组名单。未确认的共享组参数会被拒绝
+    #: （``SHARED_PARAMETER_CONFIRM_REQUIRED``）。
+    confirmed_shared_groups: list[str] = Field(default_factory=list)
+    #: 材质图结构指纹。与材质图基线不一致时在 prepare 阶段就拒绝。
+    expected_material_structure_hash: str | None = None
 
 
 class CommitPrepareResponse(BaseModel):
@@ -439,6 +467,8 @@ class CommitPrepareResponse(BaseModel):
     parameter_count: int = 0
     #: v4：绑定的参数面草稿条数（0 = 本次没绑）
     surface_parameter_count: int = 0
+    #: PR #7：绑定的材质图草稿条数（0 = 本次没绑）
+    material_graph_parameter_count: int = 0
     #: v4：绑定的结构指纹（None = 本次没绑）
     structure_hash: str | None = None
     normalized: list[dict[str, Any]] = Field(default_factory=list)
@@ -461,6 +491,14 @@ class CommitRequest(BaseModel):
     target_path: str | None = None
     surface_draft: dict[str, Any] | None = None
     structure_hash: str | None = None
+    #: 材质图草稿（PR #7）：**opaque 参数 id -> 取值**。传了就一并绑进确认令牌，
+    #: 与 Cel 草稿走同一条绑定路径；prepare 与 commit 之间被改动即拒绝。
+    material_draft: dict[str, Any] | None = None
+    #: 已确认影响范围的共享节点组名单。未确认的共享组参数会被拒绝
+    #: （``SHARED_PARAMETER_CONFIRM_REQUIRED``）。
+    confirmed_shared_groups: list[str] = Field(default_factory=list)
+    #: 材质图结构指纹。与材质图基线不一致时在 prepare 阶段就拒绝。
+    expected_material_structure_hash: str | None = None
 
 
 class CommitResponse(BaseModel):
