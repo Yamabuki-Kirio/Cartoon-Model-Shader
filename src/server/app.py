@@ -821,15 +821,38 @@ def create_app(
         dependencies=require_token,
     )
     async def cancel_render_job(job_id: str) -> dict[str, Any]:
-        # 先终止整棵进程树（入口脚本 + MCP 派发的真实 Blender + 确认服务），再落取消态。
-        unresolved = await app.state.pipeline.cancel_job(job_id)
-        job = app.state.jobs.cancel(job_id, reason="用户取消")
+        # 1) **先原子校验并落 cancelled 状态**。绝不能在状态非法时先杀进程 —— 否则
+        #    rendering/verifying/success 等不可取消状态下，用户会看到「取消失败」，
+        #    而渲染实际上已被终止。
+        try:
+            job = app.state.jobs.cancel(job_id, reason="用户取消")
+        except KeyError:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        except ValueError as exc:
+            raise errors.ToonTunerError(
+                errors.PARAM_INVALID, str(exc) or "当前状态不可取消", retryable=False
+            )
+
+        # 2) 已进入 cancelled：终止整棵进程树（入口脚本 + MCP 派发的真实 Blender + 确认服务）。
+        #    即使终止失败也**保留 cancelled**（不恢复成运行中），并如实报告残留 PID。
+        try:
+            unresolved = await app.state.pipeline.cancel_job(job_id)
+        except Exception as exc:  # noqa: BLE001 - 终止异常不得回滚已落定的取消态
+            unresolved = []
+            app.state.jobs.append_log(job_id, f"[render] 终止进程树时出错：{exc}")
         if unresolved:
-            # 不谎称已终止：明确报告仍可能残留的 PID。
             app.state.jobs.append_log(
                 job_id, f"[render] 警告：以下进程未能确认退出：{unresolved}"
             )
-        return job.to_public()
+
+        # 3) 排队任务不会经过正常 _finalize()，必须在此主动做一次任务级清理，
+        #    否则空输出目录与临时文件会残留。
+        try:
+            app.state.storage.cleanup_after_terminal(job)
+        except Exception as exc:  # noqa: BLE001
+            app.state.jobs.append_log(job_id, f"[render] 取消后清理失败：{exc}")
+
+        return app.state.jobs.get(job_id).to_public()
 
     @app.get(
         "/api/render/jobs/{job_id}/materials",

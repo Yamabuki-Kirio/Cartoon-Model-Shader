@@ -677,3 +677,103 @@ def test_cancel_active_pid_still_terminates_and_clears(tmp_path: Path) -> None:
     assert unresolved == []
     assert child.poll() is not None, "活动进程必须被终止"
     assert registry.for_job("live-job") == [], "终止后记录必须被清除"
+
+
+# -- P1：取消顺序（先落态，再终止） ---------------------------------------
+
+
+def test_cancel_illegal_state_does_not_terminate(tmp_path: Path) -> None:
+    """不可取消（rendering）状态下请求取消：不得终止任何进程，任务保持原状态。"""
+    import subprocess
+    import sys
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    app = create_app(_config(tmp_path, model_dir))
+    # 不启动 worker 执行：让任务停在测试指定的状态，避免与后台执行竞态。
+    app.state.pipeline.enqueue = lambda job_id: None  # type: ignore[assignment]
+    with authed(app) as client:
+        model_id = client.get("/api/render/models").json()["models"][0]["model_id"]
+        created = client.post(
+            "/api/render/jobs", json={"model_id": model_id, "mode": "faithful", "auto_frame": False}
+        )
+        job_id = created.json()["job_id"]
+
+        # 把任务推进到 rendering（合法链：analyzing_materials → preparing → rendering）
+        app.state.jobs.set_state(job_id, "preflight")
+        app.state.jobs.set_state(job_id, "analyzing_materials")
+        app.state.jobs.set_state(job_id, "preparing")
+        app.state.jobs.set_state(job_id, "rendering")
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        app.state.proc_registry.register(child.pid, job_id=job_id, exe=sys.executable, kind="blender")
+        try:
+            response = client.post(f"/api/render/jobs/{job_id}/cancel")
+            # 不可取消 ⇒ 拒绝（绝不能先杀进程再报错）
+            assert response.status_code in (400, 409), response.text
+            assert app.state.jobs.get(job_id).state == "rendering"
+            assert child.poll() is None, "不可取消状态下不得终止进程"
+        finally:
+            child.terminate()
+
+
+def test_cancel_legal_state_transitions_first_then_terminates(tmp_path: Path) -> None:
+    """合法状态取消：必须**先进入 cancelled**，再终止进程树。"""
+    import subprocess
+    import sys
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    app = create_app(_config(tmp_path, model_dir))
+
+    order: list[str] = []
+    real_cancel_job = app.state.pipeline.cancel_job
+
+    async def spy_cancel_job(job_id: str):
+        # 记录「终止进程树」发生时，任务是否**已经**是 cancelled。
+        order.append("terminate:" + app.state.jobs.get(job_id).state)
+        return await real_cancel_job(job_id)
+
+    app.state.pipeline.cancel_job = spy_cancel_job
+    app.state.pipeline.enqueue = lambda job_id: None  # type: ignore[assignment]
+
+    with authed(app) as client:
+        model_id = client.get("/api/render/models").json()["models"][0]["model_id"]
+        created = client.post(
+            "/api/render/jobs", json={"model_id": model_id, "mode": "faithful", "auto_frame": False}
+        )
+        job_id = created.json()["job_id"]
+        # queued 是可取消状态（已禁用 enqueue，任务保持 queued）
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        app.state.proc_registry.register(child.pid, job_id=job_id, exe=sys.executable, kind="blender")
+
+        response = client.post(f"/api/render/jobs/{job_id}/cancel")
+        assert response.status_code == 200
+        assert response.json()["state"] == "cancelled"
+        # 终止时任务必须**已经**是 cancelled（先落态，后终止）
+        assert order == ["terminate:cancelled"], f"顺序错误：{order}"
+        assert child.poll() is not None, "合法取消应终止进程树"
+
+    assert app.state.proc_registry.for_job(job_id) == []
+
+
+def test_cancel_queued_runs_cleanup(tmp_path: Path) -> None:
+    """排队任务取消后不会走 _finalize，接口必须主动做任务级清理。"""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    app = create_app(_config(tmp_path, model_dir))
+    app.state.pipeline.enqueue = lambda job_id: None  # type: ignore[assignment]
+    with authed(app) as client:
+        model_id = client.get("/api/render/models").json()["models"][0]["model_id"]
+        created = client.post(
+            "/api/render/jobs", json={"model_id": model_id, "mode": "faithful", "auto_frame": False}
+        )
+        job_id = created.json()["job_id"]
+        # 造一个残留 work 目录，模拟排队/进行中残留
+        job = app.state.jobs.get(job_id)
+        work = Path(job.output_dir) / "work"
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "tmp.exr").write_bytes(b"\0" * 1024)
+
+        response = client.post(f"/api/render/jobs/{job_id}/cancel")
+        assert response.status_code == 200
+        assert not work.exists(), "取消后必须清理残留 work 目录"
