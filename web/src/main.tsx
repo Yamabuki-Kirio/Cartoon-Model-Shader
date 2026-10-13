@@ -1,13 +1,16 @@
 import { render } from "preact";
 import { App } from "./app/App";
 import { createWorkspace } from "./state/workspace";
+import { createRenderStore } from "./state/render-store";
 import { createApiClient, readInjectedToken } from "./api/client";
 import { Endpoints } from "./api/endpoints";
+import { RenderEndpoints } from "./api/render-endpoints";
 import { parseSchema } from "./schema/parse";
 import "./styles/index.css";
 
 const client = createApiClient();
 const endpoints = new Endpoints(client);
+const renderEndpoints = new RenderEndpoints(client);
 
 /**
  * 工作台能用的接口**逐条列出来**，而不是把整个 `Endpoints` 直接传进去。
@@ -35,6 +38,9 @@ const workspace = createWorkspace({
   },
 });
 
+/** 渲染工作流的独立 store（不引入第二份调参草稿）。 */
+const renderStore = createRenderStore({ endpoints: renderEndpoints });
+
 /**
  * 挂载前先确保令牌就位。
  *
@@ -52,7 +58,7 @@ async function mount(): Promise<void> {
   }
   const target = document.getElementById("app");
   if (target) {
-    render(<App workspace={workspace} />, target);
+    render(<App workspace={workspace} renderController={renderStore} />, target);
   }
 }
 
