@@ -21,6 +21,8 @@
 - 在浏览器中调整曝光、辉光、取景、Cel 色带与逐材质参数。
 - 支持预览、参数预设、工程备份与安全保存。
 - 预览或保存失败时尝试恢复到修改前的基线。
+- 一键渲染工作流：选择模型 → 材质分析 → 材质确认 → 渲染设置 → 执行渲染 → 查看结果，
+  并可在浏览器中监控任务、取消 / 重试、查看产物。
 
 ## 架构
 
@@ -61,6 +63,41 @@ uvicorn src.server.app:app --host 127.0.0.1 --port 8765
 在 Blender 中打开工程并启动 MCP，然后访问：
 
 - 工作台：<http://127.0.0.1:8765/>
+
+### 一键渲染的环境变量
+
+一键渲染复用仓库内固定入口 `render_pipeline/开始渲染.py`。下列变量（与固定脚本一致，
+也兼容 `TOON_TUNER_` 前缀）**只由服务端读取**，前端接口从不接受任何路径或脚本：
+
+- `TOON_MODEL_ROOT`：受信任的模型根目录（扫描 `.pmx` / `.pmd` / `.blend` / `.x`）。
+- `TOON_SOURCE_BLEND`：提供节点组的源 `.blend`。
+- `TOON_BLENDER`：Blender 可执行文件路径。
+- `TOON_RUNTIME_DIR`：确认数据 / 预览 / 任务 / 锁的运行目录（默认 `runtime/`）。
+- `TOON_MAPS_DIR`：侧车映射目录（默认用户数据目录，不进仓库）。
+- `TOON_TUNER_OUTPUT_DIR`：渲染产物输出根目录（默认仓库根 `output/`）。
+
+未设置 `TOON_TUNER_API_TOKEN` 时写接口沿用进程内会话令牌（由 `GET /` 注入页面）；
+一键渲染的「执行渲染」子进程只会以白名单参数调用固定脚本，绝不接受前端提交的命令。
+
+### 资源治理（磁盘 / 内存 / 进程）
+
+每次渲染的任务目录分为 `artifacts/`（最终成品）、`logs/`（诊断日志）、`work/`（中间文件，
+任务结束后清理）。默认保留策略（可用下面这些变量覆盖，前缀同为 `TOON_` / `TOON_TUNER_`）：
+
+- `TOON_RENDER_MAX_JOBS=30`：最多保留的任务数。
+- `TOON_RENDER_MAX_AGE_DAYS=14`：成功任务最长保留天数。
+- `TOON_RENDER_MAX_TOTAL_GB=20`：输出总容量上限。
+- `TOON_RENDER_MAX_MEMORY_JOBS=200`：内存中最多保留的任务条数。
+- `TOON_RENDER_KEEP_FAILED_LOGS=1`：失败任务是否保留末尾日志。
+
+清理顺序为：已取消 → 失败 → 超龄成功 → 超数量最旧 → 超容量最旧；**正在运行、等待确认、
+被用户固定的任务绝不清理**。所有删除都限制在服务端配置的 `output/` 与 `runtime/` 内，
+并拒绝路径穿越、符号链接与 sibling-prefix。
+
+相关接口：`GET /api/render/storage`（容量/任务数/可清理空间）、
+`POST /api/render/storage/cleanup`（`dry_run=true` 预演）、
+`POST /api/render/jobs/{id}/pin`（保护任务）。前端在渲染页顶部展示容量与「保留此任务 /
+清理历史任务」入口。
 
 ## 注意事项
 

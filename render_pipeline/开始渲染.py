@@ -218,11 +218,46 @@ def send(cmd, timeout=60):
 
 
 def launch_blender(argv, log_path):
+    """经 MCP 在**常驻 Blender** 里派发一个后台 Blender 进程。
+
+    返回 MCP 响应 ``r``。**关键**：真实 Blender 的 PID 在 ``r`` 里（``@@LAUNCH@@``），
+    但它是**在常驻 Blender 进程**里启动的，不属于本入口脚本的子进程 —— 因此必须把
+    PID 显式转发到本进程 stdout，HTTP 编排层才能登记并纳入 Job Object / 兜底终止。
+    这里统一打印稳定事件 ``@@BLENDER_PID@@{"pid": N}``。
+    """
     code = ("import subprocess, json\n"
             "p = subprocess.Popen(%r, stdout=open(%r,'w',encoding='utf-8',errors='replace'),"
             " stderr=subprocess.STDOUT)\n"
             "print('@@LAUNCH@@' + json.dumps({'pid': p.pid}))\n" % (argv, log_path))
-    return send({"type": "execute_code", "params": {"code": code}}, timeout=60)
+    r = send({"type": "execute_code", "params": {"code": code}}, timeout=60)
+    report_blender_pid(r)
+    return r
+
+
+def report_blender_pid(mcp_response):
+    """从 MCP 响应里解析真实 Blender PID，并转发到本进程 stdout。
+
+    在常驻 Blender 里启动的进程不属于本入口脚本的子进程，必须显式上报 PID，
+    否则调用方无法终止它。解析失败时打印 ``@@BLENDER_PID@@{"pid": null}``，
+    让调用方明确知道「未能取得 PID，不保证可终止」，而不是静默当作成功。
+    """
+    pid = None
+    try:
+        text = mcp_response if isinstance(mcp_response, str) else json.dumps(mcp_response)
+        marker = "@@LAUNCH@@"
+        if marker in text:
+            payload = text.split(marker, 1)[1]
+            # 用正则直接抓 pid：payload 可能是被 json.dumps 转义过的（引号前带 `\`），
+            # 因此不能依赖严格的 JSON 解析。
+            import re
+
+            # 引号可能被 json.dumps 转义成 `\"`，因此允许引号前有可选反斜杠。
+            m = re.search(r'\\?"pid\\?"\s*:\s*(\d+)', payload)
+            if m:
+                pid = int(m.group(1))
+    except Exception:
+        pid = None
+    out("@@BLENDER_PID@@%s" % json.dumps({"pid": pid}))
 
 
 # ---------------------------------------------------------------- 各步骤
@@ -367,6 +402,7 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
         out("  请在页面上逐条确认；全部确认后服务端会自动继续渲染，无需再点任何按钮。")
 
         prev = None
+        reported_pid = None
         while True:
             try:
                 st = http_json("%sapi/session/%s/status" % (url, sid), timeout=5)
@@ -379,6 +415,12 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
                                                            % srv.returncode}}
                 time.sleep(1.5)
                 continue
+            # 确认服务自动续跑时启动的真实 Blender：其 PID 由服务端持有并通过 status
+            # 暴露。必须转发到本进程 stdout —— 它是常驻 Blender 派发的，不是本脚本子进程。
+            pid = st.get("blender_pid")
+            if pid and pid != reported_pid:
+                reported_pid = pid
+                out("@@BLENDER_PID@@%s" % json.dumps({"pid": pid}))
             key = (st.get("state"), st.get("attempt"), st.get("pending"))
             if key != prev:
                 prev = key

@@ -77,6 +77,13 @@ from . import (
 from .binder import BlenderBinder, preview_dir, preview_png_name
 from .blender_mcp import BlenderMCPClient
 from .commit import CommitService
+from .models_scan import ModelRegistry
+from .proc_cleanup import ProcessRegistry
+from .render_jobs import RenderJobManager
+from .render_pipeline_adapter import RenderPipelineService
+from .render_storage import StorageService
+from pathlib import Path
+import os
 from .config import AppConfig, ConfigError, load_config
 from .models import (
     BaselineRequest,
@@ -103,6 +110,12 @@ from .models import (
     RestoreResponse,
     SceneResponse,
     V4PreviewRequest,
+    ArtifactListResponse,
+    ModelInfoResponse,
+    RenderJobResponse,
+    RenderLogResponse,
+    RenderMaterialsResponse,
+    RenderSettingsRequest,
 )
 from .presets import PresetStore
 from .redact import redact
@@ -251,12 +264,57 @@ def create_app(
     store = preset_store or PresetStore(cfg.presets_dir or presets_module.presets_dir())
     commit = CommitService(binder, preview)
 
+    # 渲染工作流编排层（固定入口 = render_pipeline/开始渲染.py，绝不来自前端）。
+    # 在 lifespan 之前构建，便于常驻 worker 随服务生命周期启停。
+    _render_rt = cfg.render.runtime_dir or (config_module.REPO_ROOT / "runtime")
+    _registry_path = Path(_render_rt) / ".model_registry.json"
+    _output_root = cfg.render.output_dir or (config_module.REPO_ROOT / "output")
+    registry = ModelRegistry(cfg.render.model_root, _registry_path)
+    job_manager = RenderJobManager(
+        _output_root,
+        max_memory_jobs=cfg.render.max_memory_jobs,
+        history_index_path=Path(_render_rt) / ".jobs_index.json",
+    )
+    # 资源治理：允许删除的根目录只有服务端配置的 output/ 与 runtime/。
+    _allowed_roots = [str(_output_root), str(_render_rt)]
+    storage = StorageService(job_manager, cfg.render.retention_policy, _allowed_roots)
+    proc_registry = ProcessRegistry()
+    pipeline = RenderPipelineService(
+        job_manager,
+        registry,
+        fixed_render_script=cfg.render.pipeline_script_path,
+        model_root=cfg.render.model_root,
+        source_blend=cfg.render.source_blend,
+        blender=cfg.render.blender,
+        runtime_dir=cfg.render.runtime_dir,
+        maps_dir=cfg.render.maps_dir,
+        output_root=_output_root,
+        storage=storage,
+        proc_registry=proc_registry,
+    )
+    try:
+        registry.scan()
+    except Exception:  # noqa: BLE001 - 扫描失败不阻断服务启动
+        pass
+    # 启动时清理上次异常退出遗留的临时目录（work/），避免无界增长。
+    try:
+        storage.cleanup_stale_work()
+    except Exception:  # noqa: BLE001 - 清理失败不阻断启动
+        pass
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         await preview.start()
+        await pipeline.start_worker()
         try:
             yield
         finally:
+            # 退出：先终止任务进程树，再停 worker，最后做一次轻量清理。
+            await pipeline.stop_worker()
+            try:
+                storage.cleanup(dry_run=False)
+            except Exception:  # noqa: BLE001 - 关闭阶段吞掉清理异常
+                pass
             await preview.stop()
 
     app = FastAPI(
@@ -274,6 +332,11 @@ def create_app(
     app.state.presets = store
     app.state.commit = commit
     app.state.surface = surface_service
+    app.state.registry = registry
+    app.state.jobs = job_manager
+    app.state.pipeline = pipeline
+    app.state.storage = storage
+    app.state.proc_registry = proc_registry
 
     # 写接口统一的依赖：缺失/错误令牌一律 401 拒绝。
     require_token = [Depends(security.require_session_token)]
@@ -693,6 +756,217 @@ def create_app(
         """v4 任务状态。与 ``/api/jobs/{id}`` 共用同一份任务存储（排队与取代机制同一套）。"""
         job = preview.get_job(job_id)
         if job is None:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        return job.to_public()
+
+    # -- 渲染工作流（规格 §5-§9；适配器只调用固定脚本，不复制/覆盖） -----
+    @app.get("/api/render/models", response_model=ModelInfoResponse, tags=["render"])
+    async def render_models() -> dict[str, Any]:
+        return {"ok": True, "models": app.state.registry.to_public()}
+
+    @app.post(
+        "/api/render/models/refresh",
+        response_model=ModelInfoResponse,
+        tags=["render"],
+        dependencies=require_token,
+    )
+    async def render_models_refresh() -> dict[str, Any]:
+        return {"ok": True, "models": app.state.registry.scan()}
+
+    @app.post(
+        "/api/render/jobs",
+        response_model=RenderJobResponse,
+        tags=["render"],
+        dependencies=require_token,
+    )
+    async def create_render_job(body: RenderSettingsRequest) -> dict[str, Any]:
+        job, created = app.state.pipeline.create_job(
+            body.model_id, body.model_dump(exclude={"model_id"})
+        )
+        # 仅新任务入队：复用活跃任务时重复入队会让同一任务被执行两次。
+        if created:
+            app.state.pipeline.enqueue(job.job_id)
+        return job.to_public()
+
+    @app.get("/api/render/jobs", tags=["render"])
+    async def list_render_jobs() -> list[dict[str, Any]]:
+        return [j.to_public() for j in reversed(app.state.jobs.list_jobs())]
+
+    @app.get(
+        "/api/render/jobs/{job_id}",
+        response_model=RenderJobResponse,
+        tags=["render"],
+    )
+    async def get_render_job(job_id: str) -> dict[str, Any]:
+        job = app.state.jobs.get(job_id)
+        if job is None:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        return job.to_public(include_logs=True, include_artifacts=True)
+
+    @app.post(
+        "/api/render/jobs/{job_id}/retry",
+        response_model=RenderJobResponse,
+        tags=["render"],
+        dependencies=require_token,
+    )
+    async def retry_render_job(job_id: str) -> dict[str, Any]:
+        job = app.state.jobs.retry(job_id)
+        app.state.pipeline.enqueue(job.job_id)
+        return job.to_public()
+
+    @app.post(
+        "/api/render/jobs/{job_id}/cancel",
+        response_model=RenderJobResponse,
+        tags=["render"],
+        dependencies=require_token,
+    )
+    async def cancel_render_job(job_id: str) -> dict[str, Any]:
+        # 1) **先原子校验并落 cancelled 状态**。绝不能在状态非法时先杀进程 —— 否则
+        #    rendering/verifying/success 等不可取消状态下，用户会看到「取消失败」，
+        #    而渲染实际上已被终止。
+        try:
+            job = app.state.jobs.cancel(job_id, reason="用户取消")
+        except KeyError:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        except ValueError as exc:
+            raise errors.ToonTunerError(
+                errors.PARAM_INVALID, str(exc) or "当前状态不可取消", retryable=False
+            )
+
+        # 2) 已进入 cancelled：终止整棵进程树（入口脚本 + MCP 派发的真实 Blender + 确认服务）。
+        #    即使终止失败也**保留 cancelled**（不恢复成运行中），并如实报告残留 PID。
+        try:
+            unresolved = await app.state.pipeline.cancel_job(job_id)
+        except Exception as exc:  # noqa: BLE001 - 终止异常不得回滚已落定的取消态
+            unresolved = []
+            app.state.jobs.append_log(job_id, f"[render] 终止进程树时出错：{exc}")
+        if unresolved:
+            app.state.jobs.append_log(
+                job_id, f"[render] 警告：以下进程未能确认退出：{unresolved}"
+            )
+
+        # 3) 排队任务不会经过正常 _finalize()，必须在此主动做一次任务级清理，
+        #    否则空输出目录与临时文件会残留。
+        try:
+            app.state.storage.cleanup_after_terminal(job)
+        except Exception as exc:  # noqa: BLE001
+            app.state.jobs.append_log(job_id, f"[render] 取消后清理失败：{exc}")
+
+        return app.state.jobs.get(job_id).to_public()
+
+    @app.get(
+        "/api/render/jobs/{job_id}/materials",
+        response_model=RenderMaterialsResponse,
+        tags=["render"],
+    )
+    async def get_materials(job_id: str) -> dict[str, Any]:
+        job = app.state.jobs.get(job_id)
+        if job is None:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "materials": job.materials,
+            "confirmed_count": job.confirmed_count,
+            "required_count": job.required_count,
+            "confirm_url": job.confirm_url,
+            "waiting": job.state == "waiting_confirmation",
+        }
+
+    @app.get(
+        "/api/render/jobs/{job_id}/artifacts",
+        response_model=ArtifactListResponse,
+        tags=["render"],
+    )
+    async def list_artifacts(job_id: str) -> dict[str, Any]:
+        job = app.state.jobs.get(job_id)
+        if job is None:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        return {"ok": True, "job_id": job_id, "artifacts": job.list_artifacts()}
+
+    @app.get(
+        "/api/render/jobs/{job_id}/artifacts/{artifact_id}",
+        tags=["render"],
+        response_class=FileResponse,
+    )
+    async def artifact_file(job_id: str, artifact_id: str) -> Any:
+        """按 opaque artifact_id 取文件；真实路径只在服务端解析，前端不可指定。
+
+        安全：**不从 artifact_id 重建任何路径**。artifact_id 只是从服务端自己
+        枚举出的产物列表里查出来的键，因此 ``..`` / 绝对路径 / 编码穿越 / sibling
+        前缀（如 ``C:\\out-evil`` 对上 ``C:\\out``）都不可能越界。命中后再用
+        ``is_relative_to`` 复核一次落盘位置。
+        """
+        job = app.state.jobs.get(job_id)
+        if job is None:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+
+        match = next(
+            (art for art in job.list_artifacts() if art["artifact_id"] == artifact_id), None
+        )
+        if match is None:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"产物不存在：{artifact_id}")
+
+        base = Path(job.output_dir).resolve()
+        path = (base / match["name"]).resolve()
+        # 双保险：即便产物列表被污染，也必须真的落在输出目录内。
+        if not path.is_relative_to(base) or not path.is_file():
+            raise errors.ToonTunerError(errors.PREVIEW_FAILED, "产物文件不可用。")
+        return FileResponse(path)
+
+    @app.post(
+        "/api/render/jobs/{job_id}/open-output",
+        tags=["render"],
+        dependencies=require_token,
+    )
+    async def open_output(job_id: str) -> dict[str, Any]:
+        job = app.state.jobs.get(job_id)
+        if job is None:
+            raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
+        out = Path(job.output_dir)
+        opened = False
+        try:
+            if os.name == "nt":
+                os.startfile(str(out))  # type: ignore[attr-defined]
+            else:
+                import subprocess as _sp
+
+                _sp.run(["xdg-open", str(out)], check=False)
+            opened = True
+        except Exception:
+            opened = False
+        return {"ok": True, "opened": opened, "directory": out.name}
+
+    # -- 资源治理（规格《资源治理》第 6 节） ------------------------------
+    @app.get("/api/render/storage", tags=["render"])
+    async def render_storage() -> dict[str, Any]:
+        """容量、任务数、可清理空间。只读，不带令牌。"""
+        return app.state.storage.usage()
+
+    @app.post(
+        "/api/render/storage/cleanup",
+        tags=["render"],
+        dependencies=require_token,
+    )
+    async def render_storage_cleanup(dry_run: bool = False) -> dict[str, Any]:
+        """执行安全清理。``dry_run=true`` 只预演不删除。"""
+        report = app.state.storage.cleanup(dry_run=dry_run)
+        payload = report.to_public()
+        payload["ok"] = True
+        payload["dry_run"] = dry_run
+        return payload
+
+    @app.post(
+        "/api/render/jobs/{job_id}/pin",
+        response_model=RenderJobResponse,
+        tags=["render"],
+        dependencies=require_token,
+    )
+    async def pin_render_job(job_id: str, pinned: bool = True) -> dict[str, Any]:
+        """固定/取消固定任务。固定后的任务**绝不**被自动清理。"""
+        try:
+            job = app.state.jobs.set_pinned(job_id, pinned)
+        except KeyError:
             raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
         return job.to_public()
 

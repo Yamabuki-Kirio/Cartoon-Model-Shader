@@ -70,6 +70,12 @@ FRONTEND_NOT_BUILT = "FRONTEND_NOT_BUILT"
 SURFACE_APPLY_FAILED = "SURFACE_APPLY_FAILED"
 #: `/assets/*` 的静态资源不存在（含路径越界；两种情况刻意不区分）。
 ASSET_NOT_FOUND = "ASSET_NOT_FOUND"
+#: 渲染工作流（HTTP 编排层）
+MODEL_NOT_FOUND = "MODEL_NOT_FOUND"
+RENDER_PREFLIGHT_FAILED = "RENDER_PREFLIGHT_FAILED"
+RENDER_OUTPUT_MISSING = "RENDER_OUTPUT_MISSING"
+RENDER_SUBPROCESS_FAILED = "RENDER_SUBPROCESS_FAILED"
+RENDER_EXECUTOR_LOCKED = "RENDER_EXECUTOR_LOCKED"
 
 #: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，
 #: 便于调用方直接读到 ``parameter`` / ``value`` / ``depends_on`` / ``allowed``。
@@ -315,6 +321,31 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         404,
         False,
         "前端静态资源不存在。若页面白屏，请重新执行 npm run build 后再刷新。",
+    ),
+    MODEL_NOT_FOUND: (
+        404,
+        False,
+        "模型不存在或尚未被扫描到。请先在「模型」列表刷新，或确认模型放在受信任的模型目录内。",
+    ),
+    RENDER_PREFLIGHT_FAILED: (
+        502,
+        True,
+        "渲染预检失败（模型无法解析或分类）。请确认模型文件完整后重试。",
+    ),
+    RENDER_OUTPUT_MISSING: (
+        502,
+        True,
+        "渲染子进程结束但未产出任何产物文件。请查看任务日志与 Blender 侧报错后重试。",
+    ),
+    RENDER_SUBPROCESS_FAILED: (
+        502,
+        True,
+        "渲染子进程异常退出。请查看任务日志后重试。",
+    ),
+    RENDER_EXECUTOR_LOCKED: (
+        409,
+        True,
+        "同一模型已有渲染在进行，已拒绝重复启动（跨进程锁保证单渲染者）。请等待当前任务结束或先取消。",
     ),
 }
 

@@ -476,3 +476,72 @@ class CommitResponse(BaseModel):
     baseline_refreshed: bool = False
     saved_at: str
     warnings: list[str] = Field(default_factory=list)
+
+
+# -- 渲染工作流（HTTP 编排层） -------------------------------------------
+
+
+class RenderSettingsRequest(BaseModel):
+    """提交渲染任务：只接受 opaque model_id + 白名单设置；绝不接受路径/脚本/命令。
+
+    ``mode`` 仅 faithful | enhanced；``auto_frame`` 是否自动构图。其余字段一律 422 拒绝。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_id: str
+    mode: Literal["faithful", "enhanced"] = "faithful"
+    auto_frame: bool = False
+
+
+class ModelInfoResponse(BaseModel):
+    ok: Literal[True] = True
+    models: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class RenderJobResponse(BaseModel):
+    ok: Literal[True] = True
+    job_id: str
+    model_id: str
+    model_name: str
+    fingerprint: str
+    state: str
+    step: int
+    stage: str
+    step_count: int
+    settings: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    updated_at: str
+    is_terminal: bool = False
+    materials: list[dict[str, Any]] = Field(default_factory=list)
+    confirm_url: str | None = None
+    confirmed_count: int = 0
+    required_count: int = 0
+    #: 资源治理：是否被用户固定、占用字节数、保留状态。
+    pinned: bool = False
+    disk_bytes: int = 0
+    retention_state: str = "kept"
+    logs: list[str] | None = None
+    artifacts: list[dict[str, Any]] | None = None
+
+
+class RenderMaterialsResponse(BaseModel):
+    ok: Literal[True] = True
+    job_id: str
+    materials: list[dict[str, Any]] = Field(default_factory=list)
+    confirmed_count: int = 0
+    required_count: int = 0
+    confirm_url: str | None = None
+    waiting: bool = False
+
+
+class ArtifactListResponse(BaseModel):
+    ok: Literal[True] = True
+    job_id: str
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class RenderLogResponse(BaseModel):
+    ok: Literal[True] = True
+    job_id: str
+    logs: list[str] = Field(default_factory=list)
