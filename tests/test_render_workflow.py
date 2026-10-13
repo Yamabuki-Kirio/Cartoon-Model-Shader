@@ -239,6 +239,72 @@ def test_adapter_passes_lighting_and_glow_flags(tmp_path: Path) -> None:
     assert argv["glow_size"] is None
 
 
+def test_adapter_passes_explicit_model_path(tmp_path: Path) -> None:
+    """适配器必须显式传解析出的模型路径（--pmx），不能再依赖注册表指纹反查。
+
+    Web 注册表指纹是「大小 + 前 1MB」哈希，入口脚本 locate() 按整文件 sha256
+    反查 —— 两套口径不同，传 --fingerprint 会对任何模型都「找不到模型」。
+    """
+    import asyncio
+    import json
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    manager, service, registry = _make_service(tmp_path, FAKE_ARGV, model_dir)
+    entry = registry.to_public()[0]
+    model_id = entry["model_id"]
+    real_path, _fp, _name = registry.resolve(model_id)
+
+    job, created = service.create_job(model_id, {"mode": "faithful", "auto_frame": False})
+    assert created is True
+    asyncio.run(service.start(job.job_id))
+
+    final = manager.get(job.job_id)
+    assert final is not None
+    assert final.state == "success"
+    argv = json.loads((Path(final.output_dir) / "argv.json").read_text(encoding="utf-8"))
+    assert argv["pmx"] == str(real_path)
+    assert argv["blend"] is None
+
+
+def test_adapter_blend_model_uses_blend_flag(tmp_path: Path) -> None:
+    """.blend 模型必须走 --blend（驱动 --pmx/--blend 二选一），且不再要求源工程。
+
+    口径与 2026-10-14 凌晨 91.blend 真机三连跑一致：--blend <自身> --resolve <自身>。
+    """
+    import asyncio
+    import json
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "scene.blend").write_bytes(b"BLENDER-scene-bytes")
+    registry = ModelRegistry(model_dir, tmp_path / ".reg.json")
+    registry.scan()
+    manager = RenderJobManager(tmp_path / "out")
+    service = RenderPipelineService(
+        manager,
+        registry,
+        fixed_render_script=FAKE_ARGV,
+        model_root=model_dir,
+        runtime_dir=tmp_path / "runtime",
+        output_root=tmp_path / "out",
+    )
+    model_id = registry.to_public()[0]["model_id"]
+    real_path, _fp, _name = registry.resolve(model_id)
+    assert real_path.endswith("scene.blend")
+
+    job, created = service.create_job(model_id, {"mode": "enhanced", "auto_frame": False})
+    assert created is True
+    asyncio.run(service.start(job.job_id))
+
+    final = manager.get(job.job_id)
+    assert final is not None
+    assert final.state == "success"
+    argv = json.loads((Path(final.output_dir) / "argv.json").read_text(encoding="utf-8"))
+    assert argv["blend"] == str(real_path)
+    assert argv["pmx"] is None
+
+
 def test_adapter_zero_exit_without_artifacts_is_failure(tmp_path: Path) -> None:
     import asyncio
 

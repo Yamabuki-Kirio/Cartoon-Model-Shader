@@ -416,13 +416,12 @@ def _run_one(tgt, out_dir, job, timeout=1800):
 
     argv = [job.get("blender") or BLENDER, "--background", "--factory-startup",
             "--python", job.get("driver") or DRIVER, "--",
-            "--pmx", tgt["pmx"], "--out", out_dir,
+            "--out", out_dir,
             "--mode", job.get("mode", "faithful"),
             "--material-policy", "strict",
             "--lighting", job.get("lighting") or "volume_fog",
             "--fog-density", str(job.get("fog_density")
                                  if job.get("fog_density") is not None else 0.018),
-            "--resolve", job.get("source_blend") or SOURCE_BLEND,
             "--script", job.get("script") or SCRIPT,
             "--auto-frame", str(int(job.get("auto_frame") or 0)),
             # ★ F6：把映射目录一路带到驱动与主脚本。以前这里只传 --material-map（且是在
@@ -430,6 +429,13 @@ def _run_one(tgt, out_dir, job, timeout=1800):
             #   现在两条路都给：显式文件优先，目录兜底（渲染时按指纹重查）。
             "--maps-dir", job.get("maps_dir") or STATE.get("maps_dir") or DEFAULT_MAPS_DIR,
             "--log", logp, "--done", done]
+    # 目标种类决定驱动的二选一开关：.blend 直开且以自身为源工程（--resolve 指向自己）；
+    # PMX 导入 + job/环境里的源工程。与 开始渲染.py 的 render() 口径一致。
+    blend = tgt.get("blend")
+    if blend:
+        argv += ["--blend", blend, "--resolve", blend]
+    else:
+        argv += ["--pmx", tgt["pmx"], "--resolve", job.get("source_blend") or SOURCE_BLEND]
     # 辉光微调来自 job 文件（入口脚本写入；不传则用主脚本默认修复值）。
     for key, flag in (("Threshold", "--glow-threshold"), ("Strength", "--glow-strength"),
                       ("Size", "--glow-size"), ("Smoothness", "--glow-smoothness"),
@@ -486,7 +492,7 @@ def _render_worker(attempt, targets, job):
     ts = time.strftime("%m%d_%H%M%S")
     try:
         for tgt in targets:
-            label = tgt.get("label") or os.path.basename(tgt["pmx"])
+            label = tgt.get("label") or os.path.basename(tgt.get("blend") or tgt.get("pmx") or "")
             out_dir = tgt.get("out") or os.path.join(
                 out_root, "%s_%s_a%d" % (os.path.splitext(label)[0], ts, attempt))
             lockp = os.path.join(LOCK_DIR, "%s.render.lock" % tgt["fingerprint"][:16])
@@ -611,16 +617,18 @@ def _validate_job(job):
     for t in (job.get("targets") or []):
         fp = (t.get("fingerprint") or "").strip()
         pmx = t.get("pmx")
+        blend = t.get("blend")
+        model = blend or pmx
         if fp not in STATE["models"]:
             continue                                   # ① 必须是本次登记过的会话
-        if not pmx or not os.path.isfile(pmx):
+        if not model or not os.path.isfile(model):
             continue
         try:
-            if sha256_of(pmx) != fp:
+            if sha256_of(model) != fp:
                 continue                               # ② 内容指纹必须对上
         except Exception:
             continue
-        if not ROOT or not _under(pmx, ROOT):
+        if not ROOT or not _under(model, ROOT):
             continue                                   # ③ 必须位于素材根目录下
         out = t.get("out")
         allowed_out_root = job.get("out_root") or os.path.join(RUNTIME_DIR, "output")
@@ -632,8 +640,8 @@ def _validate_job(job):
             cand = map_path_for(None, fp, maps_dir)
             if os.path.isfile(cand) and _under(cand, maps_dir):
                 mf = cand
-        tgs.append({"fingerprint": fp, "pmx": pmx,
-                    "label": t.get("label") or os.path.basename(pmx),
+        tgs.append({"fingerprint": fp, "pmx": pmx, "blend": blend,
+                    "label": t.get("label") or os.path.basename(model),
                     "out": out, "map_file": mf})
     job["targets"] = tgs
     if not job.get("out_root"):

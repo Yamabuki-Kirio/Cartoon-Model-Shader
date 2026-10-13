@@ -45,6 +45,27 @@ _GLOW_FLAGS = (("glow_threshold", "--glow-threshold"),
 #: 视频不算成品图：先出图再出视频的管线里，视频缺失不应阻断交付判定。
 _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
+#: 入口脚本（开始渲染.py）驱动的二选一开关：.blend 直开，其余按 PMX 导入。
+_BLEND_SUFFIX = ".blend"
+
+
+def _sha256_file(path: str | Path) -> str:
+    """整文件 sha256 —— 与入口脚本/主脚本的 ``sha256_of`` 同口径。
+
+    ★ 与 Web 注册表指纹（大小 + 前 1MB）**不是**同一口径：确认清单文件名、
+      侧车映射文件名用的都是整文件 sha256，拿注册表指纹去拼会永远找不到文件。
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1 << 20)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
 
 def _deliverable_images(job: Any) -> list[dict[str, Any]]:
     """任务输出目录里的成品图（规格 §6.4 的「至少一张合法成品图」）。"""
@@ -387,11 +408,22 @@ class RenderPipelineService:
     # -- 调用固定脚本 ----------------------------------------------------
     async def _run_fixed_script(self, job: Any, fp: str, out_dir: str) -> None:
         self._manager.set_state(job.job_id, "preflight")
+        # 真实路径只在服务端注册表里解析（前端永远只给 opaque model_id）。
+        # ★ 过去这里传 ``--fingerprint <注册表指纹>``，而入口脚本的 locate() 按
+        #   **整文件 sha256** 反查 —— 两套指纹口径不同，Web 一键渲染对任何模型都会
+        #   死在「找不到模型」。改为显式传解析出的路径（--pmx/--blend 二选一）。
+        try:
+            model_path, _resolved_fp, _name = self._registry.resolve(job.model_id)
+        except KeyError:
+            raise errors.ToonTunerError(
+                errors.MODEL_NOT_FOUND, f"模型已不在注册表中：{job.model_id}", retryable=False
+            )
+        kind_blend = Path(model_path).suffix.lower() == _BLEND_SUFFIX
         cmd: list[str] = [
             sys.executable,
             str(self._fixed),
-            "--fingerprint",
-            fp,
+            "--blend" if kind_blend else "--pmx",
+            str(model_path),
             "--out",
             out_dir,
             "--mode",
@@ -467,7 +499,10 @@ class RenderPipelineService:
             self._safe_transition(job_id, "analyzing_materials")
         elif "材质需要确认" in line:
             self._safe_transition(job_id, "waiting_confirmation")
-            items = self._read_confirmation(fp)
+            # 确认清单文件名用**整文件 sha256**（入口脚本 preflight 的口径），
+            # 不是注册表指纹 —— 必须先解析模型路径再算，否则永远读不到文件。
+            pipe_fp = self._pipeline_fingerprint(job_id)
+            items = self._read_confirmation(pipe_fp) if pipe_fp else None
             if items:
                 self._manager.set_materials(job_id, items, confirm_url=self._confirm_url())
         elif "直接渲染" in line or "渲染中" in line:
@@ -681,6 +716,21 @@ class RenderPipelineService:
 
     def _confirm_url(self) -> str:
         return f"http://127.0.0.1:{CONFIRM_PORT}/"
+
+    def _pipeline_fingerprint(self, job_id: str) -> str | None:
+        """任务对应模型文件的**整文件 sha256**（入口脚本/主脚本口径）。
+
+        Web 注册表指纹是「大小 + 前 1MB」的哈希，与管线口径不同；确认清单、
+        侧车映射的文件名都用整文件 sha256，混用会永远找不到文件。
+        """
+        job = self._manager.get(job_id)
+        if job is None:
+            return None
+        try:
+            path, _fp, _name = self._registry.resolve(job.model_id)
+            return _sha256_file(path)
+        except (KeyError, OSError):
+            return None
 
     def _read_confirmation(self, fp: str) -> list[dict[str, Any]] | None:
         base = self._runtime_dir or (self._output_root / "runtime")

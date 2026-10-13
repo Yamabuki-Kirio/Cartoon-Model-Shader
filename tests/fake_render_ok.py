@@ -18,6 +18,8 @@ import sys
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fingerprint")
+    ap.add_argument("--pmx", default=None)
+    ap.add_argument("--blend", default=None)
     ap.add_argument("--out", required=True)
     ap.add_argument("--mode", default="faithful")
     ap.add_argument("--auto-frame", type=int, default=0)

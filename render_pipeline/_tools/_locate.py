@@ -36,12 +36,17 @@ def sha256_of(path, limit=None):
     return h.hexdigest()
 
 
+#: 与 Web 模型注册表（src/server/models_scan.py 的 _MODEL_EXTS）一致：
+#: 注册表列得的模型，本工具也必须能定位到。
+MODEL_EXTS = (".pmx", ".pmd", ".blend", ".x")
+
+
 def iter_pmx(root=ROOT):
     if not root:
         return
     for r, _ds, fs in os.walk(root):
         for f in sorted(fs):
-            if f.lower().endswith(".pmx"):
+            if f.lower().endswith(MODEL_EXTS):
                 yield os.path.join(r, f)
 
 
