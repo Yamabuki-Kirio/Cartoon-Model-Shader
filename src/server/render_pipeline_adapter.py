@@ -22,6 +22,7 @@ from typing import Any, Sequence
 
 from . import errors
 from .file_lock import FileLockHolder, LockBusy
+from .proc_cleanup import WindowsJobObject, terminate_job_processes
 from .render_jobs import RenderJobManager
 
 logger = logging.getLogger("toon_tuner")
@@ -132,6 +133,15 @@ class RenderPipelineService:
         """
         unresolved: list[str] = []
         deadline = time.monotonic() + grace_seconds
+
+        # 先关闭所有任务的 Job Object —— 一次终止各任务整棵进程树（含真实 Blender）。
+        if self._proc_registry is not None:
+            for job_id, job_object in list(self._proc_registry.jobs.items()):
+                try:
+                    job_object.close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("关闭任务 %s 的 Job Object 失败：%s", job_id, exc)
+                self._proc_registry.release_job_object(job_id)
 
         for proc in self._manager.active_procs():
             if proc.returncode is not None:
@@ -280,9 +290,28 @@ class RenderPipelineService:
                 details={"holder": exc.holder},
             )
         self._holders[job_id] = holder
+        # 为本次渲染建立进程树治理：Windows 下创建 Job Object 并绑定该任务，
+        # 之后入口脚本与其经 MCP 派发的真实 Blender 都会落在同一个 Job 内。
+        job_object = None
+        if self._proc_registry is not None:
+            try:
+                job_object = WindowsJobObject()
+                if job_object.available:
+                    self._proc_registry.attach_job_object(job_id, job_object)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("创建 Job Object 失败，将退化为逐 PID 终止：%s", exc)
+                job_object = None
         try:
             await self._run_fixed_script(job, fp, job.output_dir)
         finally:
+            # 正常结束后回收 Job（Job 内进程已自行退出，close 仅释放句柄）。
+            if self._proc_registry is not None:
+                self._proc_registry.release_job_object(job_id)
+            if job_object is not None:
+                try:
+                    job_object.close()
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 holder.release()
             except Exception:
@@ -355,6 +384,10 @@ class RenderPipelineService:
         依据 ``render.done`` 与产物文件判定 —— 因此这里即使匹配不到任何关键词，
         也不会导致任务卡在非终止态。
         """
+        # 固定的开始渲染.py 通过 MCP 派发 Blender 后会打印 `@@LAUNCH@@{...pid...}`；
+        # 必须登记**真实 Blender PID**（不是只记入口 Python）才能保证整树终止。
+        if "@@LAUNCH@@" in line:
+            self._record_dispatched_pid(job_id, line)
         if "预检与自动分类" in line:
             self._safe_transition(job_id, "analyzing_materials")
         elif "材质需要确认" in line:
@@ -366,6 +399,42 @@ class RenderPipelineService:
             self._safe_transition(job_id, "rendering")
         elif "完成（输出" in line:
             self._safe_transition(job_id, "verifying")
+
+    def _record_dispatched_pid(self, job_id: str, line: str) -> None:
+        """从 ``@@LAUNCH@@`` 行解析并登记真实 Blender PID。
+
+        固定脚本用 ``print('@@LAUNCH@@' + json.dumps({'pid': p.pid}))`` 报告派发结果。
+        解析失败时**明确记录「不保证已终止」**，而不是假装成功。
+        """
+        if self._proc_registry is None:
+            return
+        try:
+            payload = line.split("@@LAUNCH@@", 1)[1]
+            data = json.loads(payload)
+            pid = int(data["pid"])
+        except (IndexError, ValueError, KeyError, json.JSONDecodeError):
+            self._manager.append_log(
+                job_id, "[render] 警告：已派发 Blender 但未能解析其 PID，不保证取消/关闭时能终止。"
+            )
+            return
+        self._proc_registry.register(
+            pid,
+            job_id=job_id,
+            exe=str(self._blender) if self._blender else "blender",
+            parent_pid=None,
+            kind="blender",
+        )
+
+    async def cancel_job(self, job_id: str) -> list[int]:
+        """取消任务：终止该任务**整棵进程树**（入口 + MCP 派发的 Blender + 确认服务）。
+
+        返回未能确认退出的 PID 列表（空表示全部已终止）。
+        """
+        if self._proc_registry is None:
+            return []
+        return await asyncio.to_thread(
+            terminate_job_processes, self._proc_registry, job_id, grace_seconds=5.0
+        )
 
     def _finalize(self, job_id: str, out_dir: str, code: int) -> None:
         """终态判定：**只有固定脚本自己说 SUCCESS、或退出码 0 且确有产物**才算成功。

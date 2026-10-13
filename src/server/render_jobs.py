@@ -325,16 +325,16 @@ class RenderJobManager:
         job.updated_at = _now()
         return job
 
-    def cancel(self, job_id: str) -> RenderJob:
+    def cancel(self, job_id: str, *, reason: str | None = None) -> RenderJob:
+        """标记取消（状态流转）。
+
+        **不在此终止进程**：整棵进程树的终止由编排层（``RenderPipelineService.cancel_job``）
+        通过进程注册表统一执行 —— 否则会漏掉 MCP 派发的真实 Blender。
+        """
         job = self._must(job_id)
         if not render_state.can_cancel(job.state):
             raise ValueError(f"当前状态 {job.state} 不可取消")
-        proc = self._active.get(job_id)
-        if proc is not None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+        job.cancel_reason = reason
         return self._force_terminal(job_id, "cancelled")
 
     def retry(self, job_id: str) -> RenderJob:

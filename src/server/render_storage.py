@@ -175,34 +175,43 @@ def choose_evictions(
     def age_key(j: Any) -> float:
         return _parse_iso(j.updated_at) or 0.0
 
-    def take(state_name: str) -> list[Any]:
-        return sorted((j for j in candidates if j.state == state_name), key=age_key)
+    # 淘汰优先级：取消 / 失败排在前面（更早清理），但**不是无条件立即清理** ——
+    # 它们仍需满足「超龄 / 超数量 / 超容量」中至少一个阈值才会被淘汰，
+    # 否则失败诊断（keep_failed_logs）会在服务关闭时被立刻删除。
+    def priority(j: Any) -> int:
+        if j.state == "cancelled":
+            return 0
+        if j.state == "failed":
+            return 1
+        return 2
+
+    def evict_order(j: Any) -> tuple[int, float]:
+        return (priority(j), age_key(j))
+
+    age_seconds = policy.max_age_days * 86400
+
+    def is_expired(j: Any) -> bool:
+        return bool(age_key(j)) and (now - age_key(j)) > age_seconds
 
     ordered: list[Any] = []
-    # 1. 已取消
-    ordered += take("cancelled")
-    # 2. 失败
-    ordered += take("failed")
 
-    # 其余（成功 / rejected / diagnostic 等非取消非失败的终止态）
-    others = [j for j in candidates if j.state not in ("cancelled", "failed")]
+    # 1&2&3：超龄的任务一律优先淘汰（取消/失败排在最前）。
+    expired = [j for j in candidates if is_expired(j)]
+    ordered += sorted(expired, key=evict_order)
 
-    # 3. 超过保存天数的任务
-    age_seconds = policy.max_age_days * 86400
-    expired = [j for j in others if age_key(j) and (now - age_key(j)) > age_seconds]
-    kept = [j for j in others if j not in expired]
-    ordered += sorted(expired, key=age_key)
+    # 尚未超龄的候选（取消/失败仍在前，但不因状态本身被淘汰）。
+    remaining = [j for j in candidates if not is_expired(j)]
+    remaining.sort(key=evict_order)
 
-    # 4. 超出数量限制的最旧任务（先淘汰最旧）
-    kept_sorted = sorted(kept, key=age_key)
-    if len(kept_sorted) > policy.max_jobs:
-        overflow = len(kept_sorted) - policy.max_jobs
-        ordered += kept_sorted[:overflow]
-        kept_sorted = kept_sorted[overflow:]
+    # 4. 超出数量限制时，从淘汰优先级 + 最旧开始清理。
+    if len(remaining) > policy.max_jobs:
+        overflow = len(remaining) - policy.max_jobs
+        ordered += remaining[:overflow]
+        remaining = remaining[overflow:]
 
-    # 5. 超出总容量时继续从最旧清理
-    total = sum(int(getattr(j, "disk_bytes", 0)) for j in kept_sorted)
-    for j in kept_sorted:
+    # 5. 超出总容量时继续按同一优先级从最旧清理。
+    total = sum(int(getattr(j, "disk_bytes", 0)) for j in remaining)
+    for j in remaining:
         if total <= policy.max_total_bytes:
             break
         ordered.append(j)
@@ -392,15 +401,43 @@ class StorageService:
         return choose_evictions(self._manager.list_jobs(), self._policy)
 
     def cleanup_stale_work(self) -> int:
-        """服务启动时清理上次异常退出遗留的 ``work/`` 临时目录。
+        """服务启动时清理遗留的 ``work/`` 临时目录。
 
-        只删除 ``<output_root>/<model>/<stamp>/work`` 这类中间目录，**绝不**触碰
-        最终产物；所有删除都限制在允许根目录内。
+        **从磁盘扫描**，而不是只遍历内存中的任务列表 —— 服务刚启动时任务管理器为空，
+        上次异常退出留下的目录一个都发现不了，长期磁盘治理会在重启边界失效。
+
+        扫描 ``<root>/**/work``，只删除名为 ``work`` 的目录（中间文件），**绝不**触碰
+        ``artifacts/`` 或最终产物；所有删除限制在允许根目录内。
         """
         released = 0
-        for job in self._manager.list_jobs():
-            released += cleanup_work_dir(job.output_dir, self._roots)
+        for root in self._roots:
+            base = Path(root)
+            if not base.is_dir():
+                continue
+            # 只扫任务目录层级（root/<model>/<stamp>/work），深度受限避免全盘遍历。
+            for work_dir in base.glob("*/*/work"):
+                if not work_dir.is_dir():
+                    continue
+                try:
+                    released += safe_remove(work_dir, self._roots)
+                except (UnsafePathError, OSError):
+                    continue
         return released
+
+    def recover_layouts(self) -> list[str]:
+        """从磁盘恢复任务目录清单（供重启后清理与展示）。
+
+        返回发现的输出目录相对路径列表；不依赖内存中的任务记录。
+        """
+        found: list[str] = []
+        for root in self._roots:
+            base = Path(root)
+            if not base.is_dir():
+                continue
+            for candidate in base.glob("*/*"):
+                if candidate.is_dir() and candidate.name != "work":
+                    found.append(str(candidate))
+        return found
 
     def cleanup_stale_locks(self) -> int:
         """清理过期的渲染锁文件（孤儿锁会让下次渲染误判「已被占用」）。"""

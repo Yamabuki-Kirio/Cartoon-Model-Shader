@@ -32,9 +32,25 @@ class ProcRecord:
 
 @dataclass
 class ProcessRegistry:
-    """内存中的进程登记表（服务生命周期内有效）。"""
+    """内存中的进程登记表（服务生命周期内有效）。
+
+    每个任务可绑定一个 Windows Job Object（``KILL_ON_JOB_CLOSE``）：登记入口脚本
+    PID 后 assign 进 Job，Job 关闭即终止该任务**整棵进程树**。真实 Blender 由入口脚本
+    经 MCP 派发，是入口的子进程，因此同样落在 Job 内。
+    """
 
     records: dict[int, ProcRecord] = field(default_factory=dict)
+    #: job_id -> WindowsJobObject（仅 Windows 且创建成功时有值）
+    jobs: dict[str, Any] = field(default_factory=dict)
+
+    def attach_job_object(self, job_id: str, job_object: Any) -> None:
+        self.jobs[job_id] = job_object
+
+    def job_object(self, job_id: str) -> Any:
+        return self.jobs.get(job_id)
+
+    def release_job_object(self, job_id: str) -> None:
+        self.jobs.pop(job_id, None)
 
     def register(
         self,
@@ -54,6 +70,13 @@ class ProcessRegistry:
             kind=kind,
         )
         self.records[pid] = rec
+        # 若该任务已绑定 Job Object，立即把进程 assign 进去（整树终止的根基）。
+        job_object = self.jobs.get(job_id)
+        if job_object is not None:
+            try:
+                job_object.assign(pid)
+            except Exception:  # noqa: BLE001 - assign 失败不阻断登记
+                pass
         return rec
 
     def unregister(self, pid: int) -> None:
@@ -315,13 +338,26 @@ def terminate_job_processes(
     registry: ProcessRegistry,
     job_id: str,
     *,
-    job_object: WindowsJobObject | None = None,
     grace_seconds: float = 5.0,
 ) -> list[int]:
-    """终止某个任务登记的全部进程，返回仍未确认退出的 PID 列表。"""
+    """终止某个任务的**整棵进程树**，返回仍未确认退出的 PID 列表。
+
+    优先关闭该任务的 Job Object（``KILL_ON_JOB_CLOSE`` 一次性终止 Job 内所有进程，
+    包含 MCP 派发出来的真实 Blender）；Job 不可用时退化为逐 PID 终止整树。
+    """
     unresolved: list[int] = []
-    for rec in registry.for_job(job_id):
-        ok = terminate_tree(rec.pid, job_object=job_object, grace_seconds=grace_seconds)
+    job_object = registry.job_object(job_id)
+    records = registry.for_job(job_id)
+
+    if job_object is not None:
+        try:
+            job_object.close()  # 终止 Job 内所有进程
+        except Exception:  # noqa: BLE001
+            pass
+        registry.release_job_object(job_id)
+
+    for rec in records:
+        ok = terminate_tree(rec.pid, job_object=None, grace_seconds=grace_seconds)
         if ok:
             registry.unregister(rec.pid)
         else:

@@ -821,7 +821,14 @@ def create_app(
         dependencies=require_token,
     )
     async def cancel_render_job(job_id: str) -> dict[str, Any]:
-        job = app.state.jobs.cancel(job_id)
+        # 先终止整棵进程树（入口脚本 + MCP 派发的真实 Blender + 确认服务），再落取消态。
+        unresolved = await app.state.pipeline.cancel_job(job_id)
+        job = app.state.jobs.cancel(job_id, reason="用户取消")
+        if unresolved:
+            # 不谎称已终止：明确报告仍可能残留的 PID。
+            app.state.jobs.append_log(
+                job_id, f"[render] 警告：以下进程未能确认退出：{unresolved}"
+            )
         return job.to_public()
 
     @app.get(

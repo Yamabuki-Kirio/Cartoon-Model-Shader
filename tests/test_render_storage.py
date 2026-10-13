@@ -354,3 +354,106 @@ def test_api_storage_write_requires_token(tmp_path: Path) -> None:
     app = create_app(_config(tmp_path, model_dir))
     response = unauthed(app).post("/api/render/storage/cleanup")
     assert response.status_code == 401
+
+
+# -- 修复专项：跨重启清理 / 关闭保留失败日志 / 取消走进程树 --------------
+
+
+def test_stale_work_scan_finds_dirs_absent_from_memory(tmp_path: Path) -> None:
+    """跨重启：内存为空时，仍要从磁盘发现并清理遗留 work/。"""
+    out = tmp_path / "out"
+    # 磁盘上遗留两个任务目录（内存里完全没有记录）
+    for stamp in ("0720-aaaa", "0720-bbbb"):
+        d = out / "model-x" / stamp
+        (d / "work").mkdir(parents=True)
+        (d / "work" / "tmp.exr").write_bytes(b"\0" * 2048)
+        (d / "artifacts").mkdir()
+        (d / "artifacts" / "final.png").write_bytes(b"png")
+
+    manager = RenderJobManager(out)  # 空管理器（模拟刚重启）
+    assert manager.list_jobs() == []
+    storage = StorageService(manager, RetentionPolicy(), [str(out)])
+    released = storage.cleanup_stale_work()
+
+    assert released >= 4096, "必须从磁盘发现并清理遗留 work"
+    for stamp in ("0720-aaaa", "0720-bbbb"):
+        assert not (out / "model-x" / stamp / "work").exists()
+        assert (out / "model-x" / stamp / "artifacts" / "final.png").is_file()
+
+
+def test_shutdown_cleanup_keeps_failed_diagnostics(tmp_path: Path) -> None:
+    """关闭时执行 cleanup 不得删除失败诊断日志（即使 fresh、未超阈值）。"""
+    out = tmp_path / "out"
+    job_dir = out / "model-y" / "0720-fail"
+    (job_dir / "work").mkdir(parents=True)
+    (job_dir / "confirm_server.log").write_text("error tail\n", encoding="utf-8")
+    (job_dir / "render.done").write_text("FAILED\n", encoding="utf-8")
+
+    manager = RenderJobManager(out)
+    job, _ = manager.create("rj-fail", "model-y", "fpy", "n", {}, str(job_dir))
+    manager._force_terminal("rj-fail", "failed")
+    manager._by_fingerprint.clear()
+
+    # 默认策略：数量/期限/容量都未超 ⇒ 失败任务不应被整目录删除
+    storage = StorageService(
+        manager, RetentionPolicy(max_jobs=30, max_age_days=14, max_total_gb=20), [str(out)]
+    )
+    report = storage.cleanup(dry_run=False)
+    assert "rj-fail" not in report.removed_jobs, "未超阈值的失败任务不得被清理"
+    assert (job_dir / "confirm_server.log").is_file(), "失败诊断日志必须保留"
+    assert (job_dir / "render.done").is_file()
+
+
+def test_cancel_terminates_process_tree(tmp_path: Path) -> None:
+    """取消接口必须通过进程注册表终止整棵进程树（含登记的「真实 Blender」PID）。"""
+    import subprocess
+    import sys
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    app = create_app(_config(tmp_path, model_dir))
+    with authed(app) as client:
+        model_id = client.get("/api/render/models").json()["models"][0]["model_id"]
+        created = client.post(
+            "/api/render/jobs", json={"model_id": model_id, "mode": "faithful", "auto_frame": False}
+        )
+        job_id = created.json()["job_id"]
+
+        # 直接在注册表里挂一个「假 Blender」子进程，验证取消会终止它。
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        app.state.proc_registry.register(
+            child.pid, job_id=job_id, exe=sys.executable, kind="blender"
+        )
+        # 让任务停在可取消状态
+        app.state.jobs.set_state(job_id, "preflight")
+        app.state.jobs.set_state(job_id, "analyzing_materials")
+
+        response = client.post(f"/api/render/jobs/{job_id}/cancel")
+        assert response.status_code == 200
+        assert response.json()["state"] == "cancelled"
+
+    # 登记的「Blender」子进程必须已退出
+    assert child.poll() is not None, "取消应终止整棵进程树，登记的子进程必须退出"
+
+    # 服务关闭后注册表应已清理该任务的 Job 记录
+    assert app.state.proc_registry.for_job(job_id) == []
+
+
+def test_evictions_prioritize_but_respect_thresholds(tmp_path: Path) -> None:
+    """取消/失败只提高优先级；未超阈值时不得把它们无条件淘汰。"""
+    manager = _manager_with_jobs(
+        tmp_path,
+        [
+            {"job_id": "c1", "state": "cancelled"},
+            {"job_id": "f1", "state": "failed"},
+            {"job_id": "s1", "state": "success"},
+        ],
+    )
+    # 阈值都未超 ⇒ 什么都别清
+    loose = RetentionPolicy(max_jobs=30, max_age_days=14, max_total_gb=20)
+    assert choose_evictions(manager.list_jobs(), loose) == []
+
+    # 数量超限 ⇒ 取消/失败优先，但必须受「超数量」这一阈值约束
+    tight = RetentionPolicy(max_jobs=1, max_age_days=3650, max_total_gb=1000)
+    evict = choose_evictions(manager.list_jobs(), tight)
+    assert evict == ["c1", "f1"], f"取消/失败应优先且顺序正确，实际 {evict}"
