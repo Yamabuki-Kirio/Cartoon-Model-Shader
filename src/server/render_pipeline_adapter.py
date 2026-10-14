@@ -611,6 +611,41 @@ class RenderPipelineService:
             terminate_job_processes, self._proc_registry, job_id, grace_seconds=5.0
         )
 
+    def _absorb_manifest(self, job_id: str, out_dir: str) -> None:
+        """把 ``run_manifest.json`` 里的方案与场景恢复结果并回任务 settings。
+
+        只吸收**白名单键**，且只取标量 / 小字典 —— manifest 里有整机路径，
+        绝不能整份塞给前端。读不到就跳过：任务仍按 token 与产物判定终态。
+        """
+        path = Path(out_dir) / "run_manifest.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+
+        patch: dict[str, Any] = {}
+        scheme = data.get("render_scheme")
+        if isinstance(scheme, dict):
+            sid = scheme.get("id")
+            if sid:
+                # 以 manifest 为准：这是脚本**实际**用的方案，而不是请求里写的。
+                patch["scheme"] = str(sid)
+                if scheme.get("version") is not None:
+                    patch["scheme_version"] = scheme["version"]
+                params = scheme.get("parameters")
+                if isinstance(params, dict):
+                    patch["scheme_parameters"] = dict(params)
+        restore = data.get("scene_restore")
+        if isinstance(restore, dict):
+            patch["scene_restore"] = {
+                "restored": bool(restore.get("restored", False)),
+                "code": restore.get("code") or None,
+            }
+        if patch:
+            self._manager.merge_settings(job_id, patch)
+
     def _finalize(self, job_id: str, out_dir: str, code: int) -> None:
         """终态判定：规格 §3.2 映射表的**唯一实现点**。
 
@@ -627,6 +662,10 @@ class RenderPipelineService:
         job = self._manager.get(job_id)
         if job is None:
             return
+        # ★ PR #8 规格 §六：任务详情要展示「是否完成场景恢复」。
+        #   恢复结果写在 run_manifest.json 的 scene_restore 段 —— 回读一次并记进
+        #   任务 settings，让前端不必去猜文件位置（前端也拿不到任何路径）。
+        self._absorb_manifest(job_id, out_dir)
         raw_token = self._read_done_token(out_dir)
         images = _deliverable_images(job)
         artifacts = job.list_artifacts()

@@ -72,27 +72,45 @@ describe("一键渲染向导", () => {
     expect(getByTestId("render-artifact-art-result.png")).toBeTruthy();
   });
 
-  it("灯光与辉光增量：默认体积雾方案，enhanced 才显示辉光微调，提交体带上参数", async () => {
+  it("渲染方案：默认方案由服务端决定，enhanced 才显示辉光，提交体带 scheme 与参数", async () => {
     const { controller, endpoints } = setup();
     const { getByTestId, queryByTestId } = render(<RenderWizard controller={controller} />);
     await settle();
 
-    // 默认体积雾 + 雾密度可见；辉光区只在 enhanced 模式出现。
-    expect((getByTestId("render-lighting") as HTMLSelectElement).value).toBe("volume_fog");
-    expect(getByTestId("render-fog-density")).toBeTruthy();
+    // 默认方案来自服务端 `default`（夹具为 volume_fog），不是前端硬编码。
+    expect(getByTestId("render-scheme-volume_fog").getAttribute("aria-pressed")).toBe("true");
+    // 体积雾方案的可调参数：雾密度可见；只读项只展示不提交。
+    expect(getByTestId("render-scheme-param-fog_density")).toBeTruthy();
+    expect(getByTestId("render-scheme-param-light_intensity").getAttribute("data-readonly")).toBe(
+      "true"
+    );
+    // 辉光区只在 enhanced 模式出现。
     expect(queryByTestId("render-glow-settings")).toBeNull();
 
     fireEvent.change(getByTestId("render-mode"), { target: { value: "enhanced" } });
     await settle();
     expect(queryByTestId("render-glow-settings")).toBeTruthy();
 
-    // legacy 方案不需要雾密度：切过去后雾密度输入消失。
-    fireEvent.change(getByTestId("render-lighting"), { target: { value: "legacy" } });
+    // 切到经典方案：没有可调参数，雾密度控件消失（不会把体积雾参数带过去）。
+    fireEvent.click(getByTestId("render-scheme-classic"));
     await settle();
-    expect(queryByTestId("render-fog-density")).toBeNull();
+    expect(queryByTestId("render-scheme-param-fog_density")).toBeNull();
+    expect(getByTestId("render-scheme-no-params")).toBeTruthy();
 
-    fireEvent.change(getByTestId("render-lighting"), { target: { value: "volume_fog" } });
-    fireEvent.input(getByTestId("render-fog-density"), { target: { value: "0.03" } });
+    // 切回体积雾：草稿被保留 —— 先改一个值，切走再切回，值还在。
+    fireEvent.click(getByTestId("render-scheme-volume_fog"));
+    await settle();
+    fireEvent.input(getByTestId("render-scheme-param-fog_density-input"), {
+      target: { value: "0.03" },
+    });
+    fireEvent.click(getByTestId("render-scheme-classic"));
+    await settle();
+    fireEvent.click(getByTestId("render-scheme-volume_fog"));
+    await settle();
+    expect(
+      (getByTestId("render-scheme-param-fog_density-input") as HTMLInputElement).value
+    ).toBe("0.03");
+
     fireEvent.input(getByTestId("render-glow-threshold"), { target: { value: "0.6" } });
     fireEvent.change(getByTestId("render-glow-quality"), { target: { value: "Low" } });
     await settle();
@@ -103,12 +121,31 @@ describe("一键渲染向导", () => {
       expect.objectContaining({
         model_id: "model-3f7a91c4d20b5e68",
         mode: "enhanced",
-        lighting: "volume_fog",
-        fog_density: 0.03,
+        scheme: "volume_fog",
+        scheme_parameters: { fog_density: 0.03 },
         glow_threshold: 0.6,
         glow_quality: "Low",
       })
     );
+  });
+
+  it("方案参数超范围：就地报错、阻止提交，不发请求", async () => {
+    const { controller, endpoints } = setup();
+    const { getByTestId } = render(<RenderWizard controller={controller} />);
+    await settle();
+
+    // 夹具上限为 0.1 —— 填 5 应被本地拦下。
+    fireEvent.input(getByTestId("render-scheme-param-fog_density-input"), {
+      target: { value: "5" },
+    });
+    await settle();
+    expect(getByTestId("render-scheme-param-fog_density-error")).toBeTruthy();
+    expect(getByTestId("render-scheme-blocked")).toBeTruthy();
+
+    fireEvent.click(getByTestId("render-start"));
+    await settle();
+    // 关键：超范围时**不发请求**，也不创建任务。
+    expect(endpoints.createJob).not.toHaveBeenCalled();
   });
 
   it("等待确认状态：展示确认入口与材质表，不谎称完成", async () => {

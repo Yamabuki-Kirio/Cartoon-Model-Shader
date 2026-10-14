@@ -12,6 +12,7 @@ import {
   isShippableJob,
   isTerminalState,
   type RenderJob,
+  type RenderSchemeParam,
 } from "../../api/render-types";
 
 /**
@@ -270,6 +271,196 @@ function Steps({ current }: { current: number }) {
     </ol>
   );
 }
+/**
+ * 渲染方案选择（PR #8 规格 §六）。
+ *
+ * * 方案卡片：说明 / 推荐用途 / 是否含体积雾 / 性能影响 / 版本 / 可调参数数量。
+ * * 默认方案由服务端 `GET /api/render/schemes` 的 `default` 决定 —— 前端不硬编码。
+ * * 动态控件**完全按服务端 schema 渲染**（number / boolean / enum）；
+ *   `readonly` 参数只展示值与说明、不参与提交（未经真实 Blender 标定的项）。
+ * * 切换方案保留各自草稿；超范围就地报错，并阻止提交。
+ */
+function SchemePicker({ controller }: { controller: RenderStore }) {
+  const state = useStore(controller.store, (snapshot) => snapshot);
+
+  if (state.schemeLoading && state.schemes.length === 0) {
+    return (
+      <div class="banner banner-info" data-testid="render-schemes">
+        正在读取可用渲染方案…
+      </div>
+    );
+  }
+  if (state.schemeError && state.schemes.length === 0) {
+    return (
+      <div class="banner banner-error" data-testid="render-schemes">
+        <b>渲染方案清单读取失败</b>
+        <div class="muted">{state.schemeError.message}</div>
+        <button
+          type="button"
+          class="chip"
+          data-testid="render-schemes-retry"
+          onClick={() => void controller.actions.loadSchemes()}
+        >
+          重新读取
+        </button>
+      </div>
+    );
+  }
+
+  const current = controller.actions.currentScheme();
+  const draft = controller.actions.schemeDraft();
+
+  return (
+    <div class="scheme-picker" data-testid="render-schemes">
+      <div class="scheme-head">
+        <span>渲染方案</span>
+        <span class="muted">灯光与场景由固定方案提供，确保同一模型每次渲染可复现。</span>
+      </div>
+
+      <ul class="scheme-cards" data-testid="render-scheme-cards">
+        {state.schemes.map((scheme) => {
+          const selected = scheme.id === state.schemeId;
+          return (
+            <li key={scheme.id}>
+              <button
+                type="button"
+                class={selected ? "scheme-card scheme-card-on" : "scheme-card"}
+                data-testid={`render-scheme-${scheme.id}`}
+                aria-pressed={selected}
+                onClick={() => controller.actions.selectScheme(scheme.id)}
+              >
+                <span class="scheme-title">
+                  <b>{scheme.label}</b>
+                  <span class="muted mono-sm">v{scheme.version}</span>
+                  {scheme.recommended ? (
+                    <span class="chip chip-ok" data-testid={`render-scheme-recommended-${scheme.id}`}>
+                      默认方案
+                    </span>
+                  ) : null}
+                </span>
+                <span class="muted">{scheme.description}</span>
+                <span class="scheme-meta muted">
+                  推荐用途：{scheme.recommended_use}
+                </span>
+                <span class="scheme-meta muted">
+                  体积雾：{scheme.has_volume_fog ? "包含" : "不包含"} ·
+                  可调参数：{scheme.adjustable_count} 项
+                </span>
+                <span class="scheme-meta muted">性能：{scheme.performance_note}</span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+
+      {current ? (
+        <div class="scheme-params" data-testid="render-scheme-params">
+          {current.parameters.length === 0 ? (
+            <span class="muted" data-testid="render-scheme-no-params">
+              该方案没有可调参数（灯光数值固定，保证可复现）。
+            </span>
+          ) : null}
+          {current.parameters.map((param) => (
+            <SchemeParamField
+              key={param.id}
+              controller={controller}
+              param={param}
+              value={draft.values[param.id]}
+              error={draft.errors[param.id]}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** 一个方案参数控件。按 `kind` 渲染，`readonly` 只展示。 */
+function SchemeParamField({
+  controller,
+  param,
+  value,
+  error,
+}: {
+  controller: RenderStore;
+  param: RenderSchemeParam;
+  value: number | boolean | string | undefined;
+  error: string | undefined;
+}) {
+  const testId = `render-scheme-param-${param.id}`;
+
+  if (param.readonly) {
+    // 只读项：展示默认值与说明，明确「未经标定，暂不开放调节」。
+    return (
+      <div class="scheme-param scheme-param-ro" data-testid={testId} data-readonly="true">
+        <span class="param-label">
+          {param.label}
+          <span class="chip chip-muted">只读</span>
+        </span>
+        <span class="mono-sm">{String(param.default)}</span>
+        <span class="muted">{param.description}</span>
+      </div>
+    );
+  }
+
+  return (
+    <label class="scheme-param" data-testid={testId}>
+      <span class="param-label">{param.label}</span>
+      {param.kind === "boolean" ? (
+        <input
+          type="checkbox"
+          checked={value === true}
+          data-testid={`${testId}-input`}
+          onChange={(event) =>
+            controller.actions.setSchemeParam(
+              param.id,
+              (event.currentTarget as HTMLInputElement).checked
+            )
+          }
+        />
+      ) : param.kind === "enum" ? (
+        <select
+          value={String(value ?? "")}
+          data-testid={`${testId}-input`}
+          onChange={(event) =>
+            controller.actions.setSchemeParam(
+              param.id,
+              (event.currentTarget as HTMLSelectElement).value
+            )
+          }
+        >
+          {(param.choices ?? []).map((choice) => (
+            <option key={choice} value={choice}>
+              {choice}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <input
+          type="number"
+          min={param.minimum}
+          max={param.maximum}
+          step={param.step}
+          value={value === undefined ? "" : String(value)}
+          data-testid={`${testId}-input`}
+          onInput={(event) =>
+            controller.actions.setSchemeParam(
+              param.id,
+              Number((event.currentTarget as HTMLInputElement).value)
+            )
+          }
+        />
+      )}
+      <span class="muted">{param.description}</span>
+      {error ? (
+        <span class="bad" data-testid={`${testId}-error`} data-error="scheme-param">
+          {error}
+        </span>
+      ) : null}
+    </label>
+  );
+}
+
 function ModelStep({ controller }: { controller: RenderStore }) {
   const state = useStore(controller.store, (snapshot) => snapshot);
   // 环境未就绪时禁用「开始渲染」：诊断还没读到时按未就绪处理（保守方向），
@@ -336,40 +527,9 @@ function ModelStep({ controller }: { controller: RenderStore }) {
           />
           <span>自动构图</span>
         </label>
-        <label>
-          <span>灯光配置</span>
-          <select
-            value={state.lighting}
-            data-testid="render-lighting"
-            onChange={(event) =>
-              controller.actions.setLighting(
-                (event.currentTarget as HTMLSelectElement).value as "volume_fog" | "legacy"
-              )
-            }
-          >
-            <option value="volume_fog">体积雾灯光组（默认）</option>
-            <option value="legacy">旧版复刻灯组</option>
-          </select>
-        </label>
-        {state.lighting === "volume_fog" ? (
-          <label>
-            <span>雾密度（0–0.1）</span>
-            <input
-              type="number"
-              min="0"
-              max="0.1"
-              step="0.001"
-              value={state.fogDensity}
-              data-testid="render-fog-density"
-              onInput={(event) =>
-                controller.actions.setFogDensity(
-                  Number((event.currentTarget as HTMLInputElement).value)
-                )
-              }
-            />
-          </label>
-        ) : null}
       </div>
+
+      <SchemePicker controller={controller} />
 
       {state.mode === "enhanced" ? (
         <div class="settings-row" data-testid="render-glow-settings">
@@ -470,18 +630,29 @@ function ModelStep({ controller }: { controller: RenderStore }) {
           type="button"
           class="primary"
           data-testid="render-start"
-          disabled={!state.selectedModelId || state.busy || !environmentReady}
+          disabled={
+            !state.selectedModelId ||
+            state.busy ||
+            !environmentReady ||
+            controller.actions.schemeInvalid()
+          }
           onClick={() => void controller.actions.startJob()}
         >
           {state.busy
             ? "正在创建任务…"
-            : environmentReady
-              ? "开始渲染"
-              : "环境检查未通过，暂不能开始"}
+            : !environmentReady
+              ? "环境检查未通过，暂不能开始"
+              : controller.actions.schemeInvalid()
+                ? "方案参数有误，请先修正"
+                : "开始渲染"}
         </button>
         {!environmentReady ? (
           <div class="muted" data-testid="render-start-disabled-reason">
             请先按上方「环境未就绪」里的逐项提示处理，然后点「重新检测环境」。
+          </div>
+        ) : controller.actions.schemeInvalid() ? (
+          <div class="muted" data-testid="render-scheme-blocked">
+            方案参数超出允许范围，已阻止提交。请按红色提示修正后再开始。
           </div>
         ) : null}
       </div>
@@ -496,6 +667,85 @@ function terminalTone(state: string): "ok" | "warn" | "bad" {
   if (state === "success") return "ok";
   if (state === "diagnostic") return "warn";
   return "bad";
+}
+
+/**
+ * 任务详情里的方案摘要（PR #8 规格 §六）。
+ *
+ * 展示：方案 / 版本 / 实际生效参数 / 画面模式 / 辉光配置 /
+ * 场景恢复状态 / 是否可交付。这些字段全部来自服务端，前端只读展示。
+ */
+function JobSchemeSummary({ job }: { job: RenderJob }) {
+  const scheme = job.scheme;
+  const settings = job.settings ?? {};
+  const mode = typeof settings.mode === "string" ? settings.mode : null;
+  const restore = (settings.scene_restore ?? null) as
+    | { restored?: boolean; code?: string | null }
+    | null;
+  const params = scheme?.parameters ?? {};
+  const paramKeys = Object.keys(params);
+
+  // 辉光只在 enhanced 模式有意义；未显式设置时主脚本用默认修复值。
+  const glowEntries: [string, unknown][] =
+    mode === "enhanced"
+      ? (["glow_threshold", "glow_strength", "glow_size", "glow_smoothness", "glow_quality"] as const)
+          .map((key) => [key, settings[key]] as [string, unknown])
+          .filter(([, value]) => value !== undefined && value !== null)
+      : [];
+
+  return (
+    <div class="job-scheme" data-testid="render-job-scheme">
+      <div class="scheme-meta muted">
+        渲染方案：
+        {scheme ? (
+          <span class="mono-sm" data-testid="render-job-scheme-id">
+            {scheme.id}
+            {scheme.version !== null ? ` · v${scheme.version}` : ""}
+          </span>
+        ) : (
+          <span data-testid="render-job-scheme-id">（旧任务未记录）</span>
+        )}
+      </div>
+
+      <div class="scheme-meta muted" data-testid="render-job-scheme-params">
+        生效参数：
+        {paramKeys.length === 0
+          ? "无（该方案无可调参数）"
+          : paramKeys.map((key) => `${key}=${String(params[key])}`).join(" · ")}
+      </div>
+
+      {mode ? (
+        <div class="scheme-meta muted" data-testid="render-job-mode">
+          画面模式：{mode === "enhanced" ? "增强（enhanced）" : "忠实（faithful）"}
+        </div>
+      ) : null}
+
+      {mode === "enhanced" ? (
+        <div class="scheme-meta muted" data-testid="render-job-glow">
+          辉光配置：
+          {glowEntries.length === 0
+            ? "默认修复值（阈值 0.55 / 强度 0.85 / 尺寸 0.62 / 平滑度 0.35 / High）"
+            : glowEntries.map(([key, value]) => `${key}=${String(value)}`).join(" · ")}
+        </div>
+      ) : null}
+
+      {restore ? (
+        <div
+          class={restore.restored === false ? "bad" : "scheme-meta muted"}
+          data-testid="render-job-scene-restore"
+          data-restored={restore.restored === false ? "false" : "true"}
+        >
+          场景恢复：{restore.restored === false
+            ? `未确认（${restore.code ?? "RENDER_SCHEME_RESTORE_FAILED"}）`
+            : "已恢复并回读确认"}
+        </div>
+      ) : null}
+
+      <div class="scheme-meta muted" data-testid="render-job-shippable">
+        可交付：{job.shippable ? "是" : "否"}
+      </div>
+    </div>
+  );
 }
 
 function ProgressStep({ job, controller }: { job: RenderJob; controller: RenderStore }) {
@@ -519,6 +769,8 @@ function ProgressStep({ job, controller }: { job: RenderJob; controller: RenderS
           </span>
         ) : null}
       </div>
+
+      <JobSchemeSummary job={job} />
 
       {waiting ? (
         <div class="banner banner-warn" data-testid="render-confirm-required">

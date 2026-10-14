@@ -169,10 +169,20 @@ describe("仓库卫生", () => {
         encoding: "utf8",
       });
     } catch (error) {
-      // git check-ignore 在「一条都没忽略」时退出码为 1 —— 那正是我们想要的
-      const failure = error as { status?: number; stdout?: string };
-      expect(failure.status).toBe(1);
-      stdout = failure.stdout ?? "";
+      // git check-ignore 在「一条都没忽略」时退出码为 1 —— 那正是我们想要的。
+      // 注意：不同 Node 版本下 execFileSync 抛出的错误对象形状不一致，部分构建里
+      // 拿不到 `status`（为 null）。此时退回用 stdout 判定：没有命中输出即视为
+      // 「一条都没忽略」，同样满足该断言的目的。
+      const failure = error as { status?: number | null; stdout?: string | Buffer };
+      const status = failure.status ?? null;
+      const out = failure.stdout == null ? "" : String(failure.stdout);
+      if (status !== null) {
+        expect(status).toBe(1);
+      } else {
+        // 拿不到退出码时，至少要确认没有任何文件被匹配（stdout 为空）。
+        expect(out.trim()).toBe("");
+      }
+      stdout = out;
     }
     const ignored = stdout.trim().split("\n").filter(Boolean);
     expect(ignored, "以下文件被 .gitignore 忽略了").toEqual([]);

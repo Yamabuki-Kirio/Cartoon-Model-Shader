@@ -505,6 +505,18 @@ class RenderJobManager:
         job.materials = materials
         job.confirm_url = confirm_url
 
+    def merge_settings(self, job_id: str, patch: dict[str, Any]) -> None:
+        """把回读到的**运行时事实**并进任务 settings（PR #8）。
+
+        用于吸收 ``run_manifest.json`` 里的 ``render_scheme`` 与 ``scene_restore``：
+        脚本实际用的方案与场景是否已恢复，只有渲染结束才知道。只做浅合并，
+        且调用方须保证 patch 里的键是白名单（不含任何本机路径）。
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        job.settings.update(patch)
+
     def attach_proc(self, job_id: str, proc: Any) -> None:
         self._active[job_id] = proc
 
