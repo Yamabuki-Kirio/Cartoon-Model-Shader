@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from src.server import render_state
 from src.server.app import create_app
 from src.server.config import AppConfig, BlenderMCPConfig, RenderConfig, ServerConfig
 from src.server.proc_cleanup import ProcessRegistry, terminate_tree
@@ -418,7 +419,18 @@ def test_shutdown_cleanup_keeps_failed_diagnostics(tmp_path: Path) -> None:
 
 
 def test_cancel_terminates_process_tree(tmp_path: Path) -> None:
-    """取消接口必须通过进程注册表终止整棵进程树（含登记的「真实 Blender」PID）。"""
+    """取消接口必须通过进程注册表终止整棵进程树（含登记的「真实 Blender」PID）。
+
+    这条用例**刻意不走** ``POST /api/render/jobs``：那个端点建完任务还会
+    ``enqueue``，把任务交给常驻 worker 立刻开跑。于是「任务停在可取消状态」与
+    「后台正在把状态往前推」变成一场竞态 —— 后台先跑到终态时，``jobs.cancel()``
+    会以「当前状态不可取消」返回 400，用例随机变红。用 sleep 或加长等待只是
+    把概率调小，并没有消除竞态。
+
+    取消流程本身不关心渲染有没有真的跑起来，因此这里直接建任务、不入队：
+    ``RenderJob`` 的初始状态就是 ``queued``，而 ``queued`` 属于
+    ``CANCELABLE_STATES``。全程没有后台任务参与，状态完全由本用例决定。
+    """
     import subprocess
     import sys
 
@@ -427,29 +439,51 @@ def test_cancel_terminates_process_tree(tmp_path: Path) -> None:
     app = _render_app(tmp_path, model_dir)
     with authed(app) as client:
         model_id = client.get("/api/render/models").json()["models"][0]["model_id"]
-        created = client.post(
-            "/api/render/jobs", json={"model_id": model_id, "mode": "faithful", "auto_frame": False}
-        )
-        job_id = created.json()["job_id"]
 
-        # 直接在注册表里挂一个「假 Blender」子进程，验证取消会终止它。
+        # 只建任务，不 enqueue：没有后台 runner，状态不会自己往前走。
+        # 这里也不走 POST 端点（它顺带会校验 MCP 连接并 enqueue）——
+        # 本用例的被测对象是**取消端点**，建任务只是夹具。
+        job, created = app.state.pipeline.create_job(
+            model_id, {"mode": "faithful", "auto_frame": False}
+        )
+        assert created is True, "本用例要求新建任务，而不是复用已有活跃任务"
+        job_id = job.job_id
+        assert job.state == "queued"
+        assert render_state.can_cancel(job.state), "用例前提：queued 必须可取消"
+
+        # 造出中间文件，供「取消后清理」断言使用。
+        work_dir = Path(job.output_dir) / "work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "tmp.exr").write_bytes(b"\0" * 4096)
+        assert work_dir.is_dir(), "前置条件：work/ 必须真的存在，否则清理断言会空转"
+
+        # 挂一个「假 Blender」子进程，验证取消会终止它。
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        app.state.proc_registry.register(
-            child.pid, job_id=job_id, exe=sys.executable, kind="blender"
-        )
-        # 让任务停在可取消状态
-        app.state.jobs.set_state(job_id, "preflight")
-        app.state.jobs.set_state(job_id, "analyzing_materials")
+        try:
+            # register() 是同步的：返回即表示已写入注册表，所以下面这条断言就是
+            # 「进程已登记」的同步点 —— 不需要 sleep，也不需要等事件。
+            app.state.proc_registry.register(
+                child.pid, job_id=job_id, exe=sys.executable, kind="blender"
+            )
+            registered = {rec.pid for rec in app.state.proc_registry.for_job(job_id)}
+            assert child.pid in registered, "取消前必须确认子进程已登记在注册表中"
 
-        response = client.post(f"/api/render/jobs/{job_id}/cancel")
-        assert response.status_code == 200
-        assert response.json()["state"] == "cancelled"
+            response = client.post(f"/api/render/jobs/{job_id}/cancel")
+            assert response.status_code == 200
+            assert response.json()["state"] == "cancelled"
 
-    # 登记的「Blender」子进程必须已退出
-    assert child.poll() is not None, "取消应终止整棵进程树，登记的子进程必须退出"
-
-    # 服务关闭后注册表应已清理该任务的 Job 记录
-    assert app.state.proc_registry.for_job(job_id) == []
+            # ① 任务状态：已取消
+            assert app.state.jobs.get(job_id).state == "cancelled"
+            # ② 进程树：登记的子进程已退出，且注册表已摘除记录
+            assert child.poll() is not None, "取消应终止整棵进程树"
+            assert app.state.proc_registry.for_job(job_id) == [], "已退出的进程必须摘除记录"
+            # ③ 临时文件：work/ 中间文件被清理
+            assert not work_dir.exists(), "取消后应清理 work/ 中间文件"
+        finally:
+            # 断言中途失败时别把子进程漏在后台。
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
 
 
 def test_pid_contract_registers_real_blender(tmp_path: Path, monkeypatch) -> None:
