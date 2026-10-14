@@ -9,6 +9,7 @@ import type {
   RenderJob,
   RenderMaterialsResponse,
   RenderModelsResponse,
+  RenderSchemesResponse,
   RenderStorageUsage,
 } from "./render-types";
 
@@ -16,6 +17,7 @@ const MODELS_PATH = "/api/render/models";
 const JOBS_PATH = "/api/render/jobs";
 const STORAGE_PATH = "/api/render/storage";
 const ENVIRONMENT_PATH = "/api/render/environment";
+const SCHEMES_PATH = "/api/render/schemes";
 
 export class RenderEndpoints {
   constructor(private readonly client: ApiClient) {}
@@ -102,5 +104,15 @@ export class RenderEndpoints {
    */
   environment(options: { signal?: AbortSignal } = {}): Promise<RenderEnvironmentResponse> {
     return this.client.get(ENVIRONMENT_PATH, options);
+  }
+
+  /**
+   * 可用渲染方案清单（PR #8 规格 §一 / §六）。
+   *
+   * 只读接口：不带写令牌。方案说明、可调参数、默认方案全部由服务端注册表生成，
+   * 前端只负责渲染 —— 不硬编码默认方案，也不自定义参数范围。
+   */
+  listSchemes(options: { signal?: AbortSignal } = {}): Promise<RenderSchemesResponse> {
+    return this.client.get(SCHEMES_PATH, options);
   }
 }

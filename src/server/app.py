@@ -84,6 +84,7 @@ from .render_jobs import RenderJobManager
 from .render_environment import build_environment_report
 from .render_pipeline_adapter import RenderPipelineService
 from .render_storage import StorageService
+from .scheme_bridge import schemes_payload
 from pathlib import Path
 import os
 from .config import AppConfig, ConfigError, load_config
@@ -118,6 +119,7 @@ from .models import (
     RenderJobResponse,
     RenderLogResponse,
     RenderMaterialsResponse,
+    RenderSchemeListResponse,
     RenderSettingsRequest,
 )
 from .presets import PresetStore
@@ -813,6 +815,23 @@ def create_app(
             stale_lock_count=app.state.storage.stale_lock_count(),
         )
         return report.to_public()
+
+    @app.get(
+        "/api/render/schemes",
+        response_model=RenderSchemeListResponse,
+        tags=["render"],
+    )
+    async def render_schemes() -> dict[str, Any]:
+        """固定渲染方案列表（PR #8 规格 §五）。
+
+        **只读接口，不需要写令牌** —— 它不改变任何状态，只是让渲染向导知道有哪些
+        方案、每个方案允许调什么参数。
+
+        安全边界：响应里**绝不**出现本机路径、脚本路径、Python 模块路径或可执行命令。
+        方案描述全部由服务端从固定注册表生成，客户端拿不到任何可执行线索。
+        默认方案也由服务端给出，**前端不硬编码**（规格 §六）。
+        """
+        return schemes_payload()
 
     @app.post(
         "/api/render/jobs",

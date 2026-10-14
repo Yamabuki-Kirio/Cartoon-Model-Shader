@@ -102,7 +102,9 @@ def test_render_uses_blend_flags_for_blend_model(tmp_path: Path, monkeypatch) ->
     assert argv[argv.index("--resolve") + 1] == str(model)
     # 共同开关不受影响
     assert "--material-policy" in argv and "strict" in argv
-    assert "--lighting" in argv and "volume_fog" in argv
+    # PR #8：驱动改用固定方案接口，不再传旧的 --lighting
+    assert "--scheme" in argv and "volume_fog" in argv
+    assert "--lighting" not in argv
     assert "--maps-dir" in argv
 
 
@@ -144,14 +146,17 @@ def test_write_job_records_blend_target(tmp_path: Path) -> None:
     mod.BLENDER = "blender"
     mod.SOURCE_BLEND = ""
     job_path = mod.write_job(str(model), str(tmp_path / "out"), "enhanced", False,
-                             str(tmp_path / "maps"), lighting="legacy", fog_density=0.03)
+                             str(tmp_path / "maps"), scheme="classic",
+                             scheme_parameters={"fog_density": 0.03})
     job = json.loads(Path(job_path).read_text(encoding="utf-8"))
     assert job["model_kind"] == "blend"
     tgt = job["targets"][0]
     assert tgt["blend"] == str(model)
     assert tgt["pmx"] is None
     assert tgt["fingerprint"] == _sha256(model)
-    # 步骤 1 的灯光/辉光字段不受影响
+    # PR #8：步骤 1 的灯光字段改为固定方案，旧字段仅作兼容镜像
+    assert job["scheme"] == "classic"
+    assert job["scheme_parameters"] == {"fog_density": 0.03}
     assert job["lighting"] == "legacy"
     assert job["fog_density"] == 0.03
 
@@ -187,11 +192,11 @@ def test_main_routes_blend_model_to_direct_render(tmp_path: Path, monkeypatch) -
     calls: dict[str, object] = {}
 
     def fake_render(m, out_dir, mode, auto_frame, maps_dir=None,
-                    lighting="volume_fog", fog_density=0.018, glow=None):
+                    scheme="volume_fog", scheme_parameters=None, glow=None):
         calls["model"] = m
         calls["out_dir"] = out_dir
-        calls["lighting"] = lighting
-        calls["fog_density"] = fog_density
+        calls["scheme"] = scheme
+        calls["scheme_parameters"] = scheme_parameters
         return 0, {"status": "SUCCESS", "token": "SUCCESS"}
 
     monkeypatch.setattr(mod, "render", fake_render)
@@ -208,7 +213,7 @@ def test_main_routes_blend_model_to_direct_render(tmp_path: Path, monkeypatch) -
     assert rc == 0
     assert calls["model"] == str(model)
     assert calls["out_dir"] == str(tmp_path / "out")
-    assert calls["lighting"] == "volume_fog"
+    assert calls["scheme"] == "volume_fog"
 
 
 def test_main_rejects_unsupported_extension(tmp_path: Path, monkeypatch) -> None:

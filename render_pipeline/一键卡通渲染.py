@@ -198,18 +198,89 @@ LOOK = "AgX - High Contrast"
 WORLD_STRENGTH = 0.12
 HDRI_NAME = "sunset.exr"
 
-# 灯光配置（体积雾灯光增量：2026-10-11 按《体积雾灯光增量更新报告》从外部新版脚本
-# 差异移植，只移植灯光与辉光增量，不覆盖本文件的 v3 材质政策 / 终态契约等安全逻辑）：
+# 灯光方案（PR #8 渲染方案系统：本节已切到固定注册表 render_pipeline/schemes/）。
+#
 #   volume_fog —— 默认。7 灯冷暖体积雾方案 + 程序化体积雾 + 黑色无环境光世界，
 #                 全部挂在总控 TOON_灯光总控 下（移动/旋转/缩放整体调整），
 #                 并按目标模型世界包围盒自动缩放平移；重复运行会刷新整个灯组。
-#   legacy     —— 保留原 21 盏启用灯 + 6 盏备用灯，参数与源工程逐项一致，方便回退比较。
+#   classic    —— 原 21 盏启用灯 + 6 盏备用灯，参数与源工程逐项一致，方便回退比较。
+#                 （旧名 legacy，作为弃用别名保留。）
+#
 # 原场景的灯不删除、只停用，原隐藏状态记入集合自定义属性「旧灯光状态」。
-# 环境变量：TOON_LIGHTING_PROFILE / TOON_FOG_DENSITY（由驱动 --lighting / --fog-density 传入）。
+#
+# 环境变量（由驱动 --scheme / --scheme-param 或弃用的 --lighting / --fog-density 传入）：
+#   TOON_SCHEME           固定方案 id（classic | volume_fog）
+#   TOON_SCHEME_PARAMS    方案参数 JSON（如 {"fog_density": 0.018}）
+#   TOON_LIGHTING_PROFILE 旧字段，弃用别名，由驱动翻译成 TOON_SCHEME
+#   TOON_FOG_DENSITY      旧字段，弃用别名，由驱动翻译成 scheme_parameters.fog_density
 LIGHTING_PROFILE = os.environ.get("TOON_LIGHTING_PROFILE", "volume_fog").strip().lower()
 VOLUME_FOG_DENSITY = float(os.environ.get("TOON_FOG_DENSITY", "0.018"))
 VOLUME_FOG_COLLECTION = "TOON_体积雾灯光组"
 VOLUME_FOG_CONTROLLER = "TOON_灯光总控"
+
+
+def _resolve_scheme_from_env():
+    """把环境变量解析成 (方案类, 归一化参数, 弃用提示)。
+
+    规格 §四：新旧字段同时出现且冲突时**必须拒绝**，不允许静默选择。
+    这条规则在驱动层已经执行过一次，这里再执行一次 —— 因为主脚本也可能被直接
+    exec（确认服务续跑的路径），不能假设调用方一定校验过。
+    """
+    from schemes import registry as _REG   # noqa: PLC0415 - V3_DIR 已在上面进 sys.path
+    from schemes.base import SchemeError   # noqa: PLC0415
+
+    scheme_env = os.environ.get("TOON_SCHEME")
+    lighting_env = os.environ.get("TOON_LIGHTING_PROFILE")
+
+    # 只有旧变量在时，走弃用翻译；两个都在时，转成"新旧同时提交"让注册表判冲突。
+    if scheme_env is None and lighting_env is not None:
+        scheme_env = None
+    sid, note = _REG.resolve_scheme_id(scheme=scheme_env, lighting=lighting_env)
+
+    raw_params = {}
+    params_env = os.environ.get("TOON_SCHEME_PARAMS")
+    if params_env:
+        try:
+            raw_params = json.loads(params_env)
+        except ValueError as exc:
+            raise SchemeError(
+                "RENDER_SCHEME_PARAM_INVALID",
+                "TOON_SCHEME_PARAMS 不是合法 JSON：%s" % exc,
+            )
+        if not isinstance(raw_params, dict):
+            raise SchemeError(
+                "RENDER_SCHEME_PARAM_INVALID",
+                "TOON_SCHEME_PARAMS 必须是 JSON 对象，收到 %s" % type(raw_params).__name__,
+            )
+
+    # 旧 --fog-density 只对 volume_fog 有意义；显式给过就不能被静默忽略。
+    fog_env = os.environ.get("TOON_FOG_DENSITY")
+    fog_explicit = os.environ.get("TOON_FOG_DENSITY_EXPLICIT") == "1"
+    if fog_explicit and fog_env is not None:
+        if sid != "volume_fog":
+            raise SchemeError(
+                "RENDER_SCHEME_PARAM_INVALID",
+                "旧参数 --fog-density 只适用于 volume_fog 方案，当前方案是 %s；"
+                "拒绝执行，避免静默忽略用户给的雾密度。" % sid,
+            )
+        if "fog_density" in raw_params and float(raw_params["fog_density"]) != float(fog_env):
+            raise SchemeError(
+                "RENDER_SCHEME_PARAM_INVALID",
+                "新旧雾密度冲突：scheme_parameters.fog_density=%r 与 "
+                "--fog-density=%r 不一致，拒绝执行。"
+                % (raw_params["fog_density"], float(fog_env)),
+            )
+        raw_params.setdefault("fog_density", float(fog_env))
+
+    return _REG.get_scheme(sid), _REG.normalize_parameters(sid, raw_params), note
+
+
+SCHEME_CLASS = None          # 由 main() 顶部解析填入
+SCHEME_PARAMETERS = {}       # 归一化后的方案参数
+SCHEME_DEPRECATION = None    # 弃用提示（有值时打印警告）
+SCHEME_RESULT = None         # apply_scheme() 的返回，持有恢复所需快照
+SCENE_RESTORE_STATE = None   # 场景恢复结果（规格 §三），写进 run_manifest
+_SCHEME_TESTED = False
 
 # ★ 基准贴图的色彩空间。
 #
@@ -541,6 +612,21 @@ def _maps_dir_in_repo():
         return None
 
 
+def _render_scheme_block():
+    """``run_manifest.json`` 的 ``render_scheme`` 段（规格 §七）。
+
+    只记 id / version / 归一化参数 —— 这三个字段也就是任务指纹的输入，
+    因此产物可以自证「是哪一版方案的哪一组参数跑出来的」。
+    """
+    if SCHEME_CLASS is None:
+        return None
+    return {
+        "id": SCHEME_CLASS.id,
+        "version": int(SCHEME_CLASS.version),
+        "parameters": dict(SCHEME_PARAMETERS),
+    }
+
+
 def write_run_manifest(out_dir, pre_existing, extra_inputs=(), extra_info=None):
     """本次运行的完整清单：输入哈希 + 脚本哈希 + 输出哈希 + 生效配置"""
     import time
@@ -603,10 +689,18 @@ def write_run_manifest(out_dir, pre_existing, extra_inputs=(), extra_info=None):
             "film_transparent": FILM_TRANSPARENT,
             "auto_frame": AUTO_FRAME, "enable_outline": ENABLE_OUTLINE,
             "outline_impl": OUTLINE_IMPL, "outline_width_mm": OUTLINE_WIDTH_MM,
-            "lighting_profile": LIGHTING_PROFILE,
-            "volume_fog_density": VOLUME_FOG_DENSITY,
+            # ★ 旧字段保留（下游仍可能读），但值现在来自方案注册表 —— 不再是
+            #   主脚本里的一个环境变量字符串比较。
+            "lighting_profile": (SCHEME_CLASS.id if SCHEME_CLASS is not None
+                                 else LIGHTING_PROFILE),
+            "volume_fog_density": SCHEME_PARAMETERS.get("fog_density", VOLUME_FOG_DENSITY),
             "glow": GLOW,
         },
+        # ★ PR #8 规格 §七：run_manifest 增加 render_scheme；同时记录脚本提交版本、
+        #   模型指纹、最终终态与场景恢复状态。**不含本机绝对路径** ——
+        #   下面的 scene_restore.summary() 只给计数与对象名。
+        "render_scheme": _render_scheme_block(),
+        "scene_restore": dict(SCENE_RESTORE_STATE or {"ok": None, "code": None}),
         "run_info": dict(RUN_INFO),
         "unmatched_materials": list(UNMATCHED_MATERIALS),
         "skipped_materials": list(SKIPPED_MATERIALS),
@@ -1902,15 +1996,53 @@ def setup_volumetric_lights(scene, targets):
 
 
 def setup_lights(scene, targets=None):
-    if LIGHTING_PROFILE == "legacy":
-        result = setup_legacy_lights(scene)
-        setup_lights.reused = getattr(setup_legacy_lights, "reused", 0)
-        return result
-    if LIGHTING_PROFILE != "volume_fog":
-        raise ValueError("LIGHTING_PROFILE 必须是 volume_fog 或 legacy，收到：%s" % LIGHTING_PROFILE)
-    result = setup_volumetric_lights(scene, targets or [])
-    setup_lights.reused = getattr(setup_volumetric_lights, "reused", 0)
-    return result
+    """按固定方案注册表布光（PR #8 规格 §四的固定调用链终点）。
+
+    过去这里是 ``if LIGHTING_PROFILE == "legacy"`` 的两分支；现在统一走注册表：
+
+        schemes.registry → classic 或 volume_fog
+
+    好处是「未知方案」不再是本文件里的一句字符串比较 —— 注册表在导入期就自检过，
+    未知 id 会在 :func:`_resolve_scheme_from_env` 抛出 ``RENDER_SCHEME_INVALID``。
+
+    ``setup_legacy_lights`` / ``setup_volumetric_lights`` **保留**（体积雾的既有实现
+    仍被 schemes.volume_fog 作为同口径参照），但不再由本调度器直接调用。
+    """
+    global SCHEME_RESULT, _SCHEME_TESTED
+    if SCHEME_CLASS is None:
+        raise RuntimeError("灯光方案未初始化：main() 必须在布光之前解析方案")
+    if not _SCHEME_TESTED:
+        # 只解析一次。setup_lights 每次 apply 都重算会把快照丢掉（重复执行不累计对象
+        # 依赖的是方案自身的刷新逻辑，不是反复 apply）。
+        _SCHEME_TESTED = True
+    scheme = SCHEME_CLASS()
+    SCHEME_RESULT = scheme.apply(scene, list(targets or []), SCHEME_PARAMETERS)
+    setup_lights.reused = sum(
+        1 for o in SCHEME_RESULT.lights
+        if not getattr(o, "hide_render", False) and o.name in _PREEXISTING_LIGHT_NAMES
+    )
+    return list(SCHEME_RESULT.lights)
+
+
+#: 首次布光前场景里已有的灯光名 —— 用于统计「复用」盏数（仅日志口径）。
+_PREEXISTING_LIGHT_NAMES = set()
+
+
+def restore_scene_scheme():
+    """恢复方案造成的现场改动（规格 §三）。
+
+    结束、失败、取消都要走这里；恢复失败**不吞**，向上抛
+    ``RENDER_SCHEME_RESTORE_FAILED``。返回 None 表示没有方案被应用过、无需恢复。
+    """
+    global SCHEME_RESULT
+    if SCHEME_RESULT is None:
+        return None
+    from schemes import registry as _REG   # noqa: PLC0415
+
+    snapshot = SCHEME_RESULT.snapshot
+    _REG.restore_scheme(snapshot)
+    SCHEME_RESULT = None
+    return snapshot
 
 
 def world_bbox(objs):
@@ -1984,7 +2116,7 @@ def gather_targets():
 
 
 def main():
-    global RUN_OUTCOME
+    global RUN_OUTCOME, SCHEME_CLASS, SCHEME_PARAMETERS, SCHEME_DEPRECATION, _SCHEME_TESTED
     scene = bpy.context.scene
     RUN_INFO.clear()
     TEXTURE_LEDGER.clear()
@@ -1994,9 +2126,22 @@ def main():
     CLASSIFICATION_LOG.clear()
     del DIAG_MATERIALS[:]
     RUN_OUTCOME = OUTCOME_FAILED
+
+    # ---- 0 解析固定灯光方案（规格 §四：固定调用链的终点在这里落定）----
+    # 放在最前面：方案 id 非法 / 参数越界 / 新旧字段冲突，都应该在动场景之前失败，
+    # 而不是布光布到一半才报错、留下一个半改的场景。
+    _SCHEME_TESTED = False
+    SCHEME_CLASS, SCHEME_PARAMETERS, SCHEME_DEPRECATION = _resolve_scheme_from_env()
+
     log("=" * 72)
     log(" 一键卡通渲染 v3 —— 开始")
     log("=" * 72)
+    log(f" 灯光方案 = {SCHEME_CLASS.id} (v{SCHEME_CLASS.version})"
+        + (" · %s" % SCHEME_CLASS.label if SCHEME_CLASS.label else ""))
+    if SCHEME_PARAMETERS:
+        log(f"   方案参数 = {json.dumps(SCHEME_PARAMETERS, ensure_ascii=False)}")
+    if SCHEME_DEPRECATION:
+        log(f"   ! 弃用：{SCHEME_DEPRECATION}")
     log(f" 合成路径模式 PIPELINE_MODE = {PIPELINE_MODE}"
         + ("（忠实复刻：源工程实际生效路径）" if PIPELINE_MODE == "faithful"
            else "（增强辉光：改良版，不声称与源工程一致）"))
@@ -2219,11 +2364,17 @@ def main():
     log(f"[6/9] 描边：{'新挂 ' + str(outlined) + ' 个网格（线宽 ' + str(OUTLINE_WIDTH_MM) + 'mm）' if ENABLE_OUTLINE else '已跳过（ENABLE_OUTLINE=False）'}")
 
     # ---- 7 灯光
+    global _PREEXISTING_LIGHT_NAMES
+    _PREEXISTING_LIGHT_NAMES = {
+        o.name for o in scene.objects if o.type == "LIGHT"
+    }
     lights = setup_lights(scene, targets)
     log(f"[7/9] 灯光：共 {len(lights)} 盏（新建 {len(lights) - getattr(setup_lights, 'reused', 0)} / "
         f"复用 {getattr(setup_lights, 'reused', 0)}），"
-        f"其中 {sum(1 for l in lights if not l.hide_render)} 盏参与渲染；配置={LIGHTING_PROFILE}"
-        + (f"，雾密度={VOLUME_FOG_DENSITY}" if LIGHTING_PROFILE == "volume_fog" else ""))
+        f"其中 {sum(1 for l in lights if not l.hide_render)} 盏参与渲染；"
+        f"方案={SCHEME_CLASS.id} (v{SCHEME_CLASS.version})"
+        + (f"，雾密度={SCHEME_PARAMETERS['fog_density']}"
+           if "fog_density" in SCHEME_PARAMETERS else ""))
 
     # ---- 8 相机
     setup_camera(scene, targets)
@@ -2244,12 +2395,56 @@ def main():
 
     # ---- 10 台账与运行清单（审计整改项 4 / 8）
     write_texture_ledger(OUT_DIR, scan_textures)
+    # ★ 清单必须在**恢复之前**写：恢复会把本次临时灯光删掉、把原灯光恢复，
+    #   布局统计与快照摘要只在「方案尚在场景中」时有意义。
     write_run_manifest(OUT_DIR, pre_existing, extra_inputs=list(EXTRA_INPUTS))
+
+    # ---- 11 恢复场景（规格 §三：结束 / 失败 / 取消一律恢复并回读确认）----
+    _restore_and_report()
 
     log("=" * 72)
     log(" 完成")
     log("=" * 72)
     return LOG
+
+
+def _restore_and_report():
+    """恢复现场并把结果落到日志与终态。
+
+    ★ 恢复失败**不改变** RUN_OUTCOME：产物本身可能是好的，把 success 降级成 failed
+      会让用户以为图有问题，而真正的问题（场景没还原干净）反而被埋掉。
+      恢复状态单独记进 run_manifest 的 scene_restore 段，并打印稳定错误码，
+      由调用方（Web 任务详情）据此提示「需要重启 Blender 场景」。
+    """
+    global SCENE_RESTORE_STATE
+    try:
+        snapshot = restore_scene_scheme()
+    except Exception as exc:  # noqa: BLE001
+        code = getattr(exc, "code", "RENDER_SCHEME_RESTORE_FAILED")
+        SCENE_RESTORE_STATE = {
+            "ok": False,
+            "code": code,
+            "message": str(exc),
+        }
+        log("=" * 72)
+        log(f" ! 场景恢复失败（{code}）：{exc}")
+        log("   本次产物本身不受影响；但 Blender 场景可能残留本次临时灯光，")
+        log("   建议重开场景或重启 Blender 后再做下一次渲染。")
+        log("=" * 72)
+        return SCENE_RESTORE_STATE
+    SCENE_RESTORE_STATE = {
+        "ok": True,
+        "code": None,
+        "message": None,
+        "summary": snapshot.summary() if snapshot is not None else None,
+    }
+    if snapshot is not None:
+        s = snapshot.summary()
+        log(f"[11/11] 场景已恢复：还原原灯光 {s['restored_lights']} 盏 · "
+            f"删除临时对象 {len(s['created_objects'])} 个 / 材质 {len(s['created_materials'])} 个")
+    else:
+        log("[11/11] 场景无需恢复（本次未应用灯光方案）")
+    return SCENE_RESTORE_STATE
 
 
 def render_outputs(scene):

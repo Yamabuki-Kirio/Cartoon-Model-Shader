@@ -16,10 +16,23 @@ import type {
   RenderEnvironmentResponse,
   RenderJob,
   RenderModel,
+  RenderScheme,
+  RenderSchemesResponse,
   RenderState,
   RenderStorageUsage,
 } from "../api/render-types";
 import { createStore, type Store } from "./store";
+
+/** 单个方案的草稿（规格 §六：切换方案必须保留各自的草稿）。 */
+export interface SchemeDraft {
+  /** 只含**可调**参数的当前值；只读项不进来。 */
+  values: Record<string, number | boolean | string>;
+  /**
+   * 提交前的本地范围校验错误：参数 id → 错误文案。
+   * 非空时**阻止提交**（规格 §六：超范围显示错误并阻止提交）。
+   */
+  errors: Record<string, string>;
+}
 
 export interface RenderUiState {
   models: RenderModel[];
@@ -30,10 +43,21 @@ export interface RenderUiState {
   /** 渲染设置。 */
   mode: "faithful" | "enhanced";
   autoFrame: boolean;
-  /** 灯光配置（2026-10-11 体积雾灯光增量）。 */
-  lighting: "volume_fog" | "legacy";
-  /** 体积雾雾密度 0.0–0.1（仅 volume_fog 有意义）。 */
-  fogDensity: number;
+  /**
+   * 渲染方案清单（PR #8）。null = 尚未读取。
+   * 默认方案取自响应的 `default`，**不在前端硬编码**。
+   */
+  schemes: RenderScheme[];
+  /** 当前选中的方案 id。 */
+  schemeId: string | null;
+  schemeLoading: boolean;
+  schemeError: ErrorDetail | null;
+  /**
+   * 每个方案各自的草稿：`schemeId → SchemeDraft`。
+   * 这样从「体积雾」切到「经典」再切回来，之前调好的雾密度还在，
+   * 且经典方案里**不会**混入体积雾参数。
+   */
+  schemeDrafts: Record<string, SchemeDraft>;
   /** 辉光微调（仅 enhanced 有意义；null = 用主脚本默认修复值）。 */
   glowThreshold: number | null;
   glowStrength: number | null;
@@ -88,6 +112,56 @@ function isActive(state: RenderState): boolean {
   return state !== "success" && state !== "failed" && state !== "rejected" && state !== "diagnostic" && state !== "cancelled";
 }
 
+/**
+ * 一个方案的**可调**参数默认值。
+ *
+ * 只读参数（`readonly=true`）不进草稿：它们不参与提交，只作展示。
+ */
+function defaultDraft(scheme: RenderScheme): SchemeDraft {
+  const values: Record<string, number | boolean | string> = {};
+  for (const param of scheme.parameters) {
+    if (param.readonly) {
+      continue;
+    }
+    values[param.id] = param.default as number | boolean | string;
+  }
+  return { values, errors: {} };
+}
+
+/**
+ * 本地范围校验（与提交前的第一道闸）。
+ *
+ * **只做服务端已声明的范围检查**，不发明新约束：服务端 schema 没给
+ * `minimum`/`maximum` 就不判。真正的裁决权始终在服务端 —— 这里只是为了
+ * 让「超范围」在按下按钮之前就可见，并按规格阻止提交。
+ */
+function validateDraft(scheme: RenderScheme, draft: SchemeDraft): Record<string, string> {
+  const errors: Record<string, string> = {};
+  for (const param of scheme.parameters) {
+    if (param.readonly) {
+      continue;
+    }
+    const value = draft.values[param.id];
+    if (param.kind === "number") {
+      if (typeof value !== "number" || !Number.isFinite(value)) {
+        errors[param.id] = "请输入数字";
+        continue;
+      }
+      if (param.minimum !== undefined && value < param.minimum) {
+        errors[param.id] = `不能小于 ${param.minimum}`;
+      } else if (param.maximum !== undefined && value > param.maximum) {
+        errors[param.id] = `不能大于 ${param.maximum}`;
+      }
+    } else if (param.kind === "enum") {
+      const choices = param.choices ?? [];
+      if (choices.length > 0 && !choices.includes(String(value))) {
+        errors[param.id] = `只能是 ${choices.join(" / ")}`;
+      }
+    }
+  }
+  return errors;
+}
+
 export function createRenderStore(options: RenderStoreOptions) {
   const { endpoints } = options;
   const pollIntervalMs = options.pollIntervalMs ?? 1200;
@@ -99,8 +173,11 @@ export function createRenderStore(options: RenderStoreOptions) {
     selectedModelId: null,
     mode: "faithful",
     autoFrame: false,
-    lighting: "volume_fog",
-    fogDensity: 0.018,
+    schemes: [],
+    schemeId: null,
+    schemeLoading: false,
+    schemeError: null,
+    schemeDrafts: {},
     glowThreshold: null,
     glowStrength: null,
     glowSize: null,
@@ -234,6 +311,89 @@ export function createRenderStore(options: RenderStoreOptions) {
     }
   }
 
+  /**
+   * 读取固定渲染方案清单（PR #8 规格 §六）。
+   *
+   * 默认方案取服务端返回的 `default` —— 前端**不硬编码**。为每个方案准备一份
+   * 独立草稿，只包含服务端声明为可调的参数。
+   */
+  async function loadSchemes(): Promise<void> {
+    store.setState({ schemeLoading: true, schemeError: null });
+    try {
+      const payload: RenderSchemesResponse = await endpoints.listSchemes();
+      const schemes = payload.schemes ?? [];
+      const prevSchemeId = store.getState().schemeId;
+      const drafts = { ...store.getState().schemeDrafts };
+      for (const scheme of schemes) {
+        if (!drafts[scheme.id]) {
+          drafts[scheme.id] = defaultDraft(scheme);
+        }
+      }
+      // 选中项失效（方案被下线）时回落到服务端默认方案。
+      const keep = schemes.some((s) => s.id === prevSchemeId);
+      const chosen = keep ? (prevSchemeId as string) : (payload.default ?? schemes[0]?.id ?? null);
+      store.setState({
+        schemes,
+        schemeId: chosen,
+        schemeDrafts: drafts,
+        schemeLoading: false,
+        schemeError: null,
+      });
+    } catch (error) {
+      store.setState({ schemeLoading: false, schemeError: toDetail(error) });
+    }
+  }
+
+  /** 当前方案的草稿（不存在则按该方案默认值建一份）。 */
+  function draftFor(schemeId: string | null): SchemeDraft {
+    const state = store.getState();
+    if (!schemeId) {
+      return { values: {}, errors: {} };
+    }
+    const existing = state.schemeDrafts[schemeId];
+    if (existing) {
+      return existing;
+    }
+    const scheme = state.schemes.find((s) => s.id === schemeId);
+    return scheme ? defaultDraft(scheme) : { values: {}, errors: {} };
+  }
+
+  /**
+   * 组装要提交的 `scheme_parameters`。
+   *
+   * **只发可调参数**（规格 §一：只读项不提交）；只读参数不在这里出现，
+   * 服务端也不需要它们。
+   */
+  function schemeParametersFor(schemeId: string | null): Record<string, unknown> {
+    const scheme = store.getState().schemes.find((s) => s.id === schemeId);
+    if (!scheme) {
+      return {};
+    }
+    const draft = draftFor(schemeId);
+    const out: Record<string, unknown> = {};
+    for (const param of scheme.parameters) {
+      if (param.readonly) {
+        continue;
+      }
+      const value = draft.values[param.id];
+      if (value !== undefined) {
+        out[param.id] = value;
+      }
+    }
+    return out;
+  }
+
+  /** 当前选中方案是否存在未解决的本地校验错误。 */
+  function currentSchemeInvalid(): boolean {
+    const state = store.getState();
+    const scheme = state.schemes.find((s) => s.id === state.schemeId);
+    if (!scheme) {
+      return false;
+    }
+    // 无论是否已缓存在 state 里，都按当前值现算一遍，避免草稿过期。
+    return Object.keys(validateDraft(scheme, draftFor(scheme.id))).length > 0;
+  }
+
   async function startJob(): Promise<boolean> {
     const state = store.getState();
     if (!state.selectedModelId) {
@@ -262,14 +422,35 @@ export function createRenderStore(options: RenderStoreOptions) {
     if (state.busy) {
       return false;
     }
+    // 规格 §六：方案参数超范围时必须**阻止提交**，而不是发出去等服务端拒绝。
+    const scheme = state.schemes.find((s) => s.id === state.schemeId);
+    if (scheme) {
+      const errors = validateDraft(scheme, draftFor(scheme.id));
+      if (Object.keys(errors).length > 0) {
+        const draft = { ...draftFor(scheme.id), errors };
+        store.setState({
+          schemeDrafts: { ...state.schemeDrafts, [scheme.id]: draft },
+          jobError: {
+            code: "RENDER_SCHEME_PARAM_INVALID",
+            message: "渲染方案参数超出允许范围，已阻止提交。",
+            retryable: false,
+            hint: Object.entries(errors)
+              .map(([id, msg]) => `${id}：${msg}`)
+              .join("；"),
+          },
+        });
+        return false;
+      }
+    }
     store.setState({ busy: true, jobError: null, notice: null, artifacts: [], stepOverride: null });
     try {
       const job = await endpoints.createJob({
         model_id: state.selectedModelId,
         mode: state.mode,
         auto_frame: state.autoFrame,
-        lighting: state.lighting,
-        fog_density: state.fogDensity,
+        // 方案 id 与参数：只读项不提交；不传 scheme 时服务端用注册表默认方案。
+        ...(state.schemeId ? { scheme: state.schemeId } : {}),
+        scheme_parameters: schemeParametersFor(state.schemeId),
         glow_threshold: state.glowThreshold,
         glow_strength: state.glowStrength,
         glow_size: state.glowSize,
@@ -394,9 +575,11 @@ export function createRenderStore(options: RenderStoreOptions) {
       void loadModels();
       void loadStorage();
       void loadEnvironment();
+      void loadSchemes();
     },
     loadStorage,
     loadEnvironment,
+    loadSchemes,
     setTourOpen(open: boolean): void {
       store.setState({ tourOpen: open });
     },
@@ -418,11 +601,59 @@ export function createRenderStore(options: RenderStoreOptions) {
     setAutoFrame(enabled: boolean): void {
       store.setState({ autoFrame: enabled });
     },
-    setLighting(lighting: "volume_fog" | "legacy"): void {
-      store.setState({ lighting });
+    /**
+     * 切换渲染方案。
+     *
+     * 每个方案的草稿各自独立保留（规格 §六）：切走再切回来，之前的取值还在，
+     * 且**不会**把体积雾参数带进经典方案 —— 参数只存在于当前方案的草稿里。
+     */
+    selectScheme(schemeId: string): void {
+      const state = store.getState();
+      if (!state.schemes.some((s) => s.id === schemeId)) {
+        return;
+      }
+      const drafts = { ...state.schemeDrafts };
+      if (!drafts[schemeId]) {
+        const scheme = state.schemes.find((s) => s.id === schemeId) as RenderScheme;
+        drafts[schemeId] = defaultDraft(scheme);
+      }
+      store.setState({ schemeId, schemeDrafts: drafts });
     },
-    setFogDensity(density: number): void {
-      store.setState({ fogDensity: density });
+    /**
+     * 修改当前方案的某个可调参数。立即做范围校验并把错误写进草稿，
+     * 供 UI 就地提示（提交时还会再拦一次）。
+     */
+    setSchemeParam(paramId: string, value: number | boolean | string): void {
+      const state = store.getState();
+      const scheme = state.schemes.find((s) => s.id === state.schemeId);
+      if (!scheme) {
+        return;
+      }
+      const param = scheme.parameters.find((p) => p.id === paramId);
+      // 只读参数不接受写入 —— 它们不参与提交。
+      if (!param || param.readonly) {
+        return;
+      }
+      const next: SchemeDraft = {
+        values: { ...draftFor(scheme.id).values, [paramId]: value },
+        errors: {},
+      };
+      const errors = validateDraft(scheme, next);
+      next.errors = errors;
+      store.setState({ schemeDrafts: { ...state.schemeDrafts, [scheme.id]: next } });
+    },
+    /** 当前方案的草稿（组件渲染动态控件时读取）。 */
+    schemeDraft(): SchemeDraft {
+      return draftFor(store.getState().schemeId);
+    },
+    /** 当前方案是否存在未解决的本地校验错误。 */
+    schemeInvalid(): boolean {
+      return currentSchemeInvalid();
+    },
+    /** 当前选中的方案对象（含参数定义）。 */
+    currentScheme(): RenderScheme | null {
+      const state = store.getState();
+      return state.schemes.find((s) => s.id === state.schemeId) ?? null;
     },
     setGlow(key: "threshold" | "strength" | "size" | "smoothness", value: number | null): void {
       if (key === "threshold") store.setState({ glowThreshold: value });

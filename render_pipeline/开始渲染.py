@@ -35,8 +35,11 @@
 参数（除 --pmx/--blend/--fingerprint 外都有默认值）：
     --out <目录>          输出目录，默认 output/<模型名>_<时间戳>（每次运行都是新目录）
     --mode faithful|enhanced
-    --lighting volume_fog|legacy   灯光配置，默认 volume_fog（7 灯体积雾方案）
-    --fog-density <f>              体积雾雾密度，默认 0.018（范围 0.0–0.1）
+    --scheme classic|volume_fog     灯光方案（PR #8 固定注册表，推荐）
+    --scheme-param k=v              方案参数，可重复（如 fog_density=0.018）
+    # 旧参数保留兼容但已弃用（legacy → classic；fog-density → scheme_parameters.fog_density）
+    --lighting volume_fog|legacy    灯光配置，默认 volume_fog（7 灯体积雾方案）
+    --fog-density <f>               体积雾雾密度，默认 0.018（范围 0.0–0.1）
     --glow-threshold <f> --glow-strength <f> --glow-size <f>
     --glow-smoothness <f> --glow-quality High|Medium|Low
                                   辉光微调（仅 enhanced 模式生效；不传用主脚本修复默认值）
@@ -362,19 +365,28 @@ def ensure_previews(model, conf_path):
 
 
 def write_job(model, out_dir, mode, auto_frame, maps_dir=None,
-              lighting="volume_fog", fog_density=0.018, glow=None):
-    """把渲染任务写成 job 文件 —— 只有本地进程能写，浏览器无法提供。"""
+              scheme="volume_fog", scheme_parameters=None, glow=None):
+    """把渲染任务写成 job 文件 —— 只有本地进程能写，浏览器无法提供。
+
+    ★ 规格 §四：「更安全的实现是由任务文件传递结构化参数，命令行只传受信任任务文件
+      路径。」所以方案参数以**结构化字段**写进 job 文件，而不是拼成命令行片段。
+      驱动读 job 文件里的 scheme / scheme_parameters，命令行只传开关与路径。
+    """
     kind = model_kind(model)
     fp = sha256_of(model)
     os.makedirs(JOB_DIR, exist_ok=True)
     job_path = os.path.join(JOB_DIR, "%s.job.json" % fp[:16])
+    params = dict(scheme_parameters or {})
     job = {
-        "schema": "toon-render-job/1",
+        "schema": "toon-render-job/2",
         "auto_render": True,
         "mode": mode,
         "auto_frame": 1 if auto_frame else 0,
-        "lighting": lighting,
-        "fog_density": fog_density,
+        "scheme": scheme,
+        "scheme_parameters": params,
+        # 旧字段同步写出：确认服务与既有排查工具仍按 lighting/fog_density 读。
+        "lighting": _scheme_to_legacy_lighting(scheme),
+        "fog_density": params.get("fog_density", 0.018),
         "glow": glow or {},
         "source_blend": SOURCE_BLEND,
         "blender": BLENDER,
@@ -394,8 +406,13 @@ def write_job(model, out_dir, mode, auto_frame, maps_dir=None,
     return job_path
 
 
+def _scheme_to_legacy_lighting(scheme):
+    """方案 id → 旧 lighting 取值。只用于兼容写出，不参与判定。"""
+    return "legacy" if str(scheme) == "classic" else "volume_fog"
+
+
 def run_confirm_and_render(model, conf_path, out_dir, mode, auto_frame, port, maps_dir=None,
-                           lighting="volume_fog", fog_density=0.018, glow=None):
+                           scheme="volume_fog", scheme_parameters=None, glow=None):
     """
     启动确认页 → 等用户确认 → **服务端自动续跑渲染** → 轮询终态。
     本进程全程不启动渲染，因此不可能与页面按钮产生两个 Blender。
@@ -407,7 +424,7 @@ def run_confirm_and_render(model, conf_path, out_dir, mode, auto_frame, port, ma
     if not ok:
         return "FAILED", {"status": "FAILED", "stage": "准备输出目录", "error": err}
     job_path = write_job(model, out_dir, mode, auto_frame, maps_dir,
-                         lighting=lighting, fog_density=fog_density, glow=glow)
+                         scheme=scheme, scheme_parameters=scheme_parameters, glow=glow)
     logp = os.path.join(out_dir, "confirm_server.log")
     buf = open(logp, "w", encoding="utf-8", errors="replace")
     srv = subprocess.Popen([PY, os.path.join(HERE, "_tools", "confirm_server.py"),
@@ -513,7 +530,7 @@ def run_confirm_and_render(model, conf_path, out_dir, mode, auto_frame, port, ma
 
 
 def render(model, out_dir, mode, auto_frame, maps_dir=None,
-           lighting="volume_fog", fog_density=0.018, glow=None):
+           scheme="volume_fog", scheme_parameters=None, glow=None):
     """
     无需确认时的直接渲染。带跨进程锁，防止重复起 Blender。
 
@@ -552,8 +569,8 @@ def render(model, out_dir, mode, auto_frame, maps_dir=None,
                 os.path.join(HERE, "一键渲染_通用驱动.py"), "--",
                 "--out", out_dir, "--mode", mode,
                 "--material-policy", "strict",
-                "--lighting", lighting,
-                "--fog-density", str(fog_density),
+                "--scheme", scheme,
+                "--scheme-params", json.dumps(dict(scheme_parameters or {}), ensure_ascii=False),
                 "--script", os.path.join(HERE, "一键卡通渲染.py"),
                 "--auto-frame", "1" if auto_frame else "0",
                 # ★ F6：直渲路径过去完全不传映射目录 —— 于是已确认过的模型
@@ -608,10 +625,17 @@ def main():
     ap.add_argument("--name")
     ap.add_argument("--out")
     ap.add_argument("--mode", default="faithful", choices=("faithful", "enhanced"))
-    ap.add_argument("--lighting", default="volume_fog", choices=("volume_fog", "legacy"),
-                    help="灯光配置：volume_fog=7 灯体积雾方案（默认）；legacy=旧版 21+6 复刻灯组")
-    ap.add_argument("--fog-density", type=float, default=0.018,
-                    help="体积雾雾密度，默认 0.018（范围 0.0–0.1）")
+    ap.add_argument("--scheme", default=None, choices=("classic", "volume_fog"),
+                    help="灯光方案（PR #8 固定注册表）：classic=21+6 复刻灯组；"
+                         "volume_fog=7 灯冷暖体积雾（默认）")
+    ap.add_argument("--scheme-param", action="append", default=None, metavar="K=V",
+                    help="方案参数，可重复（如 --scheme-param fog_density=0.018）")
+    ap.add_argument("--scheme-params", default=None, metavar="JSON",
+                    help="方案参数 JSON 对象（结构化形式，优先于 --scheme-param）")
+    ap.add_argument("--lighting", default=None, choices=("volume_fog", "legacy"),
+                    help="【已弃用】请改用 --scheme：legacy→classic；volume_fog→volume_fog")
+    ap.add_argument("--fog-density", type=float, default=None,
+                    help="【已弃用】请改用 --scheme-param fog_density=<f>（范围 0.0–0.1）")
     ap.add_argument("--glow-threshold", type=float, default=None)
     ap.add_argument("--glow-strength", type=float, default=None)
     ap.add_argument("--glow-size", type=float, default=None)
@@ -640,9 +664,49 @@ def main():
     BLENDER = os.path.abspath(a.blender) if a.blender else ""
     RUNTIME_DIR = os.path.abspath(a.runtime_dir)
     a.maps_dir = os.path.abspath(a.maps_dir) if a.maps_dir else default_maps_dir()
-    if not (0.0 <= a.fog_density <= 0.1):
-        out("--fog-density 必须在 0.0–0.1 之间，收到 %r" % a.fog_density)
+
+    # ---- 灯光方案归一（规格 §四）：新参数优先，旧参数弃用翻译，冲突拒绝 ----
+    # 不能只依赖驱动层校验：入口脚本自己也可能被 --no-confirm-ui 之外的方式直调，
+    # 而且"参数非法必须在校验之前就失败"这条应该在最早的一跳就成立。
+    sys.path.insert(0, HERE)
+    from schemes import registry as _SCHEME_REG          # noqa: E402
+    from schemes.base import SchemeError as _SchemeError  # noqa: E402
+
+    _raw_params = {}
+    if a.scheme_params:
+        try:
+            _raw_params = json.loads(a.scheme_params)
+        except ValueError as exc:
+            out("--scheme-params 不是合法 JSON：%s" % exc)
+            return 2
+        if not isinstance(_raw_params, dict):
+            out("--scheme-params 必须是 JSON 对象")
+            return 2
+    for kv in (a.scheme_param or []):
+        if "=" not in kv:
+            out("--scheme-param 需要 key=value 形式，收到 %r" % kv)
+            return 2
+        k, _, v = kv.partition("=")
+        _raw_params[k.strip()] = v.strip()
+    try:
+        scheme_id, scheme_note = _SCHEME_REG.resolve_scheme_id(
+            scheme=a.scheme, lighting=a.lighting
+        )
+        if a.fog_density is not None:
+            if scheme_id != "volume_fog":
+                raise _SchemeError(
+                    "RENDER_SCHEME_PARAM_INVALID",
+                    "--fog-density 只适用于 volume_fog 方案，当前是 %s" % scheme_id,
+                )
+            _raw_params.setdefault("fog_density", a.fog_density)
+            scheme_note = (scheme_note + "；" if scheme_note else "") \
+                + "--fog-density 已弃用，请改用 --scheme-param fog_density=<f>"
+        scheme_parameters = _SCHEME_REG.normalize_parameters(scheme_id, _raw_params)
+    except _SchemeError as exc:
+        out("灯光方案参数非法（%s）：%s" % (exc.code, exc.message))
         return 2
+    if scheme_note:
+        out("! 弃用：%s" % scheme_note)
     glow = {k: v for k, v in (("Threshold", a.glow_threshold),
                               ("Strength", a.glow_strength),
                               ("Size", a.glow_size),
@@ -693,7 +757,7 @@ def main():
         out("[1/3] .blend 直开模式：材质分类在 Blender 内进行（Python 侧预检仅支持 PMX）")
         out("[2/3] 直接渲染（严格准入；未解决材质将拒绝并给出待确认模板）")
         rc, outcome = render(model, out_dir, a.mode, bool(a.auto_frame), a.maps_dir,
-                             lighting=a.lighting, fog_density=a.fog_density, glow=glow)
+                             scheme=scheme_id, scheme_parameters=scheme_parameters, glow=glow)
         report_final(outcome, out_dir)
         return rc
 
@@ -713,7 +777,7 @@ def main():
     if not requiring:
         out("[2/3] 无需人工确认 —— 直接渲染")
         rc, outcome = render(model, out_dir, a.mode, bool(a.auto_frame), a.maps_dir,
-                             lighting=a.lighting, fog_density=a.fog_density, glow=glow)
+                             scheme=scheme_id, scheme_parameters=scheme_parameters, glow=glow)
         report_final(outcome, out_dir)
         return rc
 
@@ -734,8 +798,8 @@ def main():
     ensure_previews(model, conf_path)
     token, outcome = run_confirm_and_render(model, conf_path, out_dir, a.mode,
                                             bool(a.auto_frame), a.port, a.maps_dir,
-                                            lighting=a.lighting,
-                                            fog_density=a.fog_density, glow=glow)
+                                            scheme=scheme_id,
+                                            scheme_parameters=scheme_parameters, glow=glow)
     report_final(outcome, out_dir, confirm_path=True)
     return 0 if token == "SUCCESS" else 1
 

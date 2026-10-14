@@ -112,49 +112,64 @@ def test_validate_settings_rejects_bad_mode() -> None:
 
 
 def test_validate_settings_ok() -> None:
+    """PR #8：设置归一必须落到固定方案（默认 volume_fog），并镜像旧字段。"""
     assert validate_settings({"mode": "enhanced", "auto_frame": True}) == {
         "mode": "enhanced",
         "auto_frame": True,
+        "scheme": "volume_fog",
+        "scheme_version": 1,
+        "scheme_parameters": {"fog_density": 0.018},
         "lighting": "volume_fog",
         "fog_density": 0.018,
     }
 
 
 def test_validate_settings_lighting_and_glow_ok() -> None:
-    """2026-10-11 体积雾灯光与辉光增量：合法值原样通过（辉光项可缺省）。"""
-    assert validate_settings({
+    """2026-10-11 体积雾灯光与辉光增量：合法值原样通过（辉光项可缺省）。
+
+    2026-10-12 PR #8：旧的 ``lighting=legacy`` 翻译为 ``scheme=classic``；
+    classic 方案不接受 fog_density 调参，故 scheme_parameters 为空，
+    但旧字段仍按 deprecated 语义原样回填，并附带一条弃用提示。
+    """
+    out = validate_settings({
         "mode": "enhanced",
         "lighting": "legacy",
-        "fog_density": 0.05,
         "glow_threshold": 0.6,
         "glow_strength": 0.9,
         "glow_size": 0.7,
         "glow_smoothness": 0.4,
         "glow_quality": "Low",
-    }) == {
-        "mode": "enhanced",
-        "auto_frame": False,
-        "lighting": "legacy",
-        "fog_density": 0.05,
-        "glow_threshold": 0.6,
-        "glow_strength": 0.9,
-        "glow_size": 0.7,
-        "glow_smoothness": 0.4,
-        "glow_quality": "Low",
-    }
+    })
+    assert out["mode"] == "enhanced"
+    assert out["auto_frame"] is False
+    assert out["scheme"] == "classic"
+    assert out["scheme_version"] == 1
+    # classic 无动态参数：雾密度不能被悄悄塞进方案参数
+    assert out["scheme_parameters"] == {}
+    # 旧字段原样保留（只标弃用，不删除）
+    assert out["lighting"] == "legacy"
+    assert out["fog_density"] == 0.018
+    assert out["glow_threshold"] == 0.6
+    assert out["glow_strength"] == 0.9
+    assert out["glow_size"] == 0.7
+    assert out["glow_smoothness"] == 0.4
+    assert out["glow_quality"] == "Low"
+    assert "弃用" in out["deprecation"]
 
 
 def test_validate_settings_rejects_bad_lighting() -> None:
+    """PR #8：非法旧字段值归一到方案层，报稳定码 RENDER_SCHEME_INVALID。"""
     with pytest.raises(errors.ToonTunerError) as excinfo:
         validate_settings({"lighting": "neon"})
-    assert excinfo.value.code == errors.PARAM_INVALID
+    assert excinfo.value.code == errors.RENDER_SCHEME_INVALID
 
 
 def test_validate_settings_rejects_fog_density_out_of_range() -> None:
+    """PR #8：雾密度越界由方案参数校验拦下，报 RENDER_SCHEME_PARAM_INVALID。"""
     for bad in (-0.01, 0.11):
         with pytest.raises(errors.ToonTunerError) as excinfo:
             validate_settings({"fog_density": bad})
-        assert excinfo.value.code == errors.PARAM_INVALID
+        assert excinfo.value.code == errors.RENDER_SCHEME_PARAM_INVALID
 
 
 def test_validate_settings_rejects_bad_glow_quality() -> None:
@@ -207,7 +222,11 @@ def test_adapter_success_when_artifacts_present(tmp_path: Path) -> None:
 
 
 def test_adapter_passes_lighting_and_glow_flags(tmp_path: Path) -> None:
-    """体积雾灯光与辉光增量：适配器必须把设置透传成固定脚本的命令行开关。"""
+    """体积雾灯光与辉光增量：适配器必须把设置透传成固定脚本的命令行开关。
+
+    2026-10-12 PR #8：灯光部分改为固定方案 ``--scheme`` + ``--scheme-params``；
+    旧的 ``--lighting`` / ``--fog-density`` 不再由适配器下发。
+    """
     import asyncio
     import json
 
@@ -218,8 +237,8 @@ def test_adapter_passes_lighting_and_glow_flags(tmp_path: Path) -> None:
 
     job, created = service.create_job(model_id, {
         "mode": "enhanced",
-        "lighting": "legacy",
-        "fog_density": 0.05,
+        "scheme": "volume_fog",
+        "scheme_parameters": {"fog_density": 0.05},
         "glow_threshold": 0.6,
         "glow_quality": "Low",
     })
@@ -230,13 +249,16 @@ def test_adapter_passes_lighting_and_glow_flags(tmp_path: Path) -> None:
     assert final is not None
     assert final.state == "success"
     argv = json.loads((Path(final.output_dir) / "argv.json").read_text(encoding="utf-8"))
-    assert argv["lighting"] == "legacy"
-    assert argv["fog_density"] == 0.05
+    assert argv["scheme"] == "volume_fog"
+    assert json.loads(argv["scheme_params"])["fog_density"] == 0.05
+    # 旧灯光开关已从命令链路移除，避免双写
+    assert argv["lighting"] == "volume_fog"  # 替身默认值，未被适配器覆盖
     assert argv["glow_threshold"] == 0.6
     assert argv["glow_quality"] == "Low"
     # 未设置的辉光项不传（None），让主脚本用默认修复值。
     assert argv["glow_strength"] is None
     assert argv["glow_size"] is None
+    assert "--lighting" not in argv
 
 
 def test_adapter_passes_explicit_model_path(tmp_path: Path) -> None:
