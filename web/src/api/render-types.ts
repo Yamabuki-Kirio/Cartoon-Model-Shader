@@ -42,6 +42,18 @@ export interface RenderArtifact {
   artifact_id: string;
   name: string;
   size: number;
+  /**
+   * 产物角色（服务端 `_artifact_role` 判定）。
+   *
+   * - `image` / `image_noglow` / `blend`：可能可交付（还需任务终态为 SUCCESS）
+   * - `run_result` / `run_manifest` / `texture_ledger` / `log`：运行凭据，**永远不是成品**
+   */
+  role?: "image" | "image_noglow" | "blend" | "run_result"
+    | "run_manifest" | "texture_ledger" | "log" | string;
+  /** 中文展示名（服务端给，前端不自行翻译，避免两处措辞漂移）。 */
+  label?: string;
+  /** 是否为正式成品。只有 SUCCESS 终态下的图片与 .blend 才可能为 true。 */
+  shippable?: boolean;
 }
 
 export interface RenderJob {
@@ -139,10 +151,20 @@ export interface RenderEnvironmentResponse {
 }
 
 /** 三步教程的固定文案（规格 §5.2）。 */
+/**
+ * 首次使用说明（结果导向，**不讲架构**）。
+ *
+ * 六步就是用户实际会经历的动作序列，每一步都能在界面上找到对应控件；
+ * 最后一步明确「只有 SUCCESS 是正式成品」—— 这是最容易被误解的地方
+ * （诊断图也是图，REJECTED 也不是失败）。
+ */
 export const RENDER_ONBOARDING_STEPS = [
-  "打开 Blender 测试工程",
-  "启用 Blender MCP，确认端口 9876",
-  "检查环境并刷新模型列表",
+  "打开 Blender 并启用 MCP",
+  "选择模型",
+  "选择材质模式：严格，或宽松诊断",
+  "点击「开始渲染」",
+  "如需材质确认，完成确认后会自动继续渲染",
+  "只有「成功」是正式成品；诊断结果不是成品",
 ] as const;
 
 export interface RenderArtifactsResponse {
@@ -165,6 +187,8 @@ export interface CreateRenderJobBody {
   glow_size?: number | null;
   glow_smoothness?: number | null;
   glow_quality?: "High" | "Medium" | "Low" | null;
+  /** 材质准入口径：strict=未解决材质在重建前拒绝（默认）；diagnostic=洋红棋盘诊断图（不可交付）。 */
+  material_policy?: "strict" | "diagnostic";
 }
 
 /** 成功路径的 6 步（规格 §5）。 */

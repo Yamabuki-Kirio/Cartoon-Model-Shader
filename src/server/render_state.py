@@ -33,14 +33,19 @@ ALL_STATES = (
     "rejected",
     "diagnostic",
     "cancelled",
+    # 服务重启后从摘要索引恢复出来的历史任务专用终态：上次进程被杀，
+    # 任务没走到任何终态。它是终态（不可再流转、不可交付），但**不是 run_contract
+    # 的正式终态** —— run_contract 只有四态，绝不把中断伪装成失败或成功。
+    "interrupted",
 )
 
 # ---- 终止 / 可取消 / 可重试 --------------------------------------------
-TERMINAL_STATES = {"success", "failed", "rejected", "diagnostic", "cancelled"}
+TERMINAL_STATES = {"success", "failed", "rejected", "diagnostic", "cancelled", "interrupted"}
 #: 可交付白名单：**只有 success**。rejected / diagnostic / failed / cancelled 一律不可交付。
 SHIPPABLE_STATES = {"success"}
 CANCELABLE_STATES = {"queued", "analyzing_materials", "waiting_confirmation"}
-RETRYABLE_STATES = {"failed", "rejected", "diagnostic"}
+#: 中断可重试：上次进程被杀，产物目录可能只写了一半，重跑是最自然的出路。
+RETRYABLE_STATES = {"failed", "rejected", "diagnostic", "interrupted"}
 
 # 规格 §5 的 6 步：选择模型→材质分析→材质确认→渲染设置→执行渲染→查看结果
 STEP_COUNT = 6
@@ -58,6 +63,7 @@ _STEP_BY_STATE: dict[str, tuple[int, str]] = {
     "rejected": (5, "被拒"),
     "diagnostic": (5, "诊断"),
     "cancelled": (5, "已取消"),
+    "interrupted": (5, "已中断"),
 }
 
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {

@@ -418,7 +418,9 @@ def _run_one(tgt, out_dir, job, timeout=1800):
             "--python", job.get("driver") or DRIVER, "--",
             "--out", out_dir,
             "--mode", job.get("mode", "faithful"),
-            "--material-policy", "strict",
+            # 材质准入口径来自 job 文件（入口脚本按 --material-policy 写入）；
+            # 不传默认 strict，与主脚本口径一致。
+            "--material-policy", job.get("material_policy") or "strict",
             "--lighting", job.get("lighting") or "volume_fog",
             "--fog-density", str(job.get("fog_density")
                                  if job.get("fog_density") is not None else 0.018),
@@ -654,11 +656,21 @@ def _derive_job_from_conf():
     tgs = []
     for fp in STATE["order"]:
         m = STATE["models"][fp]
-        p = (m["conf"].get("model") or {}).get("path")
-        if p:
-            tgs.append({"fingerprint": fp, "pmx": p, "label": m["file"]})
+        conf_model = m["conf"].get("model") or {}
+        p = conf_model.get("path")
+        if not p:
+            continue
+        # ★ .blend 目标必须落在 blend 键上：确认服务拼 argv 时按 pmx/blend 二选一，
+        #   把 .blend 塞进 pmx 会让驱动走 PMX 导入分支（读不了二进制就报错）。
+        is_blend = conf_model.get("model_kind") == "blend" or \
+            str(p).lower().endswith(".blend")
+        tgs.append({"fingerprint": fp,
+                    "pmx": None if is_blend else p,
+                    "blend": p if is_blend else None,
+                    "label": m["file"]})
     return {"schema": "toon-render-job/1", "auto_render": False,
             "mode": "faithful", "auto_frame": 0,
+            "material_policy": "strict",
             "source_blend": SOURCE_BLEND, "blender": BLENDER,
             "driver": DRIVER, "script": SCRIPT,
             "out_root": os.path.join(RUNTIME_DIR, "output"),

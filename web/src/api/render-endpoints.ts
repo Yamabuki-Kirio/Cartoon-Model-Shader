@@ -2,6 +2,14 @@
 
 import type { ApiClient } from "./client";
 import type {
+  CommitBody,
+  CommitPrepareBody,
+  CommitPrepareResponse,
+  CommitResponse,
+  PresetDetailResponse,
+  PresetSaveBody,
+} from "./types";
+import type {
   CreateRenderJobBody,
   RenderArtifactsResponse,
   RenderCleanupReport,
@@ -16,6 +24,9 @@ const MODELS_PATH = "/api/render/models";
 const JOBS_PATH = "/api/render/jobs";
 const STORAGE_PATH = "/api/render/storage";
 const ENVIRONMENT_PATH = "/api/render/environment";
+const PRESETS_PATH = "/api/presets";
+const COMMIT_PREPARE_PATH = "/api/session/commit/prepare";
+const COMMIT_PATH = "/api/session/commit";
 
 export class RenderEndpoints {
   constructor(private readonly client: ApiClient) {}
@@ -102,5 +113,37 @@ export class RenderEndpoints {
    */
   environment(options: { signal?: AbortSignal } = {}): Promise<RenderEnvironmentResponse> {
     return this.client.get(ENVIRONMENT_PATH, options);
+  }
+
+  // -- 与调参域联动：保存为预设 / 草稿另存为新 .blend --------------------
+  //
+  // 复用**既有**预设与 commit 端点，不另开一套保存协议：
+  //   * 预设目录与文件名全部由服务端决定，接口不接受任何路径参数；
+  //   * 保存默认「另存为」，覆盖必须走既有确认单号 + 备份机制。
+
+  /** 把当前渲染参数存为预设（写接口）。服务端扫描并拒绝任何本机路径。 */
+  savePreset(body: PresetSaveBody, options: { signal?: AbortSignal } = {}): Promise<PresetDetailResponse> {
+    return this.client.post(PRESETS_PATH, body, options);
+  }
+
+  /**
+   * 保存准备（只校验不写盘）：签发一次性短效令牌。
+   *
+   * 覆盖已有文件且未带 `confirm` 时不签发令牌，而是回 `SAVE_CONFIRM_REQUIRED`（409），
+   * `details` 里带目标与备份的绝对路径 —— 调用方应把它当「确认提示」处理。
+   */
+  commitPrepare(
+    body: CommitPrepareBody,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<CommitPrepareResponse> {
+    return this.client.post(COMMIT_PREPARE_PATH, body, options);
+  }
+
+  /** 执行保存：消费令牌 → 应用草稿 → 回读校验 → 备份 → 保存工程。 */
+  commitApply(
+    body: CommitBody,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<CommitResponse> {
+    return this.client.post(COMMIT_PATH, body, options);
   }
 }

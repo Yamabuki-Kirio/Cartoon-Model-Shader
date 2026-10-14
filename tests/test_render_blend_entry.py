@@ -187,11 +187,13 @@ def test_main_routes_blend_model_to_direct_render(tmp_path: Path, monkeypatch) -
     calls: dict[str, object] = {}
 
     def fake_render(m, out_dir, mode, auto_frame, maps_dir=None,
-                    lighting="volume_fog", fog_density=0.018, glow=None):
+                    lighting="volume_fog", fog_density=0.018, glow=None,
+                    policy="strict"):
         calls["model"] = m
         calls["out_dir"] = out_dir
         calls["lighting"] = lighting
         calls["fog_density"] = fog_density
+        calls["policy"] = policy
         return 0, {"status": "SUCCESS", "token": "SUCCESS"}
 
     monkeypatch.setattr(mod, "render", fake_render)
@@ -209,6 +211,8 @@ def test_main_routes_blend_model_to_direct_render(tmp_path: Path, monkeypatch) -
     assert calls["model"] == str(model)
     assert calls["out_dir"] == str(tmp_path / "out")
     assert calls["lighting"] == "volume_fog"
+    # 材质准入默认 strict，且随参数贯穿（步骤 3）。
+    assert calls["policy"] == "strict"
 
 
 def test_main_rejects_unsupported_extension(tmp_path: Path, monkeypatch) -> None:

@@ -25,7 +25,92 @@ from .redact import redact
 
 _LOG_CAP = 200
 _MEMORY_JOB_CAP = 200
-_ARTIFACT_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".mov", ".gif")
+
+#: 可登记为产物的扩展名。**按角色分三类**，`shippable` 只对 image / blend 开放：
+#:
+#: * image —— 成品图与无辉光对照图；
+#: * blend —— 成品 .blend（渲染管线真正保存出来的那个，不是源工程）；
+#: * meta  —— 运行凭据 JSON 与脱敏日志，**永远不是成品**。
+#:
+#: ★ 刻意不含 ``.blend1``（Blender 自动备份）、``.bak-*``（人工备份）与任何
+#:   其它备份变体：那些是回滚用的中间物，混进产物列表会让人误下到过期版本。
+_ARTIFACT_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+_ARTIFACT_BLEND_EXTS = (".blend",)
+_ARTIFACT_META_EXTS = (".json", ".log")
+_ARTIFACT_EXTS = _ARTIFACT_IMAGE_EXTS + (".mp4", ".mov", ".gif") \
+    + _ARTIFACT_BLEND_EXTS + _ARTIFACT_META_EXTS
+
+#: 产物文件名里出现就**一律不登记**的后缀/片段（备份与自动保存）。
+_EXCLUDED_NAME_SUFFIXES = (".blend1",)
+_EXCLUDED_NAME_MARKERS = (".bak", "_backup", ".old", ".tmp")
+
+#: 角色 → 展示名与是否可交付。
+_ARTIFACT_ROLES: dict[str, tuple[str, str]] = {
+    "image": ("成品图", "image"),
+    "image_noglow": ("无辉光对照图", "image"),
+    "blend": ("成品工程", "blend"),
+    "run_result": ("运行结果", "meta"),
+    "run_manifest": ("运行清单", "meta"),
+    "texture_ledger": ("贴图台账", "meta"),
+    "log": ("任务日志", "meta"),
+}
+
+
+def _artifact_role(p: Path) -> str | None:
+    """按文件名 + 扩展名判定产物角色；不该暴露的文件返回 ``None``。"""
+    name = p.name
+    low = name.lower()
+    if any(low.endswith(sfx) for sfx in _EXCLUDED_NAME_SUFFIXES):
+        return None
+    if any(mk in low for mk in _EXCLUDED_NAME_MARKERS):
+        return None
+    ext = p.suffix.lower()
+    if ext in _ARTIFACT_IMAGE_EXTS:
+        # 无辉光对照图必须在成品图之前判：文件名含「无辉光 / noglow / no_glow」。
+        if any(k in low for k in ("无辉光", "noglow", "no_glow", "no-glow")):
+            return "image_noglow"
+        return "image"
+    if ext in _ARTIFACT_BLEND_EXTS:
+        return "blend"
+    if ext == ".json":
+        if "run_result" in low:
+            return "run_result"
+        if "run_manifest" in low:
+            return "run_manifest"
+        if "texture_ledger" in low:
+            return "texture_ledger"
+        return None                      # 其它 JSON（预检台账等）是中间物，不暴露
+    if ext == ".log":
+        if low.endswith("render.stdout.log") or "stdout" in low:
+            return "log"
+        return None
+    if ext in (".mp4", ".mov", ".gif"):
+        return "image"                   # 视频按图像角色登记，但不是 shippable
+    return None
+
+
+def _is_shippable_role(role: str) -> bool:
+    """只有成品图与成品 .blend 才是可交付物；凭据 JSON 与日志永远不是。"""
+    return role in ("image", "image_noglow", "blend")
+
+
+#: 允许写进历史索引的设置键。其余一律不落盘（索引是明文文件，不能夹带路径）。
+_HISTORY_SETTING_KEYS = (
+    "mode", "auto_frame", "lighting", "fog_density", "material_policy",
+    "glow_threshold", "glow_strength", "glow_size", "glow_smoothness",
+    "glow_quality",
+)
+
+
+def _public_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    """从任务设置里挑出可安全落盘的标量项（其余含路径/令牌，绝不写进索引）。"""
+    out: dict[str, Any] = {}
+    for key in _HISTORY_SETTING_KEYS:
+        value = settings.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            if value is not None:
+                out[key] = value
+    return out
 
 
 def _now() -> str:
@@ -63,6 +148,9 @@ class RenderJob:
     #: 是否为「兼容降级判定」：render.done 缺失，但退出码 0 且确有合法产物
     #: （规格 §3.2 第五行）。降级不等于造假，但必须如实披露。
     degraded: bool = False
+    #: 本条记录是从历史索引恢复出来的（服务重启后重建，不是本次会话跑的任务）。
+    #: 前端据此提示「上次会话的任务」，且**绝不**恢复线程或子进程。
+    restored_from_history: bool = False
     _proc: Any = field(default=None, repr=False, compare=False)
 
     # -- 派生属性 --------------------------------------------------------
@@ -124,6 +212,7 @@ class RenderJob:
             "shippable": self.shippable,
             "error_code": self.error_code,
             "degraded": self.degraded,
+            "restored_from_history": self.restored_from_history,
             "cancel_reason": self.cancel_reason,
         }
         if include_logs:
@@ -146,10 +235,19 @@ class RenderJob:
         return "kept"
 
     def list_artifacts(self) -> list[dict[str, Any]]:
-        """扫输出目录，返回 opaque artifact_id <-> 文件名 的映射。
+        """扫输出目录，返回 opaque artifact_id <-> 文件的映射（带角色与可交付标记）。
 
         同时扫描任务根目录与 ``artifacts/`` 子目录：历史任务可能用扁平布局，
         新任务用分类布局，两种都要能列出来。
+
+        三条硬约束：
+
+        1. **只登记白名单角色** —— 备份（``.blend1`` / ``.bak-*``）、预检台账等
+           中间物一律不列出，避免误下到过期版本或内部台账。
+        2. **拒绝符号链接** —— 产物目录理论上只由管线写入，出现链接即视为不可信，
+           不跟随（跟随会把任务目录外的文件暴露出去）。
+        3. **可交付标记来自终态** —— ``shippable`` 要求任务本身 ``shippable=True``；
+           仅 ``SUCCESS`` 终态才可能为真，诊断图 / 拒绝 / 失败一律 false。
         """
         roots: list[Path] = []
         root = Path(self.output_dir)
@@ -158,19 +256,55 @@ class RenderJob:
         sub = root / "artifacts"
         if sub.is_dir():
             roots.append(sub)
+        job_shippable = bool(self.shippable)
         items: list[dict[str, Any]] = []
         seen: set[str] = set()
+        # 逐个扫描根的**解析后**路径，作为「不许越界」的基准。
+        # ★ 别在下面的 for 里复用 base 这个名字 —— 循环变量会把它遮蔽掉。
+        base_real_map: dict[Path, Path] = {}
+        for scan_root in roots:
+            try:
+                base_real_map[scan_root] = scan_root.resolve()
+            except OSError:
+                base_real_map[scan_root] = scan_root
         for base in roots:
-            for p in sorted(base.iterdir()):
-                if not p.is_file() or p.suffix.lower() not in _ARTIFACT_EXTS:
-                    continue
+            base_real = base_real_map.get(base, base)
+            try:
+                entries = sorted(base.iterdir())
+            except OSError:
+                continue
+            for p in entries:
                 if p.name in seen:
                     continue
+                try:
+                    # ★ 符号链接一律不登记（跟随会把任务目录外的文件交出去）。
+                    #   注意 ``is_symlink()`` **不足以**覆盖全部情况：Windows 上
+                    #   非特权进程无法创建真符号链接，``symlink_to`` 会退化成硬链接，
+                    #   此时 is_symlink() 为 False。所以再加一道「解析后必须仍在
+                    #   本目录内」的硬校验 —— 硬链接的路径仍在本目录，不会被误杀，
+                    #   而任何形式的目录穿越都会在这里露出来。
+                    if p.is_symlink():
+                        continue
+                    real = p.resolve()
+                    if not real.is_relative_to(base_real):
+                        continue
+                    if not p.is_file():
+                        continue
+                    role = _artifact_role(p)
+                    if role is None:
+                        continue
+                    size = p.stat().st_size
+                except OSError:
+                    continue
                 seen.add(p.name)
+                label = _ARTIFACT_ROLES.get(role, (role, "meta"))[0]
                 items.append({
                     "artifact_id": f"art-{p.name}",
                     "name": p.name,
-                    "size": p.stat().st_size,
+                    "size": size,
+                    "role": role,
+                    "label": label,
+                    "shippable": bool(job_shippable and _is_shippable_role(role)),
                 })
         return items
 
@@ -290,6 +424,16 @@ class RenderJobManager:
                     "updated_at": job.updated_at,
                     "disk_bytes": job.disk_bytes,
                     "pinned": job.pinned,
+                    # 恢复历史任务要能继续下载产物，就必须知道产物在哪 —— 但索引是
+                    # 落盘文件，**绝不写绝对路径**。存相对 output_root 的相对路径，
+                    # 恢复时再拼回去并复核仍在根目录内。
+                    "output_rel": self._output_rel(job),
+                    "settings_public": _public_settings(job.settings),
+                    # 终态语义必须一起落盘：恢复后才知道这条到底可不可交付。
+                    # shippable 只在 success 时为真（run_contract 词表）。
+                    "outcome": job.outcome,
+                    "shippable": bool(job.shippable),
+                    "error_code": job.error_code,
                 }
             )
             # 索引本身也有上限，避免无界增长。
@@ -313,6 +457,103 @@ class RenderJobManager:
         except (json.JSONDecodeError, OSError):
             return []
         return data if isinstance(data, list) else []
+
+    def _output_rel(self, job: RenderJob) -> str | None:
+        """任务产物目录相对 ``output_root`` 的路径；不在根目录下则返回 None。"""
+        if not job.output_dir:
+            return None
+        try:
+            rel = Path(job.output_dir).resolve().relative_to(
+                self._output_root.resolve())
+        except (ValueError, OSError):
+            return None
+        return rel.as_posix()
+
+    def _resolve_output_rel(self, rel: str | None) -> str | None:
+        """把索引里的相对路径拼回绝对路径，并复核仍在 ``output_root`` 内。
+
+        索引是磁盘上的明文文件，可能被手工改坏或篡改 —— 所以**只接受相对路径**，
+        且拼回后必须真的落在输出根目录内（防 ``../`` 越界到任意目录）。
+        """
+        if not rel or Path(rel).is_absolute():
+            return None
+        candidate = (self._output_root / rel)
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(self._output_root.resolve())
+        except (ValueError, OSError):
+            return None
+        return str(resolved)
+
+    def restore_history(self) -> int:
+        """服务启动时从摘要索引恢复历史任务。返回恢复条数。
+
+        四条硬约束（规格 §9）：
+
+        1. **已完成任务继续展示、可继续下载** —— 产物目录在磁盘上，恢复后
+           ``list_artifacts`` 直接可用。
+        2. **上次非终态任务标记为 ``interrupted``** —— 绝不把中断说成成功，
+           也不留在「渲染中」假装还活着。
+        3. **不恢复旧线程或旧子进程** —— 这里只重建内存里的记录对象，
+           不 attach 任何句柄；PID 记录也绝不跨进程复用（见 ProcessRegistry）。
+        4. **数量受 ``max_memory_jobs`` 限制** —— 从最新的记起装填，超出的丢弃
+           （磁盘产物仍在，只是不在本次会话的列表里）。
+        """
+        import json
+
+        if not self._history_index_path.is_file():
+            return 0
+        try:
+            data = json.loads(self._history_index_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return 0
+        if not isinstance(data, list):
+            return 0
+
+        restored = 0
+        # 索引按追加顺序，末尾最新；从后往前装填，先保住最近的 max_memory_jobs 条。
+        for rec in reversed(data[-self._max_memory_jobs :]):
+            if not isinstance(rec, dict):
+                continue
+            job_id = str(rec.get("job_id") or "").strip()
+            if not job_id or job_id in self._jobs:
+                continue
+            state = str(rec.get("state") or "")
+            if state not in render_state.ALL_STATES:
+                continue
+            # 非终态 = 上次进程被杀时卡住的。必须落成 interrupted。
+            if state not in render_state.TERMINAL_STATES:
+                state = "interrupted"
+            out_dir = self._resolve_output_rel(rec.get("output_rel"))
+            if out_dir is None or not Path(out_dir).is_dir():
+                # 产物目录已被清理/篡改：仍保留记录（用户能看到它曾存在），
+                # 但标成不可交付 —— 没有目录就无从列举产物，更不能声称有成品。
+                out_dir = ""
+                shippable = False
+            # 索引可能来自旧版本或被手工改过：shippable 只认 success 终态。
+            shippable = bool(rec.get("shippable")) and state == "success"
+            job = RenderJob(
+                job_id=job_id,
+                model_id=str(rec.get("model_id") or ""),
+                fingerprint="",
+                state=state,
+                output_dir=out_dir,
+                disk_bytes=int(rec.get("disk_bytes") or 0),
+                pinned=bool(rec.get("pinned")),
+                created_at=str(rec.get("created_at") or ""),
+                updated_at=str(rec.get("updated_at") or ""),
+                model_name=str(rec.get("model_name") or ""),
+                settings=rec.get("settings_public") or {},
+                outcome=(rec.get("outcome") if state in render_state.TERMINAL_STATES else None),
+                shippable=shippable,
+                error_code=rec.get("error_code"),
+                degraded=False,
+                restored_from_history=True,
+            )
+            self._jobs[job_id] = job
+            self._by_fingerprint.setdefault(job.fingerprint or f"hist:{job_id}", job_id)
+            restored += 1
+        return restored
 
     # -- 状态机 ----------------------------------------------------------
     def set_state(self, job_id: str, new_state: str) -> RenderJob:

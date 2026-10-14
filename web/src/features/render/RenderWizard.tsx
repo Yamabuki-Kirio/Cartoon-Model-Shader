@@ -1,4 +1,4 @@
-import { useEffect } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
 import { useStore } from "../../state/useStore";
 import { Chip } from "../../components/chips";
 import { formatBytes, type RenderStore } from "../../state/render-store";
@@ -88,10 +88,11 @@ export function RenderWizard({ controller }: { controller: RenderStore }) {
   );
 }
 /**
- * 首次使用教程（规格 §5.2）。
+ * 首次使用说明。
  *
- * 三步固定文案；首次进入默认展开，可折叠，也能从右上角随时重开 ——
- * 新用户不该被要求先去读命令行文档。
+ * 六步结果导向文案，**不讲架构**：不讲端口、不讲协议、不讲脚本路径 ——
+ * 用户要的是「我该点哪里、点完会看到什么」。首次进入默认展开，可折叠，
+ * 也能随时重开。
  */
 function Onboarding({ controller }: { controller: RenderStore }) {
   const state = useStore(controller.store, (snapshot) => snapshot);
@@ -110,7 +111,8 @@ function Onboarding({ controller }: { controller: RenderStore }) {
         ))}
       </ol>
       <div class="muted">
-        三步完成后，「开始渲染」即可点击。卡住时点「重新检测环境」刷新这一页的诊断结果。
+        环境不完整时「开始渲染」会保持禁用，按上方诊断逐项处理后点「重新检测环境」。
+        材质确认完成后<strong>无需手动再点渲染</strong> —— 原任务会自动继续。
       </div>
     </div>
   );
@@ -351,6 +353,26 @@ function ModelStep({ controller }: { controller: RenderStore }) {
             <option value="legacy">旧版复刻灯组</option>
           </select>
         </label>
+        <label>
+          <span>材质准入</span>
+          <select
+            value={state.materialPolicy}
+            data-testid="render-material-policy"
+            onChange={(event) =>
+              controller.actions.setMaterialPolicy(
+                (event.currentTarget as HTMLSelectElement).value as "strict" | "diagnostic"
+              )
+            }
+          >
+            <option value="strict">严格（默认）：未解决材质拒绝渲染</option>
+            <option value="diagnostic">宽松诊断：未解决材质出洋红诊断图</option>
+          </select>
+        </label>
+        <p class="muted" data-testid="render-material-policy-hint">
+          {state.materialPolicy === "strict"
+            ? "严格模式：有材质无法自动归类时，渲染会在开始前被拒绝（REJECTED），需先在确认页完成材质确认。"
+            : "宽松诊断：无法归类的材质以洋红棋盘标出并继续出图，产物记为「诊断图」，不可交付，仅用于排查缺哪些材质。"}
+        </p>
         {state.lighting === "volume_fog" ? (
           <label>
             <span>雾密度（0–0.1）</span>
@@ -614,9 +636,21 @@ function isTerminalRetryable(job: RenderJob): boolean {
 
 function ResultStep({ job, controller }: { job: RenderJob; controller: RenderStore }) {
   const state = useStore(controller.store, (snapshot) => snapshot);
+  const [presetName, setPresetName] = useState("");
+  const [saveAsPath, setSaveAsPath] = useState("");
+
+  /** 按角色取第一个可下载产物的 URL；没有就返回 null（按钮不渲染）。 */
+  function downloadUrl(target: RenderJob, role: "image" | "blend"): string | null {
+    const hit = state.artifacts.find(
+      (artifact) => artifact.role === role && artifact.shippable
+    );
+    return hit ? controller.actions.artifactUrl(target.job_id, hit.artifact_id) : null;
+  }
 
   // ---- 可交付：只有 success 且服务端说 shippable -----------------------
   if (isShippableJob(job)) {
+    const blendUrl = downloadUrl(job, "blend");
+    const imageUrl = downloadUrl(job, "image");
     return (
       <div class="render-result" data-testid="render-result">
         <h3>渲染结果</h3>
@@ -660,18 +694,95 @@ function ResultStep({ job, controller }: { job: RenderJob; controller: RenderSto
                   {artifact.name}
                 </a>
                 <span class="muted"> {formatBytes(artifact.size)}</span>
+                {/* 角色徽标：正式成品与运行凭据必须一眼可分。凭据永远不是成品。 */}
+                {artifact.role ? (
+                  <span
+                    class={artifact.shippable ? "badge badge-ok" : "badge badge-plain"}
+                    data-testid={`render-artifact-role-${artifact.artifact_id}`}
+                  >
+                    {artifact.shippable
+                      ? `正式成品 · ${artifact.label ?? artifact.role}`
+                      : (artifact.label ?? artifact.role)}
+                  </span>
+                ) : null}
               </li>
             ))}
           </ul>
         )}
-        <button
-          type="button"
-          class="chip"
-          data-testid="render-open-output"
-          onClick={() => void controller.actions.openOutput()}
-        >
-          打开输出目录
-        </button>
+        <div class="result-actions">
+          <button
+            type="button"
+            class="chip"
+            data-testid="render-open-output"
+            onClick={() => void controller.actions.openOutput()}
+          >
+            打开输出目录
+          </button>
+          {blendUrl ? (
+            <a class="chip" href={blendUrl} data-testid="render-download-blend">
+              下载成品 .blend
+            </a>
+          ) : null}
+          {imageUrl ? (
+            <a class="chip" href={imageUrl} data-testid="render-download-image">
+              下载成品图
+            </a>
+          ) : null}
+        </div>
+          {/* ---- 保存联动：预设 / 草稿另存为（默认另存为，绝不自动覆盖） ---- */}
+        <div class="result-actions" data-testid="render-save-actions">
+          <label class="field">
+            <span>保存当前参数为预设</span>
+            <input
+              type="text"
+              value={presetName}
+              placeholder="预设名称"
+              data-testid="render-preset-name"
+              onInput={(event) =>
+                setPresetName((event.currentTarget as HTMLInputElement).value)
+              }
+            />
+          </label>
+          <button
+            type="button"
+            class="chip"
+            data-testid="render-save-preset"
+            disabled={state.busy}
+            onClick={() => void controller.actions.saveRenderPreset(presetName)}
+          >
+            保存为预设
+          </button>
+          <label class="field">
+            <span>草稿另存为新 .blend</span>
+            <input
+              type="text"
+              value={saveAsPath}
+              placeholder="新文件绝对路径（.blend）"
+              data-testid="render-saveas-path"
+              onInput={(event) =>
+                setSaveAsPath((event.currentTarget as HTMLInputElement).value)
+              }
+            />
+          </label>
+          <button
+            type="button"
+            class="chip"
+            data-testid="render-save-as"
+            disabled={state.busy}
+            onClick={() => void controller.actions.saveDraftAs(saveAsPath)}
+          >
+            另存为（不覆盖原工程）
+          </button>
+        </div>
+        {/* 保存失败不改渲染成功状态 —— 只在这里单独说。 */}
+        {state.saveStatus ? (
+          <div
+            class={state.saveStatus.ok ? "banner banner-info" : "banner banner-warn"}
+            data-testid="render-save-status"
+          >
+            {state.saveStatus.message}
+          </div>
+        ) : null}
       </div>
     );
   }

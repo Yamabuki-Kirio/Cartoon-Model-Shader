@@ -60,7 +60,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 
 from . import (
     SERVICE_NAME,
@@ -244,6 +244,21 @@ class BlenderGateway:
         return await self.status()
 
 
+def _attachment_disposition(filename: str, *, fallback: str = "download") -> str:
+    """构造 ``Content-Disposition``，兼容非 ASCII 文件名。
+
+    ★ 渲染产物名几乎都含中文（``一键渲染.png``）。HTTP 头是 latin-1，直接把中文塞进
+      ``filename="..."`` 会抛 ``UnicodeEncodeError`` —— 于是**中文产物的下载端点直接
+      500**。按 RFC 5987 额外给 ``filename*=UTF-8''…``，同时保留一个纯 ASCII 的
+      ``filename`` 兜底给老客户端。
+    """
+    from urllib.parse import quote
+
+    ascii_name = "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in filename) or fallback
+    quoted = quote(filename, safe="")
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quoted}'
+
+
 def _preset_public(preset: dict[str, Any]) -> dict[str, Any]:
     """预设的对外形状：摘要 + 逐参数明细（字段名与存储格式一致）。"""
     return {
@@ -312,6 +327,13 @@ def create_app(
     try:
         storage.cleanup_stale_work()
     except Exception:  # noqa: BLE001 - 清理失败不阻断启动
+        pass
+    # 从摘要索引恢复历史任务：已完成的可继续展示与下载；上次卡在非终态的
+    # 标记为 interrupted。**只重建内存记录** —— 不恢复线程、不恢复子进程，
+    # 也绝不因为 PID 相同去杀任何进程（PID 早已可能被系统复用）。
+    try:
+        job_manager.restore_history()
+    except Exception:  # noqa: BLE001 - 索引损坏不阻断启动
         pass
 
     @asynccontextmanager
@@ -955,7 +977,8 @@ def create_app(
         安全：**不从 artifact_id 重建任何路径**。artifact_id 只是从服务端自己
         枚举出的产物列表里查出来的键，因此 ``..`` / 绝对路径 / 编码穿越 / sibling
         前缀（如 ``C:\\out-evil`` 对上 ``C:\\out``）都不可能越界。命中后再用
-        ``is_relative_to`` 复核一次落盘位置。
+        ``is_relative_to`` 复核一次落盘位置，并拒绝符号链接（跟随会把任务目录
+        外的文件交出去）。日志在返回前逐行脱敏。
         """
         job = app.state.jobs.get(job_id)
         if job is None:
@@ -968,11 +991,31 @@ def create_app(
             raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"产物不存在：{artifact_id}")
 
         base = Path(job.output_dir).resolve()
-        path = (base / match["name"]).resolve()
+        raw = base / match["name"]
+        # 符号链接一律不提供；随后还要复核「解析后的真实路径」仍在任务目录内 ——
+        # 仅靠 is_symlink() 不够：Windows 上非特权进程创建不了真符号链接，
+        # symlink_to 会退化成硬链接，只能靠解析后是否越界来判。
+        if raw.is_symlink():
+            raise errors.ToonTunerError(errors.PREVIEW_FAILED, "产物文件不可用。")
+        path = raw.resolve()
         # 双保险：即便产物列表被污染，也必须真的落在输出目录内。
         if not path.is_relative_to(base) or not path.is_file():
             raise errors.ToonTunerError(errors.PREVIEW_FAILED, "产物文件不可用。")
-        return FileResponse(path)
+        if match.get("role") == "log":
+            # 日志必然含本机绝对路径（渲染脚本打印 argv），下载前必须脱敏。
+            try:
+                text = raw.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                raise errors.ToonTunerError(errors.PREVIEW_FAILED, "日志文件不可读。")
+            safe = "\n".join(redact(line) for line in text.splitlines())
+            return PlainTextResponse(
+                redact(safe),
+                media_type="text/plain; charset=utf-8",
+                headers={"Content-Disposition": _attachment_disposition(
+                    f"{job.job_id}-render.log", fallback="render.log")},
+            )
+        headers = {"Content-Disposition": _attachment_disposition(match["name"])}
+        return FileResponse(path, headers=headers)
 
     @app.post(
         "/api/render/jobs/{job_id}/open-output",

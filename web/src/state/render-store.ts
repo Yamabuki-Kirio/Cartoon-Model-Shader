@@ -9,9 +9,10 @@
  */
 
 import { AppError, isAbortError } from "../api/types";
-import type { ErrorDetail } from "../api/types";
+import type { ErrorDetail, SaveMode } from "../api/types";
 import type { RenderEndpoints } from "../api/render-endpoints";
 import type {
+  RenderArtifact,
   RenderCleanupReport,
   RenderEnvironmentResponse,
   RenderJob,
@@ -40,20 +41,29 @@ export interface RenderUiState {
   glowSize: number | null;
   glowSmoothness: number | null;
   glowQuality: "High" | "Medium" | "Low" | null;
+  /** 材质准入口径：strict=未解决即拒绝（默认）；diagnostic=洋红棋盘诊断图（不可交付）。 */
+  materialPolicy: "strict" | "diagnostic";
   /** 当前任务（活跃或最近一次）。 */
   job: RenderJob | null;
   jobLoading: boolean;
   jobError: ErrorDetail | null;
   /** 用户在向导里手选的步骤（0-based）；null = 跟随任务状态。 */
   stepOverride: number | null;
-  /** 结果产物（终态后拉取）。 */
-  artifacts: { artifact_id: string; name: string; size: number }[];
+  /** 结果产物（终态后拉取）。复用 api 层类型，别在这里另写一份 —— 重复定义必然漂移。 */
+  artifacts: RenderArtifact[];
   busy: boolean;
   notice: string | null;
   /** 资源治理：存储用量（容量 / 任务数 / 可清理空间）。 */
   storage: RenderStorageUsage | null;
   /** 最近一次清理预演/执行的结果。 */
   lastCleanup: RenderCleanupReport | null;
+  /**
+   * 保存结果（与渲染终态**分开**）。
+   *
+   * 保存失败绝不能改渲染任务的成功状态 —— 渲染成功就是成功。所以失败只体现在
+   * 这里，页面单独显示「渲染成功，但工程保存失败」。
+   */
+  saveStatus: { ok: boolean; message: string } | null;
   /** 环境诊断（规格 §5）：就绪状态 + 12 项检查。null = 尚未读取。 */
   environment: RenderEnvironmentResponse | null;
   environmentLoading: boolean;
@@ -81,6 +91,14 @@ function toDetail(error: unknown): ErrorDetail {
 export interface RenderStoreOptions {
   endpoints: RenderEndpoints;
   pollIntervalMs?: number;
+  /**
+   * 当前调参草稿（由调参域持有）。
+   *
+   * 「草稿另存为新 .blend」要把**这一份**草稿交给 commit 协议，而草稿本体住在
+   * v4/调参 store 里 —— 所以由外部注入读取器，渲染 store 不自己复制一份。
+   * 没注入时草稿为空对象（渲染产物下载不受影响）。
+   */
+  getDraft?: () => Record<string, unknown>;
 }
 
 /** 任务是否还在跑（需要继续轮询）。 */
@@ -91,6 +109,8 @@ function isActive(state: RenderState): boolean {
 export function createRenderStore(options: RenderStoreOptions) {
   const { endpoints } = options;
   const pollIntervalMs = options.pollIntervalMs ?? 1200;
+  /** 草稿读取器另取别名：saveDraftAs 的入参也叫 options，会把它遮蔽掉。 */
+  const getDraftOption = options.getDraft;
 
   const store: Store<RenderUiState> = createStore<RenderUiState>({
     models: [],
@@ -106,6 +126,7 @@ export function createRenderStore(options: RenderStoreOptions) {
     glowSize: null,
     glowSmoothness: null,
     glowQuality: null,
+    materialPolicy: "strict",
     job: null,
     jobLoading: false,
     jobError: null,
@@ -115,6 +136,7 @@ export function createRenderStore(options: RenderStoreOptions) {
     notice: null,
     storage: null,
     lastCleanup: null,
+    saveStatus: null,
     environment: null,
     environmentLoading: false,
     tourOpen: true,
@@ -275,6 +297,7 @@ export function createRenderStore(options: RenderStoreOptions) {
         glow_size: state.glowSize,
         glow_smoothness: state.glowSmoothness,
         glow_quality: state.glowQuality,
+        material_policy: state.materialPolicy,
       });
       store.setState({ job, busy: false, stepOverride: null });
       trackJob(job.job_id);
@@ -389,6 +412,87 @@ export function createRenderStore(options: RenderStoreOptions) {
     }
   }
 
+  /** 把当前渲染参数存为预设。目录与文件名全部由服务端决定。 */
+  async function saveRenderPreset(name: string): Promise<boolean> {
+    const job = store.getState().job;
+    const trimmed = name.trim();
+    if (!trimmed) {
+      store.setState({ notice: "请先给预设起个名字。" });
+      return false;
+    }
+    // 参数取自任务 settings（服务端持久化的那次提交），不是当前 UI 的临时值 ——
+    // 否则「渲染用的参数」与「存下来的参数」可能不是同一份。
+    const parameters = { ...(job?.settings ?? {}) };
+    if (job) {
+      parameters.model_id = job.model_id;
+    }
+    store.setState({ busy: true });
+    try {
+      const saved = await endpoints.savePreset({ name: trimmed, parameters });
+      store.setState({ busy: false, notice: `已保存预设「${saved.preset.name}」。` });
+      return true;
+    } catch (error) {
+      store.setState({ busy: false, notice: toDetail(error).message });
+      return false;
+    }
+  }
+
+  /**
+   * 把当前调参草稿**另存为**新 `.blend`（默认口径，绝不自动覆盖用户工程）。
+   *
+   * 走既有 commit 两步协议：prepare 签发一次性令牌 → apply 消费令牌写盘。
+   * 覆盖必须由调用方显式传 `mode: "overwrite"` 并带 `confirm`，服务端会先回
+   * `SAVE_CONFIRM_REQUIRED` 让用户看清目标路径与备份位置。
+   *
+   * ★ 保存失败**不改渲染任务的成功状态** —— 渲染成功就是成功，保存是另一件事。
+   *   失败只写 `saveStatus`，页面单独显示「渲染成功，但工程保存失败」。
+   */
+  async function saveDraftAs(
+    targetPath: string,
+    options: { mode?: SaveMode; confirm?: boolean; confirmationId?: string | null } = {}
+  ): Promise<boolean> {
+    const mode = options.mode ?? "save_as";
+store.setState({ busy: true, saveStatus: null });
+    // 注意别写成 `options.getDraft` —— options 已被本函数的入参遮蔽，
+    // 真正的读取器在工厂参数上（renderStoreOptions）。
+    const draft = getDraftOption ? getDraftOption() : {};
+    try {
+      const prepared = await endpoints.commitPrepare({
+        mode,
+        draft,
+        target_path: mode === "save_as" ? targetPath : null,
+        confirm: options.confirm ?? false,
+        confirmation_id: options.confirmationId ?? null,
+      });
+      const applied = await endpoints.commitApply({
+        token: prepared.token,
+        mode: prepared.mode as SaveMode,
+        draft,
+        target_path: prepared.target_path,
+      });
+      store.setState({
+        busy: false,
+        saveStatus: { ok: true, message: "工程已保存。" },
+      });
+      void applied;
+      return true;
+    } catch (error) {
+      const detail = toDetail(error);
+      store.setState({
+        busy: false,
+        saveStatus: {
+          ok: false,
+          message: `渲染成功，但工程保存失败：${detail.message}`,
+        },
+      });
+      return false;
+    }
+  }
+
+  function clearSaveStatus(): void {
+    store.setState({ saveStatus: null });
+  }
+
   const actions = {
     bootstrap(): void {
       void loadModels();
@@ -408,6 +512,9 @@ export function createRenderStore(options: RenderStoreOptions) {
     retryJob,
     cancelJob,
     openOutput,
+    saveRenderPreset,
+    saveDraftAs,
+    clearSaveStatus,
     selectJob,
     selectModel(modelId: string): void {
       store.setState({ selectedModelId: modelId });
@@ -432,6 +539,9 @@ export function createRenderStore(options: RenderStoreOptions) {
     },
     setGlowQuality(quality: "High" | "Medium" | "Low" | null): void {
       store.setState({ glowQuality: quality });
+    },
+    setMaterialPolicy(policy: "strict" | "diagnostic"): void {
+      store.setState({ materialPolicy: policy });
     },
     gotoStep(step: number): void {
       store.setState({ stepOverride: step });

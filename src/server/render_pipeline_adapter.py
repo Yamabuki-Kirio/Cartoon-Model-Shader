@@ -31,9 +31,11 @@ CONFIRM_PORT = 8770
 _VALID_MODES = ("faithful", "enhanced")
 _VALID_LIGHTING = ("volume_fog", "legacy")
 _VALID_GLOW_QUALITY = ("High", "Medium", "Low")
+#: 材质准入口径：strict = 未解决即拒绝（渲染前拦下）；diagnostic = 洋红棋盘诊断图。
+_VALID_POLICY = ("strict", "diagnostic")
 _WHITELIST = {"mode", "auto_frame", "lighting", "fog_density",
               "glow_threshold", "glow_strength", "glow_size",
-              "glow_smoothness", "glow_quality"}
+              "glow_smoothness", "glow_quality", "material_policy"}
 #: 设置键 → 驱动 CLI 开关（辉光增量；仅 enhanced 模式有意义）。
 _GLOW_FLAGS = (("glow_threshold", "--glow-threshold"),
                ("glow_strength", "--glow-strength"),
@@ -77,7 +79,7 @@ def _deliverable_images(job: Any) -> list[dict[str, Any]]:
 
 
 def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    """严格白名单：mode / auto_frame + 灯光辉光增量参数。多余键一律拒绝。"""
+    """严格白名单：mode / auto_frame + 灯光辉光增量 + 材质准入口径。多余键一律拒绝。"""
     extra = set(settings) - _WHITELIST
     if extra:
         raise errors.ToonTunerError(
@@ -95,6 +97,12 @@ def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
             errors.PARAM_INVALID,
             f"lighting 必须是 {_VALID_LIGHTING}，收到 {lighting!r}", retryable=False,
         )
+    policy = settings.get("material_policy", "strict")
+    if policy not in _VALID_POLICY:
+        raise errors.ToonTunerError(
+            errors.PARAM_INVALID,
+            f"material_policy 必须是 {_VALID_POLICY}，收到 {policy!r}", retryable=False,
+        )
     try:
         fog_density = float(settings.get("fog_density", 0.018))
     except (TypeError, ValueError):
@@ -108,7 +116,8 @@ def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
             f"fog_density 必须在 0.0–0.1 之间，收到 {fog_density!r}", retryable=False,
         )
     out: dict[str, Any] = {"mode": mode, "auto_frame": auto_frame,
-                           "lighting": lighting, "fog_density": fog_density}
+                           "lighting": lighting, "fog_density": fog_density,
+                           "material_policy": policy}
     for key in ("glow_threshold", "glow_strength", "glow_size", "glow_smoothness"):
         v = settings.get(key)
         if v is None:
@@ -428,6 +437,8 @@ class RenderPipelineService:
             out_dir,
             "--mode",
             str(job.settings.get("mode", "faithful")),
+            "--material-policy",
+            str(job.settings.get("material_policy", "strict")),
             "--lighting",
             str(job.settings.get("lighting", "volume_fog")),
             "--fog-density",

@@ -486,8 +486,10 @@ class RenderSettingsRequest(BaseModel):
 
     ``mode`` 仅 faithful | enhanced；``auto_frame`` 是否自动构图。
     ``lighting`` / ``fog_density`` / ``glow_*`` 是 2026-10-11 体积雾灯光与辉光修复增量
-    （自 Z:/B-Model/渲染方法复刻 新版脚本移植）：辉光项只在 enhanced 模式有意义，
-    不传则用主脚本默认修复值（阈值 0.55 / 平滑度 0.35 / 强度 0.85 / 尺寸 0.62 / High）。
+    （自外部新版脚本差异移植）：辉光项只在 enhanced 模式有意义，不传则用主脚本默认
+    修复值（阈值 0.55 / 平滑度 0.35 / 强度 0.85 / 尺寸 0.62 / High）。
+    ``material_policy`` 是材质准入口径：strict = 未解决材质在重建前拒绝（默认）；
+    diagnostic = 未解决材质换洋红棋盘诊断图，产物记为 diagnostic（不可交付）。
     其余字段一律 422 拒绝。
     """
 
@@ -503,6 +505,7 @@ class RenderSettingsRequest(BaseModel):
     glow_size: float | None = Field(default=None, ge=0.0, le=10.0)
     glow_smoothness: float | None = Field(default=None, ge=0.0, le=1.0)
     glow_quality: Literal["High", "Medium", "Low"] | None = None
+    material_policy: Literal["strict", "diagnostic"] = "strict"
 
 
 class ModelInfoResponse(BaseModel):

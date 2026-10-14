@@ -4,6 +4,7 @@ import { RenderWizard } from "./RenderWizard";
 import { createRenderStore } from "../../state/render-store";
 import { makeTestRenderEndpoints, renderJobFixture } from "../../testing/render-fixtures";
 import type { RenderEndpoints } from "../../api/render-endpoints";
+import { AppError } from "../../api/types";
 import type { RenderJob } from "../../api/render-types";
 
 afterEach(cleanup);
@@ -72,6 +73,49 @@ describe("一键渲染向导", () => {
     expect(getByTestId("render-artifact-art-result.png")).toBeTruthy();
   });
 
+  it("产物登记：正式成品与运行凭据必须一眼可分", async () => {
+    // 服务端按角色给 shippable；前端只消费，不再自己判「什么是成品」。
+    const { controller } = setup({
+      createJob: async () => renderJobFixture({
+        state: "success", is_terminal: true, step: 5, shippable: true,
+      }),
+      getJob: async () => renderJobFixture({
+        state: "success", is_terminal: true, step: 5, shippable: true,
+      }),
+      artifacts: async (jobId: string) => ({
+        ok: true as const,
+        job_id: jobId,
+        artifacts: [
+          { artifact_id: "art-out.png", name: "一键渲染.png", size: 2048,
+            role: "image", label: "成品图", shippable: true },
+          { artifact_id: "art-成品.blend", name: "成品.blend", size: 4096,
+            role: "blend", label: "成品工程", shippable: true },
+          { artifact_id: "art-run_manifest.json", name: "run_manifest.json", size: 512,
+            role: "run_manifest", label: "运行清单", shippable: false },
+          { artifact_id: "art-log", name: "render.stdout.log", size: 128,
+            role: "log", label: "任务日志", shippable: false },
+        ],
+      }),
+    });
+    const { getByTestId } = render(<RenderWizard controller={controller} />);
+    await settle();
+    fireEvent.click(getByTestId("render-start"));
+    await settle();
+    await settleTimers(12);
+
+    expect(getByTestId("render-artifact-role-art-out.png").textContent).toContain("正式成品");
+    expect(getByTestId("render-artifact-role-art-成品.blend").textContent).toContain("正式成品");
+    // 凭据与日志永远不能出现「正式成品」
+    expect(getByTestId("render-artifact-role-art-run_manifest.json").textContent)
+      .not.toContain("正式成品");
+    expect(getByTestId("render-artifact-role-art-log").textContent)
+      .not.toContain("正式成品");
+    // 四类产物都要有下载入口
+    for (const id of ["art-out.png", "art-成品.blend", "art-run_manifest.json", "art-log"]) {
+      expect(getByTestId(`render-artifact-${id}`)).toBeTruthy();
+    }
+  });
+
   it("灯光与辉光增量：默认体积雾方案，enhanced 才显示辉光微调，提交体带上参数", async () => {
     const { controller, endpoints } = setup();
     const { getByTestId, queryByTestId } = render(<RenderWizard controller={controller} />);
@@ -107,6 +151,30 @@ describe("一键渲染向导", () => {
         fog_density: 0.03,
         glow_threshold: 0.6,
         glow_quality: "Low",
+      })
+    );
+  });
+
+  it("材质准入：默认严格，可切宽松诊断并随提交体下发", async () => {
+    const { controller, endpoints } = setup();
+    const { getByTestId } = render(<RenderWizard controller={controller} />);
+    await settle();
+
+    // 默认 strict，提示文案解释「拒绝」语义。
+    expect((getByTestId("render-material-policy") as HTMLSelectElement).value).toBe("strict");
+    expect(getByTestId("render-material-policy-hint").textContent).toContain("拒绝");
+
+    fireEvent.change(getByTestId("render-material-policy"), { target: { value: "diagnostic" } });
+    await settle();
+    expect((getByTestId("render-material-policy") as HTMLSelectElement).value).toBe("diagnostic");
+    expect(getByTestId("render-material-policy-hint").textContent).toContain("不可交付");
+
+    fireEvent.click(getByTestId("render-start"));
+    await settle();
+    expect(endpoints.createJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model_id: "model-3f7a91c4d20b5e68",
+        material_policy: "diagnostic",
       })
     );
   });
@@ -234,6 +302,112 @@ describe("一键渲染向导", () => {
  * 关键不变量：四种终态的**文案与按钮必须互不相同**，且只有 success 显示成品区。
  * 这里逐态钉死，防止回归成「除 success 外一律渲染失败」。
  */
+/**
+ * 保存联动（任务4）。
+ *
+ * 关键不变量：**保存失败绝不改渲染任务的成功状态**。渲染成功就是成功，
+ * 工程保存是另一件事 —— 失败只在结果页单独说「渲染成功，但工程保存失败」。
+ */
+describe("一键渲染：结果与保存联动", () => {
+  async function runToSuccess(overrides: Record<string, unknown> = {}) {
+    const job = () =>
+      renderJobFixture({
+        state: "success",
+        is_terminal: true,
+        step: 5,
+        shippable: true,
+        ...overrides,
+      });
+    const { controller, endpoints } = setup({
+      createJob: async () => job(),
+      getJob: async () => job(),
+      artifacts: async (jobId: string) => ({
+        ok: true as const,
+        job_id: jobId,
+        artifacts: [
+          { artifact_id: "art-out.png", name: "一键渲染.png", size: 2048,
+            role: "image", label: "成品图", shippable: true },
+          { artifact_id: "art-成品.blend", name: "成品.blend", size: 4096,
+            role: "blend", label: "成品工程", shippable: true },
+        ],
+      }),
+    });
+    const view = render(<RenderWizard controller={controller} />);
+    await settle();
+    fireEvent.click(view.getByTestId("render-start"));
+    await settle();
+    await settleTimers(12);
+    return { view, endpoints };
+  }
+
+  it("成功页提供下载成品图 / 成品 .blend / 打开输出目录", async () => {
+    const { view } = await runToSuccess();
+    expect(view.getByTestId("render-download-image")).toBeTruthy();
+    expect(view.getByTestId("render-download-blend")).toBeTruthy();
+    expect(view.getByTestId("render-open-output")).toBeTruthy();
+    expect(view.getByTestId("render-download-image").getAttribute("href"))
+      .toContain("art-out.png");
+  });
+
+  it("保存为预设：把任务参数提交给预设接口", async () => {
+    const { view, endpoints } = await runToSuccess();
+    fireEvent.input(view.getByTestId("render-preset-name"), {
+      target: { value: "我的夜景预设" },
+    });
+    await settle();
+    fireEvent.click(view.getByTestId("render-save-preset"));
+    await settle();
+
+    expect(endpoints.savePreset).toHaveBeenCalledTimes(1);
+    const body = (endpoints.savePreset as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(body.name).toBe("我的夜景预设");
+    expect(body.parameters).toBeTruthy();
+  });
+
+  it("草稿另存为：默认 save_as 且必须走 prepare → apply 两步", async () => {
+    const { view, endpoints } = await runToSuccess();
+    fireEvent.input(view.getByTestId("render-saveas-path"), {
+      target: { value: "Z:/01/out/new.blend" },
+    });
+    await settle();
+    fireEvent.click(view.getByTestId("render-save-as"));
+    await settle();
+
+    expect(endpoints.commitPrepare).toHaveBeenCalledTimes(1);
+    const prepareBody = (endpoints.commitPrepare as ReturnType<typeof vi.fn>)
+      .mock.calls[0][0];
+    // 默认另存为：不带 confirm，绝不自动覆盖用户工程
+    expect(prepareBody.mode).toBe("save_as");
+    expect(prepareBody.confirm).toBe(false);
+    expect(endpoints.commitApply).toHaveBeenCalledTimes(1);
+  });
+
+  it("保存失败：单独提示，渲染成功状态不变", async () => {
+    const { view, endpoints } = await runToSuccess();
+    (endpoints.commitPrepare as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new AppError({ code: "SAVE_FAILED", message: "Blender 未连接，无法保存工程" }, 503)
+    );
+    fireEvent.input(view.getByTestId("render-saveas-path"), {
+      target: { value: "Z:/01/out/new.blend" },
+    });
+    await settle();
+    fireEvent.click(view.getByTestId("render-save-as"));
+    await settle();
+
+    const status = view.getByTestId("render-save-status");
+    expect(status.textContent).toContain("渲染成功，但工程保存失败");
+    // 关键：成品区仍在，渲染成功没有被改成失败
+    expect(view.getByTestId("render-result")).toBeTruthy();
+    expect(view.queryByTestId("render-result-failed")).toBeNull();
+    expect(view.getByTestId("render-download-image")).toBeTruthy();
+  });
+
+  it("非成功终态不提供保存联动入口", async () => {
+    const { view } = await runToSuccess({ state: "diagnostic", shippable: false });
+    expect(view.queryByTestId("render-save-actions")).toBeNull();
+  });
+});
+
 describe("一键渲染：四种运行终态", () => {
   async function runToTerminal(
     state: "success" | "rejected" | "diagnostic" | "failed",
@@ -407,15 +581,35 @@ describe("一键渲染：首次引导与环境诊断", () => {
     },
   ];
 
-  it("首次进入默认展示三步教程", async () => {
+  it("首次进入默认展示六步结果导向说明", async () => {
     const { controller } = setup();
     const { getByTestId } = render(<RenderWizard controller={controller} />);
     await settle();
 
     const tour = getByTestId("render-tour");
-    expect(tour.textContent).toContain("打开 Blender 测试工程");
-    expect(tour.textContent).toContain("9876");
-    expect(tour.textContent).toContain("检查环境并刷新模型列表");
+    // 六步就是用户实际的动作序列
+    for (const step of [
+      "打开 Blender 并启用 MCP",
+      "选择模型",
+      "严格",
+      "开始渲染",
+      "自动继续",
+      "正式成品",
+    ]) {
+      expect(tour.textContent).toContain(step);
+    }
+    // 结果导向：必须点明「诊断不是成品」
+    expect(tour.textContent).toContain("诊断结果不是成品");
+    // 不讲架构：不提端口、不提脚本路径
+    expect(tour.textContent).not.toContain("9876");
+    expect(tour.textContent).not.toContain("一键卡通渲染.py");
+  });
+
+  it("教程说明确认后无需手动再点渲染", async () => {
+    const { controller } = setup();
+    const { getByTestId } = render(<RenderWizard controller={controller} />);
+    await settle();
+    expect(getByTestId("render-tour").textContent).toContain("无需手动再点渲染");
   });
 
   it("教程可折叠，并可从右上角重开", async () => {

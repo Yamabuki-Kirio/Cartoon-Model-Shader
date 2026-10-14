@@ -117,6 +117,7 @@ def test_validate_settings_ok() -> None:
         "auto_frame": True,
         "lighting": "volume_fog",
         "fog_density": 0.018,
+        "material_policy": "strict",
     }
 
 
@@ -136,12 +137,25 @@ def test_validate_settings_lighting_and_glow_ok() -> None:
         "auto_frame": False,
         "lighting": "legacy",
         "fog_density": 0.05,
+        "material_policy": "strict",
         "glow_threshold": 0.6,
         "glow_strength": 0.9,
         "glow_size": 0.7,
         "glow_smoothness": 0.4,
         "glow_quality": "Low",
     }
+
+
+def test_validate_settings_material_policy_ok() -> None:
+    """材质准入口径：strict（默认）/ diagnostic 原样通过。"""
+    assert validate_settings({})["material_policy"] == "strict"
+    assert validate_settings({"material_policy": "diagnostic"})["material_policy"] == "diagnostic"
+
+
+def test_validate_settings_rejects_bad_material_policy() -> None:
+    with pytest.raises(errors.ToonTunerError) as excinfo:
+        validate_settings({"material_policy": "loose"})
+    assert excinfo.value.code == errors.PARAM_INVALID
 
 
 def test_validate_settings_rejects_bad_lighting() -> None:
@@ -237,6 +251,31 @@ def test_adapter_passes_lighting_and_glow_flags(tmp_path: Path) -> None:
     # 未设置的辉光项不传（None），让主脚本用默认修复值。
     assert argv["glow_strength"] is None
     assert argv["glow_size"] is None
+    # 材质准入默认 strict（不传 = 严格）。
+    assert argv["material_policy"] == "strict"
+
+
+def test_adapter_passes_diagnostic_policy(tmp_path: Path) -> None:
+    """宽松诊断模式：material_policy=diagnostic 必须透传成 --material-policy。"""
+    import asyncio
+    import json
+
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    manager, service, registry = _make_service(tmp_path, FAKE_ARGV, model_dir)
+    model_id = registry.to_public()[0]["model_id"]
+
+    job, created = service.create_job(
+        model_id, {"mode": "faithful", "auto_frame": False, "material_policy": "diagnostic"}
+    )
+    assert created is True
+    asyncio.run(service.start(job.job_id))
+
+    final = manager.get(job.job_id)
+    assert final is not None
+    assert final.state == "success"
+    argv = json.loads((Path(final.output_dir) / "argv.json").read_text(encoding="utf-8"))
+    assert argv["material_policy"] == "diagnostic"
 
 
 def test_adapter_passes_explicit_model_path(tmp_path: Path) -> None:

@@ -389,7 +389,9 @@ class StorageService:
                 return cleanup_work_dir(job.output_dir, self._roots)
             if job.state == "cancelled":
                 return cleanup_cancelled_job(job.output_dir, self._roots)
-            if job.state in ("failed", "rejected", "diagnostic"):
+            if job.state in ("failed", "rejected", "diagnostic", "interrupted"):
+                # interrupted 与失败同治：进程被杀时可能只写了一半大文件，
+                # 不清理就会一直占着磁盘（规格 §8：失败与取消不留大体积中间物）。
                 return cleanup_failed_job(
                     job.output_dir, self._roots, keep_logs=self._policy.keep_failed_logs
                 )
