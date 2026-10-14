@@ -189,6 +189,22 @@ SETTERS: dict[tuple[str, str], tuple[str, str]] = {
         "_material_socket({object_id})",
         "_set_material_socket({object_id}, {value})",
     ),
+    # -- 材质图节点（PR #7 提交 3）----------------------------------------
+    # ``object_id`` 形如 ``材质名/节点名/插座名``；三段全由服务端探测结果拼出。
+    # 与 MATERIAL 的 ``_material_socket`` 分开实现：这里定位的是**材质节点树内任意节点**
+    # 的输入插座（而 MATERIAL 只定位材质输出所连着色器的候选插座），语义不同不可复用。
+    ("MATERIAL_GRAPH_SOCKET", "default_value"): (
+        "_mg_socket({object_id})",
+        "_set_mg_socket({object_id}, {value})",
+    ),
+    ("MATERIAL_GRAPH_RAMP", "elements"): (
+        "_mg_ramp_elements({object_id})",
+        "_set_mg_ramp_elements({object_id}, {value})",
+    ),
+    ("MATERIAL_GRAPH_RAMP", "interpolation"): (
+        "_mg_ramp_interpolation({object_id})",
+        "_set_mg_ramp_interpolation({object_id}, {value})",
+    ),
 }
 
 
@@ -441,6 +457,109 @@ def _set_material_socket(object_id, value):
         socket.default_value = [float(component) for component in value]
     else:
         socket.default_value = float(value)
+
+
+def _mg_socket_ref(object_id):
+    """``材质名/节点名/插座名`` -> 材质节点树内某节点的输入插座。
+
+    三段都由服务端探测结果拼出。任一段缺失、材质/节点/插座不存在都**抛出**：
+    拓扑在基线与写入之间变了就必须让整份计划失败并回滚，绝不静默跳过。
+    """
+    material_name, _, rest = str(object_id).partition("/")
+    node_name, _, socket_name = rest.partition("/")
+    if not material_name or not node_name or not socket_name:
+        raise RuntimeError("material graph socket binding is malformed: " + str(object_id))
+    material = _material(material_name)
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        raise RuntimeError("material has no node tree: " + str(material_name))
+    node = tree.nodes.get(node_name)
+    if node is None:
+        raise RuntimeError("material graph node not found: " + str(node_name))
+    for candidate in list(node.inputs):
+        if str(getattr(candidate, "name", "")) == socket_name:
+            return candidate
+    raise RuntimeError("material graph socket not found: " + str(socket_name))
+
+
+def _mg_socket(object_id):
+    """读材质图插座：颜色返回 4 元列表，标量返回 float。"""
+    socket = _mg_socket_ref(object_id)
+    value = getattr(socket, "default_value", None)
+    if isinstance(value, (list, tuple)):
+        return [float(component) for component in value]
+    return float(value)
+
+
+def _set_mg_socket(object_id, value):
+    """写材质图插座（颜色与标量按取值形状分派）。已连线插座一律拒绝。"""
+    socket = _mg_socket_ref(object_id)
+    if bool(getattr(socket, "is_linked", False)):
+        raise RuntimeError(
+            "material graph socket is linked, default_value has no effect: " + str(object_id)
+        )
+    if isinstance(value, (list, tuple)):
+        socket.default_value = [float(component) for component in value]
+    else:
+        socket.default_value = float(value)
+
+
+def _mg_ramp_ref(object_id):
+    material_name, _, node_name = str(object_id).partition("/")
+    if not material_name or not node_name:
+        raise RuntimeError("material graph ramp binding is malformed: " + str(object_id))
+    material = _material(material_name)
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        raise RuntimeError("material has no node tree: " + str(material_name))
+    node = tree.nodes.get(node_name)
+    if node is None:
+        raise RuntimeError("material graph ramp node not found: " + str(node_name))
+    ramp = getattr(node, "color_ramp", None)
+    if ramp is None:
+        raise RuntimeError("material graph node has no color_ramp: " + str(node_name))
+    return ramp
+
+
+def _mg_ramp_elements(object_id):
+    ramp = _mg_ramp_ref(object_id)
+    out = []
+    for element in list(ramp.elements):
+        out.append({"position": float(element.position),
+                    "color": [float(c) for c in list(getattr(element, "color", []))]})
+    return out
+
+
+def _mg_ramp_interpolation(object_id):
+    return str(getattr(_mg_ramp_ref(object_id), "interpolation", ""))
+
+
+def _set_mg_ramp_interpolation(object_id, value):
+    _mg_ramp_ref(object_id).interpolation = str(value)
+
+
+def _set_mg_ramp_elements(object_id, elements):
+    """整体替换材质图色带：先整体校验，再一次性写入；数量不符即拒绝（结构改动）。"""
+    ramp = _mg_ramp_ref(object_id)
+    wanted = []
+    for item in elements:
+        position = float(item["position"])
+        color = [float(c) for c in item["color"]]
+        if len(color) != 4:
+            raise RuntimeError("material graph ramp color must have 4 components")
+        if position < 0.0 or position > 1.0:
+            raise RuntimeError("material graph ramp position out of range: " + str(position))
+        wanted.append((position, color))
+    if len(wanted) < 2:
+        raise RuntimeError("color ramp needs at least 2 elements")
+    current = list(ramp.elements)
+    if len(current) != len(wanted):
+        raise RuntimeError(
+            "color ramp element_count mismatch: %d != %d" % (len(current), len(wanted))
+        )
+    for element, (position, color) in zip(current, wanted):
+        element.position = position
+        element.color = color
 '''.strip()
 
 
@@ -578,7 +697,14 @@ def _literal(value: Any, binding: binding_module.Binding) -> str:
         binding_module.assert_no_client_path(value)
         return repr(str(value))
 
-    if binding.object_type == "COLOR_RAMP" and binding.field == "elements":
+    # 色带整体替换：两个色带族都要走同一套校验与归一化。
+    # 漏掉材质图（PR #7）那一种的后果很隐蔽 —— 已归一化的 `[{"position":…,"color":[…]}]`
+    # 会落到下面的列表分支，被 `_normalise_item` 当成「复合取值里的 dict」而拒绝，
+    # 表现为**材质图色带根本写不进去**，而错误信息完全看不出是少了这一条。
+    if binding.field == "elements" and binding.object_type in (
+        "COLOR_RAMP",
+        "MATERIAL_GRAPH_RAMP",
+    ):
         return repr(normalise_ramp_elements(value))
 
     if isinstance(value, bool):

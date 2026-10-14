@@ -38,7 +38,7 @@ RAMP_ID = "cel.Cel_Skin.ramp"
 
 
 class SurfaceInjector:
-    """按「第几次 Cel 写入」注入失败，用于验证各阶段的失败路径。
+    """按「第几次 Cel / 材质图写入」注入失败，用于验证各阶段的失败路径。
 
     计数从 ``reset()`` 之后开始：基线那一轮的预览任务也在写 L0，不重置的话
     「第 1/2/3 次」到底指哪一次就说不清了 —— 这是上一轮踩过的竞态。
@@ -48,8 +48,12 @@ class SurfaceInjector:
         self.fake = fake
         self.cel_writes = 0
         self.l0_writes = 0
+        #: 材质图（PR #7）单独计数：它走的是同一条通用执行器，但失败语义要分开验。
+        self.mg_writes = 0
         self.fail_cel_write_at: int | None = None
         self.mismatch_cel_readback_at: int | None = None
+        self.fail_mg_write_at: int | None = None
+        self.mismatch_mg_readback_at: int | None = None
         self.fail_render = False
         #: 置 True 后，**下一次** L0 写入会把桩的 ``is_dirty`` 翻成 True（一次性）。
         self.mark_dirty_on_l0_write = False
@@ -57,15 +61,42 @@ class SurfaceInjector:
     def reset(self) -> None:
         self.cel_writes = 0
         self.l0_writes = 0
+        self.mg_writes = 0
         self.fail_cel_write_at = None
         self.mismatch_cel_readback_at = None
+        self.fail_mg_write_at = None
+        self.mismatch_mg_readback_at = None
         self.fail_render = False
         self.mark_dirty_on_l0_write = False
 
     @staticmethod
+    def _is_material_graph(code: str) -> bool:
+        """材质图参数 id 是 opaque 的 ``mg-<hash>``，生成代码里就是 ``_stage = 'mg-...'``。
+
+        比匹配辅助函数名可靠：``_prelude()`` 是两类写入**共用**的，任何按函数名判定
+        的做法都会把「前奏里定义了 _mg_*」误当成「这次写的是材质图」。
+        """
+        return "_stage = 'mg-" in code
+
+    @staticmethod
     def _is_cel(code: str) -> bool:
         # 通用执行器的前奏里有 _ramp_ref；L0 的写入模板没有。
+        # 材质图的色带辅助函数是 `_mg_ramp_ref`，**包含** `_ramp_ref` 子串 —— 先排除，
+        # 否则材质图的写入会被算成 Cel 的第 N 次，两边的注入计数一起乱。
+        if SurfaceInjector._is_material_graph(code):
+            return False
         return "_ramp_ref" in code
+
+    def _write_failure(self, stage: str, message: str) -> str:
+        return JSON_MARKER + json.dumps(
+            {
+                "applied": False,
+                "failure": {"kind": "write_failed", "stage": stage, "type": "RuntimeError", "message": message},
+                "snapshot": {},
+                "values": {},
+            },
+            ensure_ascii=False,
+        )
 
     def __call__(self, code: str) -> str:
         if "bpy.ops.render.render" in code:
@@ -83,26 +114,34 @@ class SurfaceInjector:
                 )
             return run_generated_code(code, self.fake)
 
+        if self._is_material_graph(code):
+            self.mg_writes += 1
+            if self.fail_mg_write_at is not None and self.mg_writes == self.fail_mg_write_at:
+                return self._write_failure("mg-injected", "注入的材质图写入失败")
+            stdout = run_generated_code(code, self.fake)
+            if (
+                self.mismatch_mg_readback_at is not None
+                and self.mg_writes == self.mismatch_mg_readback_at
+            ):
+                payload = json.loads(stdout.split(JSON_MARKER, 1)[1].splitlines()[0])
+                values = payload.get("values") or {}
+                corrupted = False
+                for key, value in values.items():
+                    if isinstance(value, float):
+                        values[key] = value + 1.0
+                        corrupted = True
+                        break
+                assert corrupted, "注入材质图回读不一致失败：没找到可篡改的标量"
+                return JSON_MARKER + json.dumps(payload, ensure_ascii=False)
+            return stdout
+
         if self._is_cel(code):
             self.cel_writes += 1
             if (
                 self.fail_cel_write_at is not None
                 and self.cel_writes == self.fail_cel_write_at
             ):
-                return JSON_MARKER + json.dumps(
-                    {
-                        "applied": False,
-                        "failure": {
-                            "kind": "write_failed",
-                            "stage": RAMP_ID,
-                            "type": "RuntimeError",
-                            "message": "注入的色带写入失败",
-                        },
-                        "snapshot": {},
-                        "values": {},
-                    },
-                    ensure_ascii=False,
-                )
+                return self._write_failure(RAMP_ID, "注入的色带写入失败")
             stdout = run_generated_code(code, self.fake)
             if (
                 self.mismatch_cel_readback_at is not None

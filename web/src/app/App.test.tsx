@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { AppError } from "../api/types";
 import { makeTestWorkspace, settle, settleTimers } from "../testing/endpoints";
-import { groupNode, jobPayload, materialNode, schemaPayload } from "../testing/fixtures";
+import { groupNode, graphMaterialFixture, graphParamFixture, graphSchemaPayload, graphShaderColorFixture, jobPayload, materialNode, schemaPayload } from "../testing/fixtures";
 import type { JobState } from "../api/types";
 
 afterEach(cleanup);
@@ -68,12 +68,71 @@ describe("工作台整体", () => {
     await settle(2);
     expect(getByTestId("material-editor-皮肤_脸")).toBeTruthy();
     expect(queryByTestId("cel-editor-cel.Cel_Skin")).toBeNull();
-
     // 切回 Cel 分组
     fireEvent.click(getByTestId("nav-cel.Cel_Skin"));
     await settle(2);
     expect(getByTestId("cel-editor-cel.Cel_Skin")).toBeTruthy();
     expect(queryByTestId("material-editor-皮肤_脸")).toBeNull();
+  });
+
+  it("选中材质分组时同时给出逐材质编辑器与材质图深度编辑器（PR #7）", async () => {
+    const { workspace } = await setup({
+      surfaceSchema: async () =>
+        schemaPayload({
+          groups: [
+            groupNode("Cel_Skin"),
+            materialNode({ material: "皮肤_脸", users: ["model_mesh"] }),
+          ],
+        }),
+      materialGraphSchema: async () =>
+        graphSchemaPayload({
+          materials: [
+            graphMaterialFixture({
+              material: "皮肤_脸",
+              parameters: [graphShaderColorFixture("mg-common01", [0.9, 0.5, 0.3, 1])],
+            }),
+          ],
+        }),
+    });
+    const { getByTestId, queryByTestId } = render(
+      <App workspace={workspace} autoBootstrap={false} />
+    );
+
+    // Cel 分组下没有材质图编辑器
+    expect(queryByTestId("graph-editor-皮肤_脸")).toBeNull();
+
+    fireEvent.click(getByTestId("nav-material.皮肤_脸"));
+    await settle(2);
+
+    // 两套材质参数面**并列**：固定白名单 6 项 + 探测出来的完整节点图
+    expect(getByTestId("material-editor-皮肤_脸")).toBeTruthy();
+    expect(getByTestId("graph-editor-皮肤_脸")).toBeTruthy();
+    expect(getByTestId("graph-section-common").getAttribute("data-open")).toBe("1");
+    expect(getByTestId("graph-param-mg-common01")).toBeTruthy();
+  });
+
+  it("底部操作栏复位全部草稿时同时覆盖材质图", async () => {
+    const { workspace } = await setup({
+      surfaceSchema: async () =>
+        schemaPayload({ groups: [materialNode({ material: "皮肤_脸" })] }),
+      materialGraphSchema: async () =>
+        graphSchemaPayload({
+          materials: [
+            graphMaterialFixture({ material: "皮肤_脸", parameters: [graphParamFixture("mg-x")] }),
+          ],
+        }),
+    });
+    const { getByTestId } = render(<App workspace={workspace} autoBootstrap={false} />);
+
+    workspace.actions.setValue("mg-x", 2.5);
+    workspace.actions.setValue("material.皮肤_脸.roughness", 0.25);
+    await settle(2);
+    expect(getByTestId("action-reset-all").textContent).toContain("复位全部草稿");
+
+    fireEvent.click(getByTestId("action-reset-all"));
+    const draft = workspace.store.getState().draft;
+    expect("mg-x" in draft).toBe(false);
+    expect("material.皮肤_脸.roughness" in draft).toBe(false);
   });
 
   it("导航的「仅已修改」筛选生效", async () => {

@@ -16,6 +16,7 @@
 
 import type { CommitStatus, ErrorDetail, SaveMode } from "../api/types";
 import type { SurfaceDraft, SurfaceSchema } from "../schema/types";
+import { graphNodeIndex, splitGraphDraft, type MaterialGraphSchema } from "../schema/graph";
 import { sanitizeDraft } from "./draft";
 
 export type SavePhase =
@@ -124,6 +125,34 @@ export function splitSaveDraft(
   draft: SurfaceDraft
 ): { l0: Record<string, unknown>; surface: Record<string, unknown> } {
   return { l0: {}, surface: sanitizeDraft(schema, draft) };
+}
+
+/** 保存载荷的三半：L0 / v4 参数面 / 材质图（PR #7）。 */
+export interface SaveDraftSplit {
+  l0: Record<string, unknown>;
+  surface: Record<string, unknown>;
+  graph: Record<string, unknown>;
+}
+
+/**
+ * 把工作台的草稿拆成保存接口要的三半。
+ *
+ * 与 {@link splitSaveDraft} 的差别只有材质图：材质图参数 id 走 `material_draft`，
+ * 混进 `surface_draft` 只会被服务端当未知参数拒掉。拆分点收在这里 ——
+ * 别处不需要知道哪些 id 属于哪一边。
+ */
+export function splitSaveDraftFull(
+  schema: SurfaceSchema | null,
+  graphSchema: MaterialGraphSchema | null,
+  draft: SurfaceDraft
+): SaveDraftSplit {
+  const { surface, graph } = splitGraphDraft(graphSchema, draft);
+  return {
+    // L0 那一半留空 = 不改动 L0（服务端用「基线 + 草稿」合成完整取值）。
+    l0: {},
+    surface: sanitizeDraft(schema, surface),
+    graph: sanitizeDraft(null, graph, graphNodeIndex(graphSchema)),
+  };
 }
 
 /**
@@ -251,6 +280,31 @@ export function saveStatusRows(status: CommitStatus | null): SaveStepRow[] {
       }
     : null;
 
+  // 材质图（PR #7）单独一档：它与 Cel 是两批独立的写入，一边成功一边失败是真实存在的
+  // 情形；合并成一行会让「材质图到底写进去没有」看不出来。
+  const graphTouched =
+    status.material_graph_readback_verified !== undefined ||
+    Object.keys(status.applied_material_graph ?? {}).length > 0;
+  const graphApplied: SaveStepRow | null = graphTouched
+    ? {
+        key: "applied-material-graph",
+        label: "应用（材质图）",
+        ...triState(
+          Object.keys(status.applied_material_graph ?? {}).length > 0 ||
+            status.material_graph_readback_verified,
+          `${Object.keys(status.applied_material_graph ?? {}).length} 项已写入`,
+          "未写入"
+        ),
+      }
+    : null;
+  const graphReadback: SaveStepRow | null = graphTouched
+    ? {
+        key: "readback-material-graph",
+        label: "回读（材质图）",
+        ...triState(status.material_graph_readback_verified, "一致", "不一致"),
+      }
+    : null;
+
   const backup = status.backup ?? { required: false, created: false, path: null, path_confirmed: null };
   const backupRow: SaveStepRow = backup.required
     ? {
@@ -305,9 +359,15 @@ export function saveStatusRows(status: CommitStatus | null): SaveStepRow[] {
   if (surfaceApplied) {
     rows.push(surfaceApplied);
   }
+  if (graphApplied) {
+    rows.push(graphApplied);
+  }
   rows.push(readback);
   if (surfaceReadback) {
     rows.push(surfaceReadback);
+  }
+  if (graphReadback) {
+    rows.push(graphReadback);
   }
   rows.push(backupRow, savedRow, rollbackRow);
   return rows;

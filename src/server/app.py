@@ -91,6 +91,7 @@ from .models import (
     FramingContextResponse,
     HealthResponse,
     JobResponse,
+    MaterialGraphPreviewRequest,
     ParamSchemaResponse,
     PresetDeleteResponse,
     PresetDetailResponse,
@@ -104,6 +105,7 @@ from .models import (
     SceneResponse,
     V4PreviewRequest,
 )
+from .material_graph_service import MaterialGraphService
 from .presets import PresetStore
 from .redact import redact
 from .session import PreviewService, preview_url_for, validate_draft
@@ -244,7 +246,10 @@ def create_app(
     gateway = BlenderGateway(cfg)
     binder = BlenderBinder(cfg.blender_mcp)
     surface_service = SurfaceService()
-    preview = PreviewService(binder, surface_service)
+    #: 材质图参数面（PR #7）。与 ``surface_service`` 平行且独立：材质图探针或装配
+    #: 失败不会影响 L0 / Cel 两条既有路径。
+    material_graph_service = MaterialGraphService()
+    preview = PreviewService(binder, surface_service, material_graph_service)
     #: 所有写接口的统一闸门；令牌只在进程启动时生成一次。
     guard = security.SessionGuard()
     # 预设实现以 PR#2 的完整版为准；PR#3 的 cfg.presets_dir 作为额外覆盖入口接进来。
@@ -585,6 +590,9 @@ def create_app(
             surface_draft=body.surface_draft,
             structure_hash=body.structure_hash,
             confirmation_id=body.confirmation_id,
+            material_draft=body.material_draft,
+            confirmed_shared_groups=list(body.confirmed_shared_groups),
+            expected_material_structure_hash=body.expected_material_structure_hash,
         )
 
     @app.post(
@@ -606,6 +614,9 @@ def create_app(
             target_path=body.target_path,
             surface_draft=body.surface_draft,
             structure_hash=body.structure_hash,
+            material_draft=body.material_draft,
+            confirmed_shared_groups=list(body.confirmed_shared_groups),
+            expected_material_structure_hash=body.expected_material_structure_hash,
         )
 
     # -- 诊断（只读，不需要令牌）------------------------------------------
@@ -635,6 +646,58 @@ def create_app(
         只读接口，因此按既有规则不校验会话令牌。
         """
         return {"ok": True, **surface_service.schema_public()}
+
+    # -- 材质图（Material Graph，PR #7）-----------------------------------
+    @app.get("/api/material-graph/schema", tags=["material-graph"])
+    async def material_graph_schema() -> dict[str, Any]:
+        """材质图递归 schema：每个参数带置信等级、证据、影响路径与影响材质。
+
+        **只读接口**，因此按既有规则不校验会话令牌。
+        ``parameters`` 里的每一项都带 ``confidence`` / ``readonly_reason`` ——
+        推测结果永远不会被标成确定。
+        """
+        mg = preview.material_graph
+        if mg.baseline is None:
+            raise errors.ToonTunerError(
+                errors.NO_BASELINE,
+                "尚未建立材质图基线。请先建立基线（会顺带采集材质节点图）。",
+            )
+        return {"ok": True, **mg.schema_public()}
+
+    @app.get("/api/material-graph/materials/{material_id}", tags=["material-graph"])
+    async def material_graph_material(material_id: str) -> dict[str, Any]:
+        """单个材质的材质图 schema（含反向追踪结果与影响路径）。只读，不校验令牌。"""
+        mg = preview.material_graph
+        if mg.baseline is None:
+            raise errors.ToonTunerError(errors.NO_BASELINE, "尚未建立材质图基线。")
+        return {"ok": True, **mg.material_schema(material_id)}
+
+    @app.post(
+        "/api/material-graph/preview",
+        dependencies=require_token,
+        tags=["material-graph"],
+    )
+    async def material_graph_preview(body: MaterialGraphPreviewRequest) -> dict[str, Any]:
+        """提交材质图预览：校验 → 快照 → 应用 → 回读 → 渲染 → 恢复 → 回读确认。
+
+        前端只提交 **opaque 参数 id** 与取值。节点 / 插座 / 材质身份一律由服务端
+        从基线 schema 反查得到，请求里出现任何路径形态或表达式都会被拒绝。
+        共享节点组参数在 ``confirmed_shared_groups`` 未确认时返回
+        ``SHARED_PARAMETER_CONFIRM_REQUIRED``，绝不静默改到别的材质上。
+        """
+        job = await preview.submit_surface(
+            l0_draft={},
+            surface_draft={},
+            material_draft=dict(body.material_draft),
+            confirmed_shared=list(body.confirmed_shared_groups),
+            expected_material_structure_hash=body.expected_material_structure_hash,
+        )
+        return {
+            "ok": True,
+            "job_id": job.job_id,
+            "seq": job.seq,
+            "status": job.status,
+        }
 
     @app.get("/api/v4/session/baseline", tags=["v4"])
     async def v4_session_baseline() -> dict[str, Any]:
@@ -679,6 +742,9 @@ def create_app(
             surface_draft=surface_draft,
             framing_options=options,
             expected_structure_hash=body.expected_structure_hash,
+            material_draft=dict(body.material_draft),
+            confirmed_shared=list(body.confirmed_shared_groups),
+            expected_material_structure_hash=body.expected_material_structure_hash,
         )
         return {
             "ok": True,

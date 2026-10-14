@@ -157,12 +157,29 @@ class BlenderBinder:
         return payload
 
     # -- 通用执行器（v4 参数面）------------------------------------------
+    @staticmethod
+    def _apply_error_code(ops: list[Any]) -> str:
+        """整批 op 属于**哪一族参数面**，就用哪个稳定错误码。
+
+        材质图（PR #7）与 Cel 走的是同一个通用执行器，但「改的是材质节点」与
+        「改的是合成器节点组」是两件事：报 `SURFACE_APPLY_FAILED` 会让用户去错的地方
+        找原因。调用方**永远把两批分开传**（`plan.ops` 与 `plan.material_ops`），
+        因此「整批同族」这个前提是确定的 —— 混合批次不存在，也就不会判错。
+        """
+        if ops and all(
+            str(getattr(op.binding, "object_type", "")).startswith("MATERIAL_GRAPH_")
+            for op in ops
+        ):
+            return errors.MATERIAL_GRAPH_APPLY_FAILED
+        return errors.SURFACE_APPLY_FAILED
+
     def apply_surface_ops(self, ops: list[Any]) -> dict[str, Any]:
         """用 v4 通用执行器**原子**应用一组计划操作（色带整体替换等）。
 
         Blender 侧失败不回结构化 ``failure`` 之外的任何东西：执行器已经把它自己
-        写过的部分回滚到快照，这里只负责翻成稳定错误码 ``SURFACE_APPLY_FAILED``
-        并把「失败在哪条参数、什么原因」留在 details 里。
+        写过的部分回滚到快照，这里只负责翻成稳定错误码（Cel 为
+        ``SURFACE_APPLY_FAILED``、材质图为 ``MATERIAL_GRAPH_APPLY_FAILED``）并把
+        「失败在哪条参数、什么原因」留在 details 里。
 
         空计划是合法输入（例如工程里一个 Cel 组都没探到）：直接返回空结果，
         不去下发一段必然报错的空脚本。
@@ -174,7 +191,7 @@ class BlenderBinder:
         if payload.get("applied") is False:
             failure = payload.get("failure") or {}
             raise errors.ToonTunerError(
-                errors.SURFACE_APPLY_FAILED,
+                self._apply_error_code(ops),
                 f"参数写入失败：{redact(str(failure.get('message') or '')) or '未给出可识别的原因'}"
                 "（本次写入已被回滚）。",
                 details={

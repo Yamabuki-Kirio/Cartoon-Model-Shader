@@ -297,6 +297,12 @@ export interface CommitPrepareBody {
   confirmation_id?: string | null;
   surface_draft?: Record<string, unknown> | null;
   structure_hash?: string | null;
+  /** 材质图草稿：**opaque 参数 id -> 取值**。传了就一并绑进确认令牌。 */
+  material_draft?: Record<string, unknown> | null;
+  /** 已确认影响范围的共享节点组名单（未确认的共享组参数会被拒绝）。 */
+  confirmed_shared_groups?: string[];
+  /** 材质图结构指纹；与材质图基线不一致时在 prepare 阶段就拒绝。 */
+  expected_material_structure_hash?: string | null;
 }
 
 /**
@@ -337,6 +343,10 @@ export interface CommitBody {
   target_path?: string | null;
   surface_draft?: Record<string, unknown> | null;
   structure_hash?: string | null;
+  /** 材质图草稿：与 prepare 逐项一致，不一致即拒绝保存。 */
+  material_draft?: Record<string, unknown> | null;
+  confirmed_shared_groups?: string[];
+  expected_material_structure_hash?: string | null;
 }
 
 /** 保存失败时 `details.status` 的形状。四个状态各自独立，不合并成一句。 */
@@ -359,6 +369,8 @@ export interface CommitStatus {
     reason: string | null;
     l0?: Record<string, unknown> | null;
     cel?: Record<string, unknown> | null;
+    /** 材质图那一段的回滚结果（与 L0 / Cel **分开报**，不合并成一句）。 */
+    material_graph?: Record<string, unknown> | null;
   };
   saved: boolean;
   target_path: string;
@@ -368,6 +380,10 @@ export interface CommitStatus {
   applied_surface: Record<string, unknown>;
   surface_readback_verified: boolean;
   surface_mismatches: Array<Record<string, unknown>>;
+  /** 材质图（PR #7）：已写入的参数取值。 */
+  applied_material_graph?: Record<string, unknown>;
+  material_graph_readback_verified?: boolean;
+  material_graph_mismatches?: Array<Record<string, unknown>>;
   save?: {
     path_after?: string | null;
     path_matches?: boolean;
@@ -391,4 +407,132 @@ export interface CommitResponse {
   baseline_refreshed: boolean;
   saved_at: string;
   warnings: string[];
+}
+
+// -- 材质图（Material Graph，PR #7）------------------------
+
+/**
+ * 识别等级（后端 `material_graph.semantics.LEVELS`）。
+ *
+ * 这是**服务端给出的判定**，前端只负责如实展示，绝不自行提升等级：
+ * `inferred`（推测）与 `experimental`（实验性）永远不会被显示成「已确认」。
+ */
+export type GraphConfidence =
+  | "confirmed"
+  | "inferred"
+  | "user_confirmed"
+  | "experimental"
+  | "unsupported";
+
+/** schema 分区（后端 `material_graph.semantics.CATEGORIES`），决定右侧的分组顺序。 */
+export type GraphCategory =
+  | "common"
+  | "color"
+  | "numeric"
+  | "ramp"
+  | "node_group"
+  | "texture"
+  | "inferred"
+  | "advanced";
+
+/** 三值并存：探测到的当前值 / 基线值 / 真正生效值。 */
+export interface GraphParamValues {
+  current: unknown;
+  baseline: unknown;
+  effective: unknown;
+}
+
+export interface GraphRampElementPublic {
+  index: number;
+  position: {
+    value: number;
+    baseline: number | null;
+    minimum: number;
+    maximum: number;
+    step?: number;
+  };
+  color: { value: number[]; baseline: number[] | null };
+}
+
+/**
+ * 单个材质图参数的对外形状（后端 `material_graph.schema.to_spec`）。
+ *
+ * **不含任何节点路径**：`id` 是 opaque 的 `mg-<hash>`，真实节点名只出现在
+ * `source_label`（展示用）。因此请求体里不可能出现可被当作路径使用的拼接串。
+ */
+export interface GraphParamPublic {
+  id: string;
+  label: string | null;
+  kind: string;
+  confidence: GraphConfidence | string | null;
+  semantic: string | null;
+  semantic_label: string | null;
+  evidence: string[];
+  influence_paths: string[][];
+  affected_materials: string[];
+  shared: boolean;
+  editable: boolean;
+  supported: boolean;
+  category: GraphCategory | string | null;
+  readonly_reason: string | null;
+  source_node: string | null;
+  source_label: string | null;
+  in_group: string | null;
+  used_outputs: string[];
+  value: GraphParamValues;
+  minimum?: number | null;
+  maximum?: number | null;
+  step?: number | null;
+  elements?: GraphRampElementPublic[];
+  interpolation?: string | null;
+  element_count?: number | null;
+  /** 只暴露 `object_type` 与 `field`，**不含** `object_id`。 */
+  binding?: { object_type?: string; field?: string };
+}
+
+/** 反向追踪的汇总（降级原因 / 环 / 入口），供「高级影响路径」区展示。 */
+export interface GraphTraceSummary {
+  entry?: string;
+  entry_output?: string;
+  max_depth?: number;
+  cycle?: string[];
+  nodes?: Array<Record<string, unknown>>;
+}
+
+export interface GraphMaterialPublic {
+  schema_version: string;
+  material_id: string;
+  material: string;
+  available: boolean;
+  structure_hash?: string;
+  degraded_reason?: string | null;
+  trace?: GraphTraceSummary | null;
+  shared_groups?: Record<string, string[]>;
+  /** 内部节点树（与 `parameters` 同一批 id）；前端以 `parameters` 为准。 */
+  groups?: unknown[];
+  parameters: GraphParamPublic[];
+  categories?: Record<string, string[]>;
+  highest_cost?: string;
+  error?: string | null;
+}
+
+export interface MaterialGraphSchemaResponse {
+  ok: true;
+  available: boolean;
+  schema_version: string;
+  material_graph_baseline_id?: string;
+  structure_hash?: string;
+  materials: GraphMaterialPublic[];
+}
+
+/**
+ * 「共享节点组影响范围确认」的载荷。
+ *
+ * 三个字段全部来自服务端 `SHARED_PARAMETER_CONFIRM_REQUIRED` 的 `details` ——
+ * 前端**不猜**会影响谁：确认框里列的材质就是服务端说要改的那些。
+ */
+export interface SharedConfirmRequest {
+  parameter: string;
+  sharedGroup: string;
+  affectedMaterials: string[];
 }

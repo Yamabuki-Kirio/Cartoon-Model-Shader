@@ -10,7 +10,9 @@ import type {
   CommitResponse,
   FramingContext,
   FramingSubmitOptions,
+  GraphMaterialPublic,
   JobState,
+  MaterialGraphSchemaResponse,
   PresetDetailResponse,
   PresetListResponse,
   PresetSaveBody,
@@ -41,6 +43,16 @@ export interface PreviewSubmitPayload {
   draft: Record<string, unknown>;
   framing?: FramingSubmitOptions;
   expected_structure_hash?: string;
+  /**
+   * 材质图草稿（PR #7）：**opaque 参数 id -> 取值**。
+   *
+   * 与 `draft` 分开是服务端的契约，不是风格问题：`draft` 会被当成参数面草稿
+   * 逐个 id 校验，把材质图 id 混进去只会得到 `PARAM_INVALID`。
+   */
+  material_draft?: Record<string, unknown>;
+  /** 已确认影响范围的共享节点组。未列出的共享组参数会被服务端拒绝。 */
+  confirmed_shared_groups?: string[];
+  expected_material_structure_hash?: string;
 }
 
 export interface SurfaceBaselineResponse extends SurfaceBaselinePublic {
@@ -93,6 +105,31 @@ export class Endpoints {
   /** v4 任务状态（与 /api/jobs/{id} 共用同一份存储）。 */
   job(jobId: string, options: Omit<RequestOptions, "method" | "body"> = {}): Promise<JobState> {
     return this.client.get(`/api/v4/jobs/${encodeURIComponent(jobId)}`, options);
+  }
+
+  // -- 材质图（PR #7）------------------------
+
+  /**
+   * 材质图递归 schema（只读，不带令牌）。
+   *
+   * 需要**材质图基线**：它由 `POST /api/session/baseline` 顺带采集，
+   * 没建立之前服务端回 `NO_BASELINE`（而不是给一份空 schema 假装成功）。
+   */
+  materialGraphSchema(
+    options: Omit<RequestOptions, "method" | "body"> = {}
+  ): Promise<MaterialGraphSchemaResponse> {
+    return this.client.get(MATERIAL_GRAPH_SCHEMA_PATH, options);
+  }
+
+  /** 单个材质的材质图 schema（含反向追踪与影响路径）。只读，不校验令牌。 */
+  materialGraphMaterial(
+    materialId: string,
+    options: Omit<RequestOptions, "method" | "body"> = {}
+  ): Promise<{ ok: true } & GraphMaterialPublic> {
+    return this.client.get(
+      `${MATERIAL_GRAPH_PATH}/materials/${encodeURIComponent(materialId)}`,
+      options
+    );
   }
 
   // -- 预设 ------------------------
@@ -164,6 +201,8 @@ export const V4_SCHEMA_PATH = "/api/v4/surface/schema";
 export const V4_BASELINE_PATH = "/api/v4/session/baseline";
 export const V4_PREVIEW_PATH = "/api/v4/preview";
 export const V4_JOB_PATH = "/api/v4/jobs";
+export const MATERIAL_GRAPH_PATH = "/api/material-graph";
+export const MATERIAL_GRAPH_SCHEMA_PATH = "/api/material-graph/schema";
 export const FRAMING_PATH = "/api/framing/context";
 export const BLENDER_STATUS_PATH = "/api/blender/status";
 export const PRESETS_PATH = "/api/presets";

@@ -10,13 +10,30 @@ import {
 import type { RampNode } from "../../schema/types";
 import type { Workspace } from "../../state/workspace";
 
+export interface RampBridge {
+  dragElement(elementIndex: number, elements: RampElements, interpolation: string): void;
+  setElementColor(elementIndex: number, elements: RampElements, interpolation: string): void;
+  sealHistory(): void;
+}
+
+export type RampElements = Array<{ position: number; color: number[] }>;
+
 export interface RampStripProps {
   workspace: Workspace;
   groupId: string;
   node: RampNode;
-  elements: Array<{ position: number; color: number[] }>;
+  elements: RampElements;
   interpolation: string;
   editable: boolean;
+  /**
+   * 写入桥。
+   *
+   * 缺省时用 Cel 的约定：色带 id 就是 `${groupId}.ramp`。材质图（PR #7）的色带
+   * id 是服务端生成的 opaque `mg-<hash>` —— **没有后缀可以拼**，因此它必须自带
+   * 一个桥。把参数 id 塞进 `groupId` 指望拼出正确的 id 是一种猜测，
+   * 而猜错的表现是「拖了没反应」，最难排查。
+   */
+  bridge?: RampBridge;
 }
 
 /**
@@ -45,10 +62,20 @@ export function RampStrip({
   elements,
   interpolation,
   editable,
+  bridge,
 }: RampStripProps) {
   const trackRef = useRef<HTMLDivElement | null>(null);
   const dragIndexRef = useRef<number | null>(null);
   const [dragging, setDragging] = useState<number | null>(null);
+  // 桥在**每次渲染**里重新构造，永远捕获最新的 `elements` 与 `interpolation`；
+  // 这也是「色带 props 永不发霉」这条约束在桥上的延续。
+  const sink: RampBridge =
+    bridge ?? {
+      dragElement: (index, next, value) => workspace.actions.dragElement(groupId, index, next, value),
+      setElementColor: (index, next, value) =>
+        workspace.actions.setElementColor(groupId, index, next, value),
+      sealHistory: () => workspace.actions.sealHistory(),
+    };
 
   function positionFromEvent(clientX: number): number | null {
     const track = trackRef.current;
@@ -86,7 +113,7 @@ export function RampStrip({
     if (Math.abs(clamped - (elements[index]?.position ?? 0)) < 1e-9) {
       return;
     }
-    workspace.actions.dragElement(groupId, index, withPosition(index, clamped), interpolation);
+    sink.dragElement(index, withPosition(index, clamped), interpolation);
   }
 
   function endDrag(event?: Event) {
@@ -106,7 +133,7 @@ export function RampStrip({
       }
     }
     // 封存历史：下一次拖动是一条**新的**撤销记录。
-    workspace.actions.sealHistory();
+    sink.sealHistory();
   }
 
   function beginDrag(index: number, event: Event) {
@@ -182,9 +209,9 @@ export function RampStrip({
                   const next = elements.map((item, itemIndex) =>
                     itemIndex === index ? { position: clamped, color: item.color } : item
                   );
-                  workspace.actions.dragElement(groupId, index, next, interpolation);
+                  sink.dragElement(index, next, interpolation);
                 }}
-                onBlur={() => workspace.actions.sealHistory()}
+                onBlur={() => sink.sealHistory()}
               />
             </label>
 
@@ -203,7 +230,7 @@ export function RampStrip({
                   const next = elements.map((item, itemIndex) =>
                     itemIndex === index ? { position: item.position, color: parsed } : item
                   );
-                  workspace.actions.setElementColor(groupId, index, next, interpolation);
+                  sink.setElementColor(index, next, interpolation);
                 }}
               />
             </label>
@@ -224,9 +251,9 @@ export function RampStrip({
                   const next = elements.map((item, itemIndex) =>
                     itemIndex === index ? { position: item.position, color: parsed } : item
                   );
-                  workspace.actions.setElementColor(groupId, index, next, interpolation);
+                  sink.setElementColor(index, next, interpolation);
                 }}
-                onBlur={() => workspace.actions.sealHistory()}
+                onBlur={() => sink.sealHistory()}
               />
             </label>
 

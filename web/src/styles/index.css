@@ -32,17 +32,23 @@
 
 * { box-sizing: border-box; }
 
+html, body, #app { height: 100%; }
+
 body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
   font: 14px/1.5 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  /* 页面主体固定在视口内：滚动只发生在三栏**内部**，页面本身不滚。
+     否则「中央预览区」会被长参数列表顶出视野，调参时看不到画面。 */
+  overflow: hidden;
 }
 
 .workspace {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
 }
 
 .muted { color: var(--muted); }
@@ -64,6 +70,7 @@ body {
   padding: 8px 16px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
+  flex: none;
 }
 .status-item { display: inline-flex; align-items: center; gap: 6px; }
 .status-item em { font-style: normal; color: var(--muted); }
@@ -73,7 +80,9 @@ body {
 .dot-timeout, .dot-protocol_error, .dot-blender_error { background: var(--warn); }
 
 /* 横幅 */
-.banners { display: flex; flex-direction: column; }
+/* 横幅可以很多条（结构失效 + 错误 + 提示 + 外部改动 + 脏标记）。
+   自己不滚的话，它们会把工作台挤出视口 —— 于是「固定在视口内」就成了空话。 */
+.banners { display: flex; flex-direction: column; flex: 0 1 auto; max-height: 26vh; overflow-y: auto; }
 .banner {
   display: flex;
   gap: 8px;
@@ -91,39 +100,62 @@ body {
 .banner-dismiss { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 16px; }
 .external-list { margin: 4px 0; padding-left: 18px; }
 
-/* 三栏 */
+/* 三栏：各自独立滚动，中央预览始终占着自己那一列。 */
 .workbench {
   flex: 1;
+  min-height: 0;
   display: grid;
   grid-template-columns: 280px minmax(360px, 1fr) minmax(360px, 1fr);
   gap: 12px;
   padding: 12px;
-  align-items: start;
+  align-items: stretch;
+  overflow: hidden;
 }
 
 @media (max-width: 1400px) {
-  .workbench { grid-template-columns: 240px 1fr; grid-template-areas: "nav preview" "nav inspector"; }
+  /* 窄下来之后预览与检查器上下叠放：两行都要能各自滚动，因此行高必须可收缩
+     （`minmax(0, 1fr)` 而不是 `auto`，否则内容会把行撑破、溢出被裁掉）。 */
+  .workbench {
+    grid-template-columns: 240px 1fr;
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas: "nav preview" "nav inspector";
+  }
   .nav-panel { grid-area: nav; }
   .preview-pane { grid-area: preview; }
   .inspector { grid-area: inspector; }
 }
 
 @media (max-width: 900px) {
-  .workbench { grid-template-columns: 1fr; grid-template-areas: "preview" "nav" "inspector"; }
+  /* 单列堆叠时一屏放不下，只能让页面自己滚 —— 此时「固定在视口内」不再成立，
+     这是刻意的：宁可页面滚动，也不要把三块挤成三条看不见内容的缝。 */
+  body { overflow: auto; }
+  .workspace { height: auto; min-height: 100vh; }
+  .workbench {
+    grid-template-columns: 1fr;
+    grid-template-rows: none;
+    grid-template-areas: "preview" "nav" "inspector";
+    overflow: visible;
+  }
+  .nav-panel, .preview-pane, .inspector { max-height: none; }
 }
 
 .nav-panel, .preview-pane, .inspector {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
+  /* 三栏各自成列、各自滚动：`overflow: hidden` + 内部滚动容器，
+     外面的网格因此永远不会被内容撑大。 */
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   overflow: hidden;
 }
 
 /* 导航 */
-.nav-search { padding: 10px; border-bottom: 1px solid var(--border); }
+.nav-search { padding: 10px; border-bottom: 1px solid var(--border); flex: none; }
 .nav-search input[type="search"] { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-alt); color: var(--text); }
 .nav-filters { display: flex; gap: 6px; margin-top: 8px; }
-.nav-list { padding: 6px; }
+.nav-list { padding: 6px; flex: 1; min-height: 0; overflow-y: auto; }
 .nav-item {
   display: flex;
   justify-content: space-between;
@@ -178,20 +210,23 @@ body {
 .cost-l3 { color: var(--warn); }
 
 /* 预览 */
-.preview-toolbar { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px; border-bottom: 1px solid var(--border); }
+.preview-toolbar { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px; border-bottom: 1px solid var(--border); flex: none; }
 .preview-sources, .preview-zoom, .preview-actions { display: flex; gap: 6px; }
 .preview-actions { margin-left: auto; }
-.preview-stage { min-height: 320px; display: flex; align-items: center; justify-content: center; padding: 12px; background: var(--panel-alt); }
+/* 预览区自己撑满剩余高度、自己滚（画面很长或元信息很多时）。 */
+.preview-stage { flex: 1; min-height: 240px; display: flex; align-items: center; justify-content: center; padding: 12px; background: var(--panel-alt); overflow: auto; }
 .preview-image-fit { max-width: 100%; max-height: 60vh; object-fit: contain; }
 .preview-image-1x { max-width: none; }
-.preview-meta { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 8px 12px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+.preview-meta { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 8px 12px; border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); flex: none; max-height: 24vh; overflow-y: auto; }
 .inline-error { margin: 6px 12px; color: var(--bad); }
 .inline-warn { margin: 6px 12px; color: var(--warn); }
 
 /* 检查器 */
-.inspector-head { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.inspector-head { padding: 10px 12px; border-bottom: 1px solid var(--border); flex: none; }
 .inspector-head h2 { margin: 0 0 6px; font-size: 15px; }
-.inspector-body { padding: 12px; display: flex; flex-direction: column; gap: 16px; }
+/* 右栏是**一个**滚动容器：材质图分区可能上百项，但滚动条只有一条，
+   用户不会在嵌套的滚动区里迷路。分区内部的长列表另有自己的边界框（见下）。 */
+.inspector-body { padding: 12px; display: flex; flex-direction: column; gap: 16px; flex: 1; min-height: 0; overflow-y: auto; }
 .status-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 
 .cel-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
@@ -260,8 +295,7 @@ body {
 
 /* 底部操作栏 */
 .action-bar {
-  position: sticky;
-  bottom: 0;
+  flex: none;
   display: flex;
   flex-wrap: wrap;
   gap: 10px 24px;
@@ -296,6 +330,11 @@ body {
   padding: 12px 16px;
   background: var(--panel);
   border-top: 1px solid var(--border);
+  /* 面板本身可能很长（预设列表、四态表）：自己滚、且有上限，
+     否则它会把工作台挤成一条缝。 */
+  flex: 0 1 auto;
+  max-height: 46vh;
+  overflow-y: auto;
 }
 .save-head {
   display: flex;
@@ -361,3 +400,126 @@ body {
 .preset-item-main { display: flex; flex-direction: column; }
 .preset-meta { font-size: 12px; }
 .preset-item-actions { display: flex; gap: 6px; }
+
+/* 材质图深度编辑（PR #7） */
+.graph-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 0 0;
+  border-top: 1px solid var(--border);
+}
+.graph-editor h3 { margin: 0; font-size: 14px; }
+
+.graph-toolbar { display: flex; flex-direction: column; gap: 6px; }
+.graph-search {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-alt);
+  color: var(--text);
+}
+.graph-filters { display: flex; flex-wrap: wrap; gap: 4px; }
+.graph-filters .chip[data-count="0"] { opacity: 0.5; }
+.graph-toolbar-actions { display: flex; gap: 6px; }
+
+/* 分区：可折叠，展开状态由 workspace 按材质保存。 */
+.graph-sections { display: flex; flex-direction: column; gap: 8px; }
+.graph-section { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.graph-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--panel-alt);
+  font-size: 13px;
+}
+.graph-section-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.graph-section-caret { color: var(--muted); }
+.graph-section-counts { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+.graph-section-body { padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+.graph-section-hint { margin: 0; font-size: 12px; }
+
+/* 参数行 */
+.graph-param-list { display: flex; flex-direction: column; gap: 8px; }
+/* 长列表的虚拟窗口需要一个**有界**的滚动容器，否则窗口永远停在开头。
+   给它一个明确的上限，让它看起来就是一块可滚动的子列表。 */
+.graph-param-list.virtual {
+  max-height: 46vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px;
+}
+.graph-param-slot { height: 64px; overflow: hidden; }
+.graph-param {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.graph-param-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.graph-param-label { font-size: 13px; font-weight: 600; }
+.graph-param-value { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.graph-param-values {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 2px 12px;
+  margin: 0;
+  font-size: 12px;
+}
+.graph-param-values dt { color: var(--muted); }
+.graph-param-values dd { margin: 0 0 2px; word-break: break-word; font-family: var(--mono); }
+.graph-param-scope { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--muted); }
+.graph-param-scope .inline-warn { margin: 2px 0; }
+.graph-param-evidence summary { cursor: pointer; color: var(--text); }
+.graph-evidence-list, .graph-path-list { margin: 4px 0; padding-left: 18px; }
+.graph-param-actions { display: flex; gap: 6px; }
+
+.graph-number-inputs, .graph-color-inputs { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.graph-number-inputs input[type="number"] { width: 110px; padding: 2px 4px; }
+.graph-slider { width: 140px; }
+.graph-no-slider { font-size: 12px; }
+.graph-color-inputs input[type="color"] { width: 48px; height: 24px; padding: 0; border: 1px solid var(--border); background: none; }
+.graph-alpha { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
+.graph-alpha input[type="number"] { width: 72px; padding: 2px 4px; }
+.graph-ramp { display: flex; flex-direction: column; gap: 4px; }
+.graph-ramp-interpolation { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; font-size: 12px; }
+.graph-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+/* 共享节点组确认 */
+.shared-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--panel-alt);
+  font-size: 13px;
+}
+.shared-confirm-title { margin: 0; font-size: 13px; color: var(--warn); }
+.shared-confirm-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.shared-confirmed { font-size: 12px; }
+.shared-confirm-list { margin: 4px 0; padding-left: 18px; }
+
+.confidence-badge { cursor: help; }
+.btn-sm { padding: 3px 8px; font-size: 12px; }

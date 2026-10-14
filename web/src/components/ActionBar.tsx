@@ -61,7 +61,7 @@ export function ActionBar({ workspace }: { workspace: Workspace }) {
           disabled={state.historyBlocked || state.dirtyIds.size === 0}
           onClick={() => workspace.actions.resetAllDraft()}
         >
-          复位全部 Cel
+          复位全部草稿
         </button>
       </div>
 
@@ -91,7 +91,7 @@ export function ActionBar({ workspace }: { workspace: Workspace }) {
               ? "结构已变化，请先刷新基线"
               : saving
                 ? "保存进行中，等它结束再预览"
-                : "提交完整 Cel 草稿并渲染一张预览"
+                : "提交完整草稿（Cel + 逐材质 + 材质图）并渲染一张预览"
           }
           onClick={() => workspace.actions.applyAndPreview()}
         >

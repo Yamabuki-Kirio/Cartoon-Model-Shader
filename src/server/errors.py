@@ -70,6 +70,10 @@ FRONTEND_NOT_BUILT = "FRONTEND_NOT_BUILT"
 SURFACE_APPLY_FAILED = "SURFACE_APPLY_FAILED"
 #: `/assets/*` 的静态资源不存在（含路径越界；两种情况刻意不区分）。
 ASSET_NOT_FOUND = "ASSET_NOT_FOUND"
+#: 材质图（PR #7）共享节点组参数在未确认影响范围前被拒绝写入。
+SHARED_PARAMETER_CONFIRM_REQUIRED = "SHARED_PARAMETER_CONFIRM_REQUIRED"
+#: 材质图（PR #7）回滚后未能恢复到提交前状态（用于 ``error.details``）。
+MATERIAL_GRAPH_APPLY_FAILED = "MATERIAL_GRAPH_APPLY_FAILED"
 
 #: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，
 #: 便于调用方直接读到 ``parameter`` / ``value`` / ``depends_on`` / ``allowed``。
@@ -315,6 +319,18 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         404,
         False,
         "前端静态资源不存在。若页面白屏，请重新执行 npm run build 后再刷新。",
+    ),
+    SHARED_PARAMETER_CONFIRM_REQUIRED: (
+        409,
+        False,
+        "该参数属于被多个材质共享的节点组，修改前必须确认影响范围（会同时影响列出的材质）。"
+        "请在界面上确认后再提交。",
+    ),
+    MATERIAL_GRAPH_APPLY_FAILED: (
+        502,
+        True,
+        "材质图参数写入 Blender 失败（本次写入已被自动回滚，工程里的取值未改变）。"
+        "请确认对应材质与节点仍然存在后重试。",
     ),
 }
 
