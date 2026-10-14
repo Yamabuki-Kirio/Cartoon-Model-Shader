@@ -1,12 +1,13 @@
 import { useWorkspace } from "../app/useWorkspace";
 import { baselineValue, nodeValue } from "../state/draft";
-import { isMaterialGroup } from "../schema/material";
+import { isMaterialGroup, materialNameOf } from "../schema/material";
 import { flatten } from "../schema/parse";
 import { rgbaToCss } from "../schema/ramp";
 import type { SurfaceNode } from "../schema/types";
 import type { Workspace } from "../state/workspace";
 import { CelEditor } from "../features/cel/CelEditor";
 import { MaterialEditor } from "../features/material/MaterialEditor";
+import { MaterialGraphEditor } from "../features/graph/MaterialGraphEditor";
 import { Chip, reasonLabel } from "./chips";
 
 export function Inspector({ workspace }: { workspace: Workspace }) {
@@ -33,7 +34,16 @@ export function Inspector({ workspace }: { workspace: Workspace }) {
               按分组身份分派，而不是让 Cel 编辑器去猜「没有色带 = 也许是个材质」。
               先把 id 取出来：`isMaterialGroup` 是类型谓词，否定分支会被收窄成 never。 */}
           {isMaterialGroup(group) ? (
-            <MaterialEditor workspace={workspace} groupId={activeId} />
+            <>
+              {/* 两套材质参数面**并列**：上一个是固定白名单的 6 项安全参数，
+                  下一个是服务端探测出来的完整节点图参数（PR #7）。
+                  它们解决的不是同一个问题，合成一个列表只会让人分不清哪个是哪个。 */}
+              <MaterialEditor workspace={workspace} groupId={activeId} />
+              <MaterialGraphEditor
+                workspace={workspace}
+                materialName={materialNameOf(group)}
+              />
+            </>
           ) : (
             <CelEditor workspace={workspace} groupId={activeId} />
           )}

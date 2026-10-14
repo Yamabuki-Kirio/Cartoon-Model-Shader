@@ -31,6 +31,7 @@ const workspace = createWorkspace({
     deletePreset: (presetId, options) => endpoints.deletePreset(presetId, options),
     commitPrepare: (body, options) => endpoints.commitPrepare(body, options),
     commitApply: (body, options) => endpoints.commitApply(body, options),
+    materialGraphSchema: (options) => endpoints.materialGraphSchema(options),
     parseSchema,
   },
 });

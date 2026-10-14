@@ -37,12 +37,26 @@ import type {
   PresetSkip,
   PresetSummary,
   SaveMode,
+  SharedConfirmRequest,
   SurfaceBaselinePublic,
 } from "../api/types";
 import { AppError } from "../api/types";
-import type { SurfaceDraft, SurfaceSchema } from "../schema/types";
+import type { SurfaceDraft, SurfaceNode, SurfaceSchema } from "../schema/types";
 import { flatten, topGroups } from "../schema/parse";
 import { canCopyInto, copyRampValue, draftValueFromNode } from "../schema/ramp";
+import {
+  confirmRequestFromDetails,
+  emptyGraphView,
+  graphNodeIndex,
+  parseMaterialGraphSchema,
+  sharedGroupOf,
+  splitGraphDraft,
+  unconfirmedSharedGroupsInSchema,
+  MATERIAL_GRAPH_GROUP,
+  MATERIAL_GRAPH_GROUP_PREFIX,
+  type GraphViewState,
+  type MaterialGraphSchema,
+} from "../schema/graph";
 import { DraftHistory, type CommandKind } from "./commands";
 import {
   computeDirtyIds,
@@ -52,6 +66,7 @@ import {
   nodeValue,
   resetAll,
   resetGroup,
+  resetIds,
   sanitizeDraft,
   setDraftValue,
   valuesEqual,
@@ -64,7 +79,7 @@ import {
   saveBusy,
   saveFailureNotice,
   saveTargetProblem,
-  splitSaveDraft,
+  splitSaveDraftFull,
   type SaveOutcome,
   type SaveState,
 } from "./save";
@@ -159,6 +174,54 @@ export interface WorkspaceState {
   save: SaveState;
   /** 本地预设列表。 */
   presets: PresetState;
+  /** 材质图参数面（PR #7）。草稿与撤销栈与 v4 参数面共用，见 `draft.ts`。 */
+  graph: GraphState;
+}
+
+/**
+ * 材质图参数面状态（PR #7）。
+ *
+ * 与 v4 参数面**平行且独立**：结构指纹、基线、恢复结果都分开报，
+ * 因为「Cel 的结构变了」与「材质节点图变了」是两件不同的事，
+ * 合并成一句会让人无从判断该刷新什么。
+ */
+export interface GraphState {
+  /** 是否已经成功加载过一份材质图 schema。 */
+  loaded: boolean;
+  loading: boolean;
+  schema: MaterialGraphSchema | null;
+  /** 只有**真的失败**才填。没有基线不算失败 —— 那是流程顺序问题。 */
+  error: ErrorDetail | null;
+  /** 服务端当前是否存在材质图基线（没有就先刷新基线）。 */
+  baselineReady: boolean;
+  baselineId: string | null;
+  structureHash: string | null;
+  /** 用户已确认影响范围的共享节点组（随预览与保存一起提交）。 */
+  confirmedSharedGroups: string[];
+  /** 服务端要求确认影响范围时填；确认或取消后清空。 */
+  pendingShared: SharedConfirmRequest | null;
+  /** 上次成功预览里材质图那一段是否逐项回读一致；`null` = 没有证据。 */
+  restoreVerified: boolean | null;
+  restoreMismatches: Array<Record<string, unknown>>;
+  /** 逐材质的界面视图状态。 */
+  view: Record<string, GraphViewState>;
+}
+
+export function emptyGraphState(): GraphState {
+  return {
+    loaded: false,
+    loading: false,
+    schema: null,
+    error: null,
+    baselineReady: false,
+    baselineId: null,
+    structureHash: null,
+    confirmedSharedGroups: [],
+    pendingShared: null,
+    restoreVerified: null,
+    restoreMismatches: [],
+    view: {},
+  };
 }
 
 export interface PresetState {
@@ -275,6 +338,15 @@ export interface WorkspaceEndpoints {
     options?: { signal?: AbortSignal }
   ): Promise<CommitPrepareResponse>;
   commitApply(body: CommitBody, options?: { signal?: AbortSignal }): Promise<CommitResponse>;
+  /** 材质图递归 schema（只读）。需要先建立基线，否则服务端回 `NO_BASELINE`。 */
+  materialGraphSchema(options?: { signal?: AbortSignal }): Promise<{
+    ok: true;
+    available: boolean;
+    schema_version: string;
+    material_graph_baseline_id?: string;
+    structure_hash?: string;
+    materials: unknown[];
+  }>;
   parseSchema(raw: unknown): SurfaceSchema;
 }
 
@@ -405,7 +477,96 @@ export function createWorkspace(options: WorkspaceOptions) {
     autoPreviewPending: false,
     save: emptySaveState(),
     presets: emptyPresetState(),
+    graph: emptyGraphState(),
   });
+
+  /**
+   * 材质图参数索引的**按身份记忆**缓存。
+   *
+   * `draft.ts` 的草稿工具每次都会查一遍索引，而构建索引是 O(参数数)。
+   * 缓存以 `schema` 的**对象身份**为键：schema 一换（刷新基线 / 重新加载）就重建，
+   * 因此不会出现「索引比 schema 旧」的漂移。
+   */
+  let graphIndexCache: { schema: MaterialGraphSchema | null; index: Map<string, SurfaceNode> } | null =
+    null;
+
+  function graphNodes(): Map<string, SurfaceNode> {
+    const schema = store.getState().graph.schema;
+    if (!graphIndexCache || graphIndexCache.schema !== schema) {
+      graphIndexCache = { schema, index: graphNodeIndex(schema) };
+    }
+    return graphIndexCache.index;
+  }
+
+  function patchGraph(patch: Partial<GraphState>): void {
+    store.setState({ graph: { ...store.getState().graph, ...patch } });
+  }
+
+  /**
+   * 色带写入的**唯一实现**。Cel 与材质图共用。
+   *
+   * 交互语义必须一致：拖动期间同一 `mergeKey` 合并成一条命令、松开时 `seal()`
+   * 成新的撤销记录。两处各写一份，迟早会出现「Cel 能撤销、材质图不能」这类漂移。
+   */
+  function writeRamp(
+    paramId: string,
+    groupId: string,
+    params: {
+      kind: CommandKind;
+      label: string;
+      elements: Array<{ position: number; color: number[] }>;
+      interpolation: string;
+      mergeKey: string | null;
+    }
+  ): void {
+    commitCommand({
+      kind: params.kind,
+      label: params.label,
+      groupId,
+      next: setDraftValue(
+        store.getState().draft,
+        paramId,
+        rampDraftOf(params.elements, params.interpolation)
+      ),
+      mergeKey: params.mergeKey,
+    });
+  }
+
+  /** 材质图参数所属材质的界面分组 id（命令展示与日志归类用）。 */
+  function graphGroupIdOf(state: WorkspaceState, paramId: string): string {
+    const material = state.graph.schema?.index.get(paramId)?.meta.material;
+    return material ? `${MATERIAL_GRAPH_GROUP_PREFIX}${material}` : MATERIAL_GRAPH_GROUP;
+  }
+
+  function graphLabelOf(state: WorkspaceState, paramId: string): string {
+    return state.graph.schema?.index.get(paramId)?.node.label ?? paramId;
+  }
+
+  /**
+   * 草稿里属于某个共享节点组的参数 id。
+   *
+   * 用户点「取消」时用它把**这一组**的改动撤掉：他说了「先别改共享的东西」，
+   * 那就不能留着草稿等下一次预览偷偷带下去。
+   */
+  function sharedGroupDraftIds(request: SharedConfirmRequest | null): string[] {
+    const schema = store.getState().graph.schema;
+    const draft = store.getState().draft;
+    if (!schema || !request) {
+      return [];
+    }
+    const ids: string[] = [];
+    for (const material of schema.materials) {
+      for (const param of material.params) {
+        if (!(param.node.id in draft)) {
+          continue;
+        }
+        if (sharedGroupOf(param, material) === request.sharedGroup) {
+          ids.push(param.node.id);
+        }
+      }
+    }
+    return ids;
+  }
 
   function syncHistoryDepths(): void {
     store.setState({
@@ -502,7 +663,9 @@ export function createWorkspace(options: WorkspaceOptions) {
     const state = store.getState();
     store.setState({
       draft: next,
-      dirtyIds: computeDirtyIds(state.schema, next),
+      // 两族 id 共用一份草稿：脏项统计必须同时看 v4 索引与材质图索引，
+      // 否则材质图改了却不显示「N 项已改」，用户会以为没生效。
+      dirtyIds: computeDirtyIds(state.schema, next, graphNodes()),
       // 「画面过期」的前提是**有一张画面**。还没渲染过就没有「过期」可言 ——
       // 那种情况由「N 项已改（未预览）」表达，两件事不能混成一句提示。
       previewStale: state.lastSuccessfulPreview !== null && draftVersion !== previewedVersion,
@@ -544,6 +707,16 @@ export function createWorkspace(options: WorkspaceOptions) {
 
   function handleSuccess(job: JobState, result: JobResult): void {
     const applied = (result.applied_surface ?? {}) as Record<string, unknown>;
+    // 材质图那一段的写入结果。它与 Cel 是两批独立写入，因此单独取、单独报，
+    // 合并进 `effective` 只是因为两族 id 不相交（同一张「生效值」表）。
+    const appliedGraph = (result.applied_material_graph ?? {}) as Record<string, unknown>;
+    const graphRestoreVerified =
+      typeof result.material_graph_restore_verified === "boolean"
+        ? (result.material_graph_restore_verified as boolean)
+        : null;
+    const graphRestoreMismatches = Array.isArray(result.material_graph_restore_mismatches)
+      ? (result.material_graph_restore_mismatches as Array<Record<string, unknown>>)
+      : [];
     // 结果里没有就回落到任务级字段：服务端两处都会带，但前端不该因为只读了一处就丢提示。
     const external = result.external_changes ?? job.external_changes ?? [];
     const rawUrl = result.preview_url ?? `/api/preview/${job.job_id}`;
@@ -570,15 +743,32 @@ export function createWorkspace(options: WorkspaceOptions) {
     if (isBaselineJob) {
       baselineJobId = null;
     }
+    const current = store.getState();
     store.setState({
       lastSuccessfulPreview: preview,
       ...(isBaselineJob ? { baselinePreviewStatus: "ready" as const, baselinePreviewUrl: rawUrl } : {}),
       // 新草稿产生时旧任务结果**不写进 effective**，并标记画面对应的草稿已过期。
-      ...(stale ? {} : { effective: { ...store.getState().effective, ...applied } }),
+      ...(stale ? {} : { effective: { ...current.effective, ...applied, ...appliedGraph } }),
       previewStale: draftVersion !== previewedVersion,
       externalChanges: external,
       error: null,
       loading: false,
+      graph: {
+        ...current.graph,
+        // 只有过期的提交才不该写「生效值」——与 `effective` 同一条准则。
+        restoreVerified: stale ? current.graph.restoreVerified : graphRestoreVerified,
+        restoreMismatches: stale ? current.graph.restoreMismatches : graphRestoreMismatches,
+        baselineId:
+          typeof result.material_graph_baseline_id === "string"
+            ? (result.material_graph_baseline_id as string)
+            : current.graph.baselineId,
+        structureHash:
+          typeof result.material_structure_hash === "string"
+            ? (result.material_structure_hash as string)
+            : current.graph.structureHash,
+        // 写入已经成功：这一轮的影响范围确认到此为止。
+        pendingShared: null,
+      },
       notice: stale
         ? "本次画面基于提交时的草稿；你在渲染期间又改过草稿，已标记为过期。"
         : null,
@@ -586,7 +776,7 @@ export function createWorkspace(options: WorkspaceOptions) {
       // 那是写入留下的粘性标记，不是内容差异。不改承诺、不尝试清标记，只如实说明。
       projectNotice: result.project?.dirty_flagged
         ? PROJECT_DIRTY_NOTICE
-        : store.getState().projectNotice,
+        : current.projectNotice,
     });
   }
 
@@ -700,6 +890,51 @@ export function createWorkspace(options: WorkspaceOptions) {
       : "基线已建立，但首张预览未能生成；可点「刷新基线」重试。";
   }
 
+  /**
+   * 加载材质图 schema（PR #7）。
+   *
+   * 三种结果必须分开，混成一种界面就只能说谎：
+   *
+   * * **成功** → 存 schema、结构指纹与基线号；
+   * * **没有基线**（`NO_BASELINE`）→ 这**不是失败**：材质图基线由
+   *   `POST /api/session/baseline` 顺带采集，用户点一次「刷新基线」就有了。
+   *   界面据此提示「先刷新基线」，而不是弹一条红色错误；
+   * * 其余错误 → 如实报出来。这时候遮着只会让人以为材质图本来就没有参数。
+   */
+  async function refreshGraphSchema(): Promise<boolean> {
+    patchGraph({ loading: true, error: null });
+    try {
+      const raw = await endpoints.materialGraphSchema();
+      const schema = parseMaterialGraphSchema(raw);
+      patchGraph({
+        loading: false,
+        loaded: true,
+        schema,
+        error: null,
+        baselineReady: true,
+        baselineId: schema.baselineId,
+        structureHash: schema.structureHash,
+      });
+      return true;
+    } catch (error) {
+      const detail = toDetail(error);
+      if (detail.code === "NO_BASELINE") {
+        patchGraph({
+          loading: false,
+          loaded: false,
+          schema: null,
+          error: null,
+          baselineReady: false,
+          baselineId: null,
+          structureHash: null,
+        });
+        return false;
+      }
+      patchGraph({ loading: false, error: detail });
+      return false;
+    }
+  }
+
   async function refreshBaseline(choice?: Partial<FramingChoice>): Promise<boolean> {
     const framing: FramingChoice = { ...store.getState().framingChoice, ...(choice ?? {}) };
     // 上一次的基线预览若还挂着，这次刷新同样会取代它 —— 先如实改判，别让它停在 pending。
@@ -743,6 +978,9 @@ export function createWorkspace(options: WorkspaceOptions) {
     history.clear();
     syncHistoryDepths();
     const schema = await loadSchema();
+    // 刷新基线同样会**重新采集材质图**（服务端在建立基线时顺带做），
+    // 因此这里必须重新拉一次 schema —— 否则界面还挂在旧基线的参数与结构指纹上。
+    await refreshGraphSchema();
     const surface = created.surface ?? null;
     draftVersion = 0;
     previewedVersion = 0;
@@ -772,6 +1010,15 @@ export function createWorkspace(options: WorkspaceOptions) {
           ? "v4 拓扑探针未成功，Cel 参数暂不可用（L0 与保存流程不受影响）。"
           : null,
       activeGroupId: store.getState().activeGroupId ?? firstGroupId(schema),
+      // 新基线 = 新一次探测：共享节点组的影响范围可能已经变了，旧确认不再指向同一件事，
+      // 必须作废。宁可让用户再确认一次，也不能沿用一份可能已经过期的「我已了解」。
+      graph: {
+        ...store.getState().graph,
+        confirmedSharedGroups: [],
+        pendingShared: null,
+        restoreVerified: null,
+        restoreMismatches: [],
+      },
     });
 
     if (!jobId) {
@@ -790,6 +1037,9 @@ export function createWorkspace(options: WorkspaceOptions) {
     try {
       const baseline = await endpoints.surfaceBaseline();
       const schema = await loadSchema();
+      // 材质图 schema 与 v4 schema 是两次只读请求；这里同样重新拉一次，
+      // 让「保存成功后基线已刷新」这条路径上的材质图状态跟着一起更新。
+      await refreshGraphSchema();
       store.setState({
         baseline,
         baselineId: baseline.baseline_id ?? null,
@@ -875,6 +1125,36 @@ export function createWorkspace(options: WorkspaceOptions) {
       actions.applyStructureFatal(detail, patch);
       return;
     }
+    // 共享节点组：**这不是失败**，是「先确认影响范围」那一步（与 `SAVE_CONFIRM_REQUIRED`
+    // 同一条准则）。把它渲染成红色错误，用户会以为改坏了什么，而其实只需要点一下确认。
+    if (detail.code === "SHARED_PARAMETER_CONFIRM_REQUIRED") {
+      const request = confirmRequestFromDetails(detail.details);
+      if (!request) {
+        // details 形状对不上：**不编影响范围**。宁可如实说我们拿不到这份信息，
+        // 也不能让用户在不知道会影响谁的情况下点「确认」。
+        store.setState({
+          ...patch,
+          error: {
+            ...detail,
+            message:
+              "服务端要求确认共享节点组的影响范围，但没有给出组名与受影响材质；请刷新基线后重试。",
+          },
+          loading: false,
+        });
+        return;
+      }
+      store.setState({
+        ...patch,
+        error: null,
+        loading: false,
+        graph: { ...store.getState().graph, pendingShared: request, error: null },
+        notice:
+          request.affectedMaterials.length > 0
+            ? `该参数属于共享节点组「${request.sharedGroup}」，会同时影响：${request.affectedMaterials.join("、")}。确认后才会写入。`
+            : `该参数属于共享节点组「${request.sharedGroup}」，修改前必须确认影响范围。`,
+      });
+      return;
+    }
     // 隔离的材质在工程里找不到：**当场关掉隔离**，否则用户点几次「应用并预览」都会
     // 撞同一堵墙。关掉这件事必须说出来 —— 静默改掉用户的开关比报错更糟。
     if (detail.code === "ISOLATE_MATERIAL_MISSING") {
@@ -900,17 +1180,33 @@ export function createWorkspace(options: WorkspaceOptions) {
     store.setState({ presets: { ...store.getState().presets, ...patch } });
   }
 
-  /** 保存的当前载荷：草稿拆成 L0 / 参数面两半，带上客户端持有的结构指纹。 */
+  /** 保存的当前载荷：草稿拆成 L0 / 参数面 / 材质图三半，带上两个结构指纹。 */
   function savePayload(mode: SaveMode, targetPath: string | null): {
     mode: SaveMode;
     targetPath: string | null;
     l0: Record<string, unknown>;
     surface: Record<string, unknown>;
+    graph: Record<string, unknown>;
     structureHash: string | null;
+    graphStructureHash: string | null;
+    confirmedSharedGroups: string[];
   } {
     const state = store.getState();
-    const { l0, surface } = splitSaveDraft(state.schema, state.draft);
-    return { mode, targetPath, l0, surface, structureHash: state.structureHash };
+    const { l0, surface, graph } = splitSaveDraftFull(
+      state.schema,
+      state.graph.schema,
+      state.draft
+    );
+    return {
+      mode,
+      targetPath,
+      l0,
+      surface,
+      graph,
+      structureHash: state.structureHash,
+      graphStructureHash: state.graph.structureHash,
+      confirmedSharedGroups: [...state.graph.confirmedSharedGroups],
+    };
   }
 
   /**
@@ -939,6 +1235,15 @@ export function createWorkspace(options: WorkspaceOptions) {
       previewStale: false,
       historyBlocked: false,
       notice: "已保存到工程文件：基线已按新内容刷新，草稿已清空。",
+      // 草稿清空了，材质图那一段的确认与回执也必须跟着归零 ——
+      // 留着「已确认影响范围」而草稿里什么都没有，会让下一次编辑看起来像已经被批准过。
+      graph: {
+        ...store.getState().graph,
+        confirmedSharedGroups: [],
+        pendingShared: null,
+        restoreVerified: null,
+        restoreMismatches: [],
+      },
     });
   }
 
@@ -956,6 +1261,10 @@ export function createWorkspace(options: WorkspaceOptions) {
       draft: payload.l0,
       surface_draft: payload.surface,
       structure_hash: payload.structureHash,
+      // 材质图与 Cel 走同一条绑定路径：prepare 与 commit 之间任一份被改动即拒绝。
+      material_draft: payload.graph,
+      confirmed_shared_groups: payload.confirmedSharedGroups,
+      expected_material_structure_hash: payload.graphStructureHash,
     };
     patchSave({ phase: "committing", error: null, confirm: null, steps: ["已签发确认令牌"] });
     try {
@@ -1053,6 +1362,9 @@ export function createWorkspace(options: WorkspaceOptions) {
         confirmation_id: confirmationId,
         surface_draft: payload.surface,
         structure_hash: payload.structureHash,
+        material_draft: payload.graph,
+        confirmed_shared_groups: payload.confirmedSharedGroups,
+        expected_material_structure_hash: payload.graphStructureHash,
       });
       patchSave({ confirm: confirmFromPrepared(prepared) });
       return await runCommit(prepared);
@@ -1089,7 +1401,7 @@ export function createWorkspace(options: WorkspaceOptions) {
   /** 保存预设的请求体：L0 留空、参数面草稿整份带上，另附当前的取景设置。 */
   function presetPayload(name: string): PresetSaveBody {
     const state = store.getState();
-    const { surface } = splitSaveDraft(state.schema, state.draft);
+    const { surface } = splitSaveDraftFull(state.schema, state.graph.schema, state.draft);
     return {
       name,
       framing_mode: state.framingChoice.mode,
@@ -1267,10 +1579,15 @@ export function createWorkspace(options: WorkspaceOptions) {
     setValue(paramId: string, value: unknown, options2: { seal?: boolean } = {}): void {
       const state = store.getState();
       const node = state.schema ? flatten(state.schema.groups).get(paramId) : undefined;
+      // 材质图参数不在 v4 schema 里，但它们的改动走**同一条**命令栈：
+      // 用户按 Ctrl+Z 时不该去猜「这一步退的是 Cel 还是材质」。
+      const graphParam = state.graph.schema?.index.get(paramId);
       commitCommand({
         kind: "setValue",
-        label: `修改 ${node?.label ?? paramId}`,
-        groupId: ownerGroupId(paramId),
+        label: `修改 ${node?.label ?? graphParam?.node.label ?? paramId}`,
+        groupId: graphParam
+          ? `${MATERIAL_GRAPH_GROUP_PREFIX}${graphParam.meta.material}`
+          : ownerGroupId(paramId),
         next: setDraftValue(state.draft, paramId, value),
         mergeKey: DraftHistory.mergeKey("setValue", paramId),
       });
@@ -1292,14 +1609,12 @@ export function createWorkspace(options: WorkspaceOptions) {
       elements: Array<{ position: number; color: number[] }>,
       interpolation: string
     ): void {
-      const state = store.getState();
-      const rampId = `${groupId}.ramp`;
-      commitCommand({
+      writeRamp(`${groupId}.ramp`, groupId, {
         kind: "dragElement",
         label: `${groupId} 第 ${elementIndex + 1} 个色标`,
-        groupId,
-        next: setDraftValue(state.draft, rampId, rampDraftOf(elements, interpolation)),
-        mergeKey: DraftHistory.mergeKey("dragElement", rampId, elementIndex),
+        elements,
+        interpolation,
+        mergeKey: DraftHistory.mergeKey("dragElement", `${groupId}.ramp`, elementIndex),
       });
     },
 
@@ -1309,13 +1624,11 @@ export function createWorkspace(options: WorkspaceOptions) {
       elements: Array<{ position: number; color: number[] }>,
       interpolation: string
     ): void {
-      const state = store.getState();
-      const rampId = `${groupId}.ramp`;
-      commitCommand({
+      writeRamp(`${groupId}.ramp`, groupId, {
         kind: "setElementColor",
         label: `${groupId} 第 ${elementIndex + 1} 个色标颜色`,
-        groupId,
-        next: setDraftValue(state.draft, rampId, rampDraftOf(elements, interpolation)),
+        elements,
+        interpolation,
         mergeKey: null,
       });
     },
@@ -1325,13 +1638,50 @@ export function createWorkspace(options: WorkspaceOptions) {
       value: string,
       elements: Array<{ position: number; color: number[] }>
     ): void {
-      const state = store.getState();
-      const rampId = `${groupId}.ramp`;
-      commitCommand({
+      writeRamp(`${groupId}.ramp`, groupId, {
         kind: "setValue",
         label: `${groupId} 插值方式`,
-        groupId,
-        next: setDraftValue(state.draft, rampId, rampDraftOf(elements, value)),
+        elements,
+        interpolation: value,
+        mergeKey: null,
+      });
+    },
+
+    // -- 材质图色带（同一个色带交互，写的是 opaque 参数 id）----------------
+
+    /**
+     * 材质图色带的写入入口。
+     *
+     * 与 Cel 的差别只有 id：Cel 的色带 id 是 `${groupId}.ramp` 这个**约定**，
+     * 材质图的色带是服务端生成的 opaque `mg-<hash>` —— 没有后缀可拼，
+     * 只能由调用方把 id 交进来。交互语义（拖动合并、松开封存）完全一致。
+     */
+    dragGraphRamp(
+      paramId: string,
+      elementIndex: number,
+      elements: Array<{ position: number; color: number[] }>,
+      interpolation: string
+    ): void {
+      writeRamp(paramId, graphGroupIdOf(store.getState(), paramId), {
+        kind: "dragElement",
+        label: `${graphLabelOf(store.getState(), paramId)} 第 ${elementIndex + 1} 个色标`,
+        elements,
+        interpolation,
+        mergeKey: DraftHistory.mergeKey("dragElement", paramId, elementIndex),
+      });
+    },
+
+    setGraphRampColor(
+      paramId: string,
+      elementIndex: number,
+      elements: Array<{ position: number; color: number[] }>,
+      interpolation: string
+    ): void {
+      writeRamp(paramId, graphGroupIdOf(store.getState(), paramId), {
+        kind: "setElementColor",
+        label: `${graphLabelOf(store.getState(), paramId)} 第 ${elementIndex + 1} 个色标颜色`,
+        elements,
+        interpolation,
         mergeKey: null,
       });
     },
@@ -1342,7 +1692,7 @@ export function createWorkspace(options: WorkspaceOptions) {
         kind: "resetGroup",
         label: `复位 ${groupId}`,
         groupId,
-        next: resetGroup(state.draft, state.schema, groupId),
+        next: resetGroup(state.draft, state.schema, groupId, graphNodes()),
         mergeKey: null,
       });
     },
@@ -1351,11 +1701,123 @@ export function createWorkspace(options: WorkspaceOptions) {
       const state = store.getState();
       commitCommand({
         kind: "resetAll",
-        label: "复位全部 Cel 草稿",
+        label: "复位全部草稿",
         groupId: "",
         groupIds: topGroups(state.schema).map((group) => group.id),
-        next: resetAll(state.draft, state.schema),
+        next: resetAll(state.draft, state.schema, graphNodes()),
         mergeKey: null,
+      });
+    },
+
+    // -- 材质图（PR #7）------------------------
+
+    refreshGraphSchema,
+
+    /**
+     * 记录某个材质的界面视图状态（展开的分区 / 搜索词 / 筛选）。
+     *
+     * 按材质分开存：材质图参数可能上百项，一次切换就把折叠结构摊平、
+     * 把筛选清掉，等于让用户重做一遍。
+     */
+    setGraphView(materialName: string, patch: Partial<GraphViewState>): void {
+      const graph = store.getState().graph;
+      const current = graph.view[materialName] ?? emptyGraphView();
+      store.setState({
+        graph: { ...graph, view: { ...graph.view, [materialName]: { ...current, ...patch } } },
+      });
+    },
+
+    /** 单项复位：只删掉这一个参数的草稿项，**不作废**同材质的其它修改。 */
+    resetGraphParam(paramId: string): void {
+      const state = store.getState();
+      const param = state.graph.schema?.index.get(paramId);
+      commitCommand({
+        kind: "resetGraph",
+        label: `复位 ${param?.node.label ?? paramId}`,
+        groupId: param ? `${MATERIAL_GRAPH_GROUP_PREFIX}${param.meta.material}` : "",
+        next: resetIds(state.draft, [paramId]),
+        mergeKey: null,
+      });
+    },
+
+    /** 材质分组复位：删掉该材质下**全部**材质图参数的草稿项。 */
+    resetGraphMaterial(materialName: string): void {
+      const state = store.getState();
+      const material = state.graph.schema?.byName.get(materialName);
+      if (!material) {
+        return;
+      }
+      commitCommand({
+        kind: "resetGraphMaterial",
+        label: `复位材质图 ${materialName}`,
+        groupId: `${MATERIAL_GRAPH_GROUP_PREFIX}${materialName}`,
+        next: resetIds(
+          state.draft,
+          material.params.map((param) => param.node.id)
+        ),
+        mergeKey: null,
+      });
+    },
+
+    /** 复位**全部**材质图草稿（不碰 v4 参数面）。 */
+    resetAllGraphDraft(): void {
+      const state = store.getState();
+      const schema = state.graph.schema;
+      if (!schema) {
+        return;
+      }
+      commitCommand({
+        kind: "resetGraphMaterial",
+        label: "复位全部材质图草稿",
+        groupId: MATERIAL_GRAPH_GROUP,
+        groupIds: schema.materials.map((item) => `${MATERIAL_GRAPH_GROUP_PREFIX}${item.name}`),
+        next: resetIds(state.draft, schema.index.keys()),
+        mergeKey: null,
+      });
+    },
+
+    /**
+     * 确认共享节点组的影响范围。
+     *
+     * 这一步是**知情的**：面板上必须先列出组名、该组下的全部参数、以及会一起改到的
+     * 材质，用户看清了再点。确认只对**当前这次基线**有效 —— 刷新基线会清空它，
+     * 因为影响范围可能已经变了。
+     */
+    confirmSharedGroup(group: string, options2: { preview?: boolean } = {}): void {
+      const graph = store.getState().graph;
+      if (!group || graph.confirmedSharedGroups.includes(group)) {
+        patchGraph({ pendingShared: null });
+        return;
+      }
+      patchGraph({
+        confirmedSharedGroups: [...graph.confirmedSharedGroups, group],
+        pendingShared: null,
+      });
+      store.setState({ notice: `已确认共享节点组「${group}」的影响范围。` });
+      if (options2.preview ?? true) {
+        void actions.applyAndPreview();
+      }
+    },
+
+    cancelSharedConfirm(): void {
+      const request = store.getState().graph.pendingShared;
+      patchGraph({ pendingShared: null });
+      const ids = sharedGroupDraftIds(request);
+      if (ids.length > 0) {
+        // 走命令栈：撤销得回来。用户可能只是误点了「取消」。
+        commitCommand({
+          kind: "resetGraph",
+          label: `取消共享节点组 ${request?.sharedGroup ?? ""} 的改动`,
+          groupId: request ? `${MATERIAL_GRAPH_GROUP_PREFIX}${request.sharedGroup}` : "",
+          next: resetIds(store.getState().draft, ids),
+          mergeKey: null,
+        });
+      }
+      store.setState({
+        notice:
+          ids.length > 0
+            ? `已取消：共享节点组「${request?.sharedGroup ?? ""}」的改动未被确认，相关草稿已撤销。`
+            : "已取消：共享节点组的改动未被确认。",
       });
     },
 
@@ -1437,7 +1899,28 @@ export function createWorkspace(options: WorkspaceOptions) {
         return false;
       }
       const framing: FramingChoice = { ...state.framingChoice, ...(choice ?? {}) };
-      const draft = sanitizeDraft(state.schema, state.draft);
+      const draft = sanitizeDraft(state.schema, state.draft, graphNodes());
+      // 提交前的共享节点组自检：服务端**一定**会拒（`SHARED_PARAMETER_CONFIRM_REQUIRED`），
+      // 与其白跑一次请求、让确认框在「加载中」之后才弹出来，不如在这里就摊开影响范围。
+      // 判据与服务端逐字一致（`GraphParam.shared` ⟺ `validate_graph_draft` 的那一条）。
+      const unconfirmed = unconfirmedSharedGroupsInSchema(
+        state.graph.schema,
+        draft,
+        state.graph.confirmedSharedGroups
+      );
+      if (unconfirmed.length > 0) {
+        const first = unconfirmed[0];
+        store.setState({
+          error: null,
+          notice:
+            first.affectedMaterials.length > 0
+              ? `有 ${unconfirmed.length} 个共享节点组尚未确认影响范围。先确认「${first.sharedGroup}」：会同时影响 ${first.affectedMaterials.join("、")}。`
+              : `有 ${unconfirmed.length} 个共享节点组尚未确认影响范围。`,
+          graph: { ...store.getState().graph, pendingShared: first },
+        });
+        return false;
+      }
+      const { surface: surfaceDraft, graph: graphDraft } = splitGraphDraft(state.graph.schema, draft);
       previewedVersionForSubmit = draftVersion;
       // 手动提交即「立刻渲染」：把排期撤掉，免得刚渲染完又立刻被自动预览再渲染一次。
       cancelAutoPreview();
@@ -1445,9 +1928,18 @@ export function createWorkspace(options: WorkspaceOptions) {
       // 新任务会取代在途的基线预览 —— 那次基线图不可能再被我们跟踪到，如实改判。
       abandonPendingBaselinePreview();
       const payload: JobSubmitPayload = {
-        draft,
+        draft: surfaceDraft,
         framing: framingPayload(framing),
         ...(state.structureHash ? { expected_structure_hash: state.structureHash } : {}),
+        ...(Object.keys(graphDraft).length > 0
+          ? {
+              material_draft: graphDraft,
+              confirmed_shared_groups: [...state.graph.confirmedSharedGroups],
+              ...(state.graph.structureHash
+                ? { expected_material_structure_hash: state.graph.structureHash }
+                : {}),
+            }
+          : {}),
       };
       const ok = await runner.start(payload);
       if (!ok) {
@@ -1493,6 +1985,15 @@ export function createWorkspace(options: WorkspaceOptions) {
           error: null,
           steps: [],
           status: null,
+        },
+        // 材质图那一段同样作废：结构变了，之前确认过的共享组影响范围不再指向同一件事，
+        // 回执也说不出「上次写入生效值是多少」了。
+        graph: {
+          ...store.getState().graph,
+          confirmedSharedGroups: [],
+          pendingShared: null,
+          restoreVerified: null,
+          restoreMismatches: [],
         },
       });
     },

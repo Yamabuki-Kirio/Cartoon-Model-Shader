@@ -602,3 +602,315 @@ export function commitResponsePayload(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+// -- 材质图（PR #7）-----------------------------
+
+/**
+ * 单个材质图参数夹具。
+ *
+ * 形状与后端 `material_graph.schema.to_spec` 对齐，**包括那些看起来多余的字段**
+ * （`evidence`、`used_outputs`、`influence_paths`…）：解析层少读一个字段，
+ * 测试应该跟着红，而不是因为夹具恰好没写而悄悄通过。
+ */
+export function graphParamFixture(
+  id: string,
+  overrides: Record<string, unknown> = {}
+) {
+  return {
+    id,
+    label: id,
+    kind: "float",
+    confidence: "confirmed",
+    semantic: "value",
+    semantic_label: "数值",
+    evidence: ["节点类型 VALUE 语义确定"],
+    influence_paths: [["Value", "Principled BSDF", "Material Output"]],
+    affected_materials: ["model_mesh"],
+    shared: false,
+    editable: true,
+    supported: true,
+    category: "numeric",
+    readonly_reason: null,
+    source_node: "Value",
+    source_label: "Value",
+    in_group: null,
+    used_outputs: ["Value"],
+    value: { current: 1, baseline: 1, effective: 1 },
+    minimum: null,
+    maximum: null,
+    step: null,
+    binding: { object_type: "MATERIAL_GRAPH_SOCKET", field: "default_value" },
+    ...overrides,
+  };
+}
+
+/** 着色器常量（`SEM_SHADER` → 分区 `common`）。 */
+export function graphShaderColorFixture(id: string, value: number[]) {
+  return graphParamFixture(id, {
+    label: "Principled BSDF · Base Color",
+    kind: "color",
+    semantic: "shader",
+    semantic_label: "着色器",
+    category: "common",
+    source_node: "Principled BSDF",
+    source_label: "Principled BSDF",
+    used_outputs: ["BSDF"],
+    value: { current: value, baseline: value, effective: value },
+    binding: { object_type: "MATERIAL_GRAPH_SOCKET", field: "default_value" },
+  });
+}
+
+/** ColorRamp：单一复合节点，色标取值可编辑、数量只读。 */
+export function graphRampFixture(
+  id: string,
+  options: { elements?: Array<[number, number[]]>; interpolation?: string } = {}
+) {
+  const pairs = options.elements ?? [
+    [0.0, [0.1, 0.1, 0.12, 1.0]],
+    [0.5, [0.55, 0.5, 0.48, 1.0]],
+    [1.0, [0.95, 0.94, 0.92, 1.0]],
+  ];
+  const interpolation = options.interpolation ?? "LINEAR";
+  return graphParamFixture(id, {
+    label: "ColorRamp 色带",
+    kind: "ramp",
+    semantic: "ramp",
+    semantic_label: "色带",
+    evidence: ["节点挂载 color_ramp 结构"],
+    category: "ramp",
+    source_node: "ColorRamp",
+    source_label: "ColorRamp",
+    used_outputs: ["Color"],
+    value: { current: null, baseline: null, effective: null },
+    elements: pairs.map(([position, color], index) => ({
+      index,
+      position: { value: position, baseline: position, minimum: 0, maximum: 1, step: 0.001 },
+      color: { value: color, baseline: color },
+    })),
+    interpolation,
+    element_count: pairs.length,
+    binding: { object_type: "MATERIAL_GRAPH_RAMP", field: "elements" },
+  });
+}
+
+/** 推测参数（`inferred` → 独立分区，且服务端一律标成不可写）。 */
+export function graphInferredFixture(id: string) {
+  return graphParamFixture(id, {
+    label: "Mix · Fac",
+    confidence: "inferred",
+    semantic: "mix",
+    semantic_label: "颜色混合",
+    evidence: ["节点类型 MIX 的语义随模式/规则变化，需真机确认"],
+    category: "inferred",
+    editable: false,
+    readonly_reason: "inferred_not_confirmed",
+    source_node: "Mix",
+    source_label: "Mix",
+    used_outputs: ["Result"],
+    influence_paths: [["Mix", "Principled BSDF", "Material Output"]],
+  });
+}
+
+/** 实验性语义（着色器混合）。 */
+export function graphExperimentalFixture(id: string) {
+  return graphParamFixture(id, {
+    label: "Mix Shader 节点组",
+    confidence: "experimental",
+    semantic: "mix_shader",
+    semantic_label: "着色器混合",
+    evidence: ["着色器混合，改动需微扰验证"],
+    category: "advanced",
+    editable: false,
+    readonly_reason: "experimental_semantics",
+    source_node: "Mix Shader",
+    source_label: "Mix Shader",
+  });
+}
+
+/** 不支持的节点（探到了类型但无法安全执行 / 回滚）。 */
+export function graphUnsupportedFixture(id: string) {
+  return graphParamFixture(id, {
+    label: "MysteryNode（无可编辑参数）",
+    confidence: "unsupported",
+    semantic: "other",
+    semantic_label: "其它",
+    evidence: ["未识别的节点类型 MYSTERY"],
+    category: "advanced",
+    editable: false,
+    supported: false,
+    readonly_reason: "unconfirmed_capability",
+    source_node: "MysteryNode",
+    source_label: "MysteryNode",
+    binding: undefined,
+  });
+}
+
+/**
+ * **共享**节点组内的可写参数。
+ *
+ * 这是唯一能触发服务端 `SHARED_PARAMETER_CONFIRM_REQUIRED` 的形态：
+ * 参数本身可写（组内 `confirmed` 节点），但它所在的组被多个材质引用。
+ */
+export function graphSharedFixture(id: string, options: { group?: string; users?: string[] } = {}) {
+  const group = options.group ?? "Cel_Shared";
+  const users = options.users ?? ["皮肤_脸", "头发_前"];
+  return graphParamFixture(id, {
+    label: "SharedValue · Value",
+    confidence: "confirmed",
+    semantic: "value",
+    semantic_label: "数值",
+    category: "numeric",
+    shared: true,
+    in_group: group,
+    source_node: "SharedValue",
+    source_label: "SharedValue",
+    affected_materials: users,
+    value: { current: 0.5, baseline: 0.5, effective: 0.5 },
+  });
+}
+
+export interface GraphMaterialFixtureOptions {
+  material?: string;
+  materialId?: string;
+  available?: boolean;
+  structureHash?: string;
+  degradedReason?: string | null;
+  error?: string | null;
+  parameters?: unknown[];
+  sharedGroups?: Record<string, string[]>;
+}
+
+/** 单个材质的材质图 schema 夹具。 */
+export function graphMaterialFixture(options: GraphMaterialFixtureOptions = {}) {
+  const material = options.material ?? "皮肤_脸";
+  const available = options.available ?? true;
+  const parameters = options.parameters ?? defaultGraphParameters();
+  const categories: Record<string, string[]> = {};
+  for (const raw of parameters) {
+    const param = raw as { id?: string; category?: string };
+    const category = param.category ?? "advanced";
+    categories[category] = [...(categories[category] ?? []), param.id ?? ""];
+  }
+  return {
+    schema_version: "toon-material-graph/1",
+    material_id: options.materialId ?? `mat-${material}`,
+    material,
+    available,
+    ...(available
+      ? {
+          structure_hash: options.structureHash ?? "a".repeat(64),
+          degraded_reason: options.degradedReason ?? null,
+          trace: {
+            entry: "Material Output",
+            entry_output: "Surface",
+            max_depth: 8,
+            cycle: [],
+            nodes: [
+              {
+                name: "Principled BSDF",
+                type: "BSDF_PRINCIPLED",
+                label: "Principled BSDF",
+                depth: 1,
+                level: "confirmed",
+                confidence: "confirmed",
+                semantic: "shader",
+                influence_paths: [["Principled BSDF", "Material Output"]],
+              },
+            ],
+          },
+        }
+      : { error: options.error ?? "该材质没有可用的节点图（未启用节点，或探测未返回结构）。" }),
+    shared_groups: options.sharedGroups ?? {},
+    groups: [],
+    parameters: available ? parameters : [],
+    categories: available ? categories : {},
+    highest_cost: "L1",
+  };
+}
+
+/** 覆盖全部七个分区的默认参数集合。 */
+export function defaultGraphParameters(): unknown[] {
+  return [
+    graphShaderColorFixture("mg-common01", [0.86, 0.72, 0.66, 1]),
+    graphParamFixture("mg-common02", {
+      label: "Principled BSDF · Roughness",
+      semantic: "shader",
+      semantic_label: "着色器",
+      category: "common",
+      source_node: "Principled BSDF",
+      source_label: "Principled BSDF",
+      value: { current: 0.5, baseline: 0.5, effective: 0.5 },
+      minimum: 0,
+      maximum: 1,
+      step: 0.01,
+    }),
+    graphParamFixture("mg-color01", {
+      label: "RGB · Color",
+      kind: "color",
+      semantic: "color",
+      semantic_label: "颜色",
+      category: "color",
+      source_node: "RGB",
+      source_label: "RGB",
+      value: { current: [0.2, 0.4, 0.9, 1], baseline: [0.2, 0.4, 0.9, 1], effective: [0.2, 0.4, 0.9, 1] },
+    }),
+    graphRampFixture("mg-ramp01"),
+    graphParamFixture("mg-numeric01", {
+      label: "Math · Value",
+      semantic: "math",
+      semantic_label: "数值运算",
+      category: "numeric",
+      source_node: "Math",
+      source_label: "Math",
+      value: { current: 2, baseline: 2, effective: 2 },
+      minimum: -10,
+      maximum: 10,
+      step: 0.1,
+      binding: { object_type: "MATERIAL_GRAPH_SOCKET", field: "default_value" },
+    }),
+    graphParamFixture("mg-group01", {
+      label: "Cel_Shared 节点组",
+      kind: "enum",
+      confidence: "experimental",
+      semantic: "group",
+      semantic_label: "节点组",
+      category: "node_group",
+      editable: false,
+      readonly_reason: "shared_group_requires_confirmation",
+      source_node: "Cel_Shared",
+      source_label: "Cel_Shared",
+      value: { current: "Cel_Shared", baseline: "Cel_Shared", effective: "Cel_Shared" },
+      binding: undefined,
+    }),
+    graphParamFixture("mg-texture01", {
+      label: "Image Texture（无可编辑参数）",
+      confidence: "confirmed",
+      semantic: "texture",
+      semantic_label: "纹理控制",
+      category: "texture",
+      editable: false,
+      supported: false,
+      readonly_reason: "no_editable_socket",
+      source_node: "Image Texture",
+      source_label: "Image Texture",
+      binding: undefined,
+    }),
+    graphInferredFixture("mg-inferred01"),
+    graphExperimentalFixture("mg-advanced01"),
+    graphUnsupportedFixture("mg-advanced02"),
+  ];
+}
+
+/** 整份材质图 schema（`GET /api/material-graph/schema`）。 */
+export function graphSchemaPayload(
+  options: { materials?: unknown[]; structureHash?: string; baselineId?: string } = {}
+) {
+  return {
+    ok: true as const,
+    available: true,
+    schema_version: "toon-material-graph/1",
+    material_graph_baseline_id: options.baselineId ?? "mg0000000001",
+    structure_hash: options.structureHash ?? "b".repeat(64),
+    materials: options.materials ?? [graphMaterialFixture()],
+  };
+}

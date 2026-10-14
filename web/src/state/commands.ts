@@ -22,7 +22,11 @@ export type CommandKind =
   | "resetAll"
   | "copyToGroup"
   /** 套用一份预设到草稿。一次性改很多项，因此是不可合并的原子命令。 */
-  | "applyPreset";
+  | "applyPreset"
+  /** 材质图单项复位（PR #7）。 */
+  | "resetGraph"
+  /** 材质图按材质 / 整体复位（PR #7）。 */
+  | "resetGraphMaterial";
 
 export interface DraftCommand {
   kind: CommandKind;

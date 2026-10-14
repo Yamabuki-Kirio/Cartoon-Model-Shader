@@ -26,6 +26,16 @@ export interface JobSubmitPayload {
   draft: Record<string, unknown>;
   framing?: FramingSubmitOptions;
   expected_structure_hash?: string;
+  /**
+   * 材质图草稿（PR #7）：**opaque 参数 id -> 取值**。
+   *
+   * 与 `draft` 分开是服务端契约：`draft` 逐 id 走参数面校验，材质图 id 混进去
+   * 只会得到 `PARAM_INVALID`。两者在同一个任务里应用、回读、渲染、回滚。
+   */
+  material_draft?: Record<string, unknown>;
+  /** 用户已确认影响范围的共享节点组；未列出的共享组参数会被服务端拒绝。 */
+  confirmed_shared_groups?: string[];
+  expected_material_structure_hash?: string;
 }
 
 interface EndpointsLike {
@@ -339,6 +349,9 @@ function toJobError(error: unknown): JobError {
       message: error.message,
       retryable: error.retryable,
       hint: error.hint,
+      // `details` 必须原样带过去：共享节点组确认（`SHARED_PARAMETER_CONFIRM_REQUIRED`）
+      // 要列出的受影响材质就在里面。丢掉它，界面就只能说「被拒绝了」而说不出会影响谁。
+      details: error.details,
     };
   }
   return {

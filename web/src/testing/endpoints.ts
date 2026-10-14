@@ -6,6 +6,7 @@ import {
   baselinePayload,
   commitPreparedPayload,
   commitResponsePayload,
+  graphSchemaPayload,
   jobPayload,
   presetDetail,
   presetListPayload,
@@ -30,6 +31,7 @@ export type TestEndpoints = WorkspaceEndpoints & {
   deletePreset: ReturnType<typeof vi.fn>;
   commitPrepare: ReturnType<typeof vi.fn>;
   commitApply: ReturnType<typeof vi.fn>;
+  materialGraphSchema: ReturnType<typeof vi.fn>;
 };
 
 export function makeTestEndpoints(overrides: Partial<WorkspaceEndpoints> = {}): TestEndpoints {
@@ -75,6 +77,11 @@ export function makeTestEndpoints(overrides: Partial<WorkspaceEndpoints> = {}): 
       },
     })),
     parseSchema,
+    // -- 材质图 ------------------------
+    // 默认给一份「有基线、有一份材质图 schema」的响应：生产里这两个条件是
+    // `POST /api/session/baseline` 建立的，夹具若默认报 NO_BASELINE，
+    // 每个既有用例都会多出一条与它无关的失败路径。
+    materialGraphSchema: vi.fn(async () => graphSchemaPayload()),
     // -- 预设 ------------------------
     // 夹具**不**缓存：真实服务端每次都读目录，缓存一份会让
     // 「删了之后还在」这类缺陷在测试里永远看不到。

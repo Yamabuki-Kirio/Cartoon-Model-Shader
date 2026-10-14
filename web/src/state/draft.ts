@@ -10,6 +10,19 @@ import { flatten, walk } from "../schema/parse";
 
 export type SurfaceValues = Record<string, unknown>;
 
+/**
+ * 额外的参数索引（材质图参数面，PR #7）。
+ *
+ * 草稿里可以同时存在**两族** id：v4 参数面（`cel.*` / `material.*`）与材质图
+ * （opaque `mg-<hash>`）。它们共用同一份草稿与同一个撤销栈 —— 用户眼里就是
+ * 「我改的东西」，分成两个撤销栈只会让 Ctrl+Z 猜不到会退哪一步。
+ *
+ * 该索引只用于**查询**，不会被复制：材质图 schema 可能上千项，每次改草稿都
+ * 复制一遍是没有理由的开销。两族 id 不可能冲突（`mg-` vs `cel.` / `material.`），
+ * 因此「先查 v4、再查额外」的合并语义是安全的。不传时行为与只有 v4 时完全一致。
+ */
+export type ExtraParamIndex = ReadonlyMap<string, SurfaceNode>;
+
 export function emptyDraft(): SurfaceDraft {
   return {};
 }
@@ -129,14 +142,15 @@ export function allIdsOf(node: SurfaceNode): string[] {
 }
 
 /** 已修改的 id 集合：草稿值与基线值不一致的项。 */
-export function computeDirtyIds(schema: SurfaceSchema | null, draft: SurfaceDraft): Set<string> {
+export function computeDirtyIds(
+  schema: SurfaceSchema | null,
+  draft: SurfaceDraft,
+  extra?: ExtraParamIndex
+): Set<string> {
   const dirty = new Set<string>();
-  if (!schema) {
-    return dirty;
-  }
-  const index = flatten(schema.groups);
+  const index = flatten(schema?.groups ?? []);
   for (const [paramId, value] of Object.entries(draft)) {
-    const node = index.get(paramId);
+    const node = index.get(paramId) ?? extra?.get(paramId);
     if (!node) {
       // 草稿里出现了当前 schema 没有的 id（例如刷新基线后残留）：算作脏，
       // 但提交前会被过滤掉。这里不静默忽略，否则「已修改数量」会与界面不符。
@@ -153,15 +167,16 @@ export function computeDirtyIds(schema: SurfaceSchema | null, draft: SurfaceDraf
 /** 仅保留当前 schema 里可写的 id —— 提交前的最后一道过滤。 */
 export function sanitizeDraft(
   schema: SurfaceSchema | null,
-  draft: SurfaceDraft
+  draft: SurfaceDraft,
+  extra?: ExtraParamIndex
 ): SurfaceDraft {
-  if (!schema) {
+  if (!schema && !extra) {
     return {};
   }
-  const index = flatten(schema.groups);
+  const index = flatten(schema?.groups ?? []);
   const out: SurfaceDraft = {};
   for (const [paramId, value] of Object.entries(draft)) {
-    const node = index.get(paramId);
+    const node = index.get(paramId) ?? extra?.get(paramId);
     if (!node || node.kind === "group" || node.kind === "unknown") {
       continue;
     }
@@ -173,36 +188,53 @@ export function sanitizeDraft(
   return out;
 }
 
-/** 复位某个分组：删掉子树里所有 id 的草稿项。 */
-export function resetGroup(draft: SurfaceDraft, schema: SurfaceSchema | null, groupId: string): SurfaceDraft {
-  if (!schema) {
-    return draft;
-  }
-  const node = flatten(schema.groups).get(groupId);
-  if (!node) {
-    return draft;
-  }
-  const ids = new Set(allIdsOf(node));
+/**
+ * 只保留 `ids` **之外**的草稿项。
+ *
+ * 材质图按「参数 / 材质」两种粒度复位都走这里：材质分组的 id 不在任何索引里
+ * （参数 id 才是索引键），所以不能靠 `resetGroup` 的按名查找。
+ */
+export function resetIds(draft: SurfaceDraft, ids: Iterable<string>): SurfaceDraft {
+  const keep = ids instanceof Set ? ids : new Set(ids);
   const next: SurfaceDraft = {};
   for (const [paramId, value] of Object.entries(draft)) {
-    if (!ids.has(paramId)) {
+    if (!keep.has(paramId)) {
       next[paramId] = value;
     }
   }
   return next;
 }
 
-/** 复位全部 Cel 草稿：只清掉当前 schema 覆盖的 id，不碰别的东西。 */
-export function resetAll(draft: SurfaceDraft, schema: SurfaceSchema | null): SurfaceDraft {
-  if (!schema) {
+/** 复位某个分组：删掉子树里所有 id 的草稿项。 */
+export function resetGroup(
+  draft: SurfaceDraft,
+  schema: SurfaceSchema | null,
+  groupId: string,
+  extra?: ExtraParamIndex
+): SurfaceDraft {
+  const node = flatten(schema?.groups ?? []).get(groupId) ?? extra?.get(groupId);
+  if (!node) {
+    return draft;
+  }
+  return resetIds(draft, allIdsOf(node));
+}
+
+/** 复位全部草稿：只清掉当前两族索引覆盖的 id，不碰别的东西。 */
+export function resetAll(
+  draft: SurfaceDraft,
+  schema: SurfaceSchema | null,
+  extra?: ExtraParamIndex
+): SurfaceDraft {
+  if (!schema && !extra) {
     return {};
   }
-  const ids = new Set(flatten(schema.groups).keys());
+  const index = flatten(schema?.groups ?? []);
   const next: SurfaceDraft = {};
   for (const [paramId, value] of Object.entries(draft)) {
-    if (!ids.has(paramId)) {
-      next[paramId] = value;
+    if (index.has(paramId) || extra?.has(paramId)) {
+      continue;
     }
+    next[paramId] = value;
   }
   return next;
 }

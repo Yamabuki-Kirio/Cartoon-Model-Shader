@@ -96,7 +96,6 @@ export function NavPanel({ workspace }: NavPanelProps) {
       <VirtualList
         items={filtered}
         itemHeight={filter === "material" ? 62 : 44}
-        height={560}
         class="nav-list"
         empty={<p class="muted pad">没有匹配的分组。</p>}
         renderItem={(entry) => (
