@@ -118,6 +118,8 @@ RENDER = {
     "started_at": None,
     "ended_at": None,
     "self_test": False,
+    #: 真实 Blender PID（由 _dispatch 记录，经 render_status 暴露给入口脚本转发）。
+    "blender_pid": None,
     "lock": threading.Lock(),
     "thread": None,
     "auto_event": threading.Event(),
@@ -284,6 +286,9 @@ def render_status():
         "out_root": display_path(out_root, root=out_root),
         "error": RENDER["error"],
         "blender_channel": blender_channel_ready(),
+        #: 服务端唯一持有的真实 Blender PID（由 _dispatch 记录）。入口脚本据此
+        #: 把 PID 转发到自己的 stdout，供 HTTP 编排层登记 / 终止。
+        "blender_pid": RENDER.get("blender_pid"),
         "started_at": RENDER["started_at"],
         "ended_at": RENDER["ended_at"],
         "targets": [{"label": t.get("label"),
@@ -322,6 +327,10 @@ def _dispatch(argv, log_path):
     起一个后台 Blender。返回 (ok, info)。
     优先走常驻 Blender MCP 进程；不可用时回退为本机直接启动。
     两条通道都失败时给出可操作诊断，而不是抛裸异常。
+
+    成功时把真实 Blender PID 记入 ``RENDER["blender_pid"]``，并通过 ``render_status``
+    暴露出去 —— 入口脚本据此把 PID 转发到自己的 stdout（真实 Blender 并非入口的
+    子进程，必须显式取 PID 才能被终止）。
     """
     resident_err = None
     try:
@@ -330,7 +339,9 @@ def _dispatch(argv, log_path):
                 " stderr=subprocess.STDOUT)\n"
                 "print('@@LAUNCH@@' + json.dumps({'pid': p.pid}))\n" % (argv, log_path))
         r = _send({"type": "execute_code", "params": {"code": code}}, timeout=60)
-        if "@@LAUNCH@@" in json.dumps(r):
+        text = json.dumps(r)
+        if "@@LAUNCH@@" in text:
+            RENDER["blender_pid"] = _extract_pid(text)
             return True, "resident"
         resident_err = str(r)[:200]
     except Exception as e:
@@ -339,6 +350,7 @@ def _dispatch(argv, log_path):
     try:
         logf = open(log_path, "w", encoding="utf-8", errors="replace")
         p = subprocess.Popen(argv, stdout=logf, stderr=subprocess.STDOUT)
+        RENDER["blender_pid"] = p.pid
         return True, "direct:pid=%d" % p.pid
     except Exception as e:
         return False, ("无法启动 Blender。"
@@ -346,6 +358,23 @@ def _dispatch(argv, log_path):
                        "直接启动亦被拒（%s）。\n"
                        "      处理：先在 Blender 里启用 MCP 监听（默认端口 9876），再重试渲染。"
                        % (resident_err, e))
+
+
+def _extract_pid(text):
+    """从含 ``@@LAUNCH@@`` 的文本里解析出 pid；解析不到返回 None。
+
+    payload 可能被 ``json.dumps`` 转义（引号前带 ``\\``），因此用正则抓数字，
+    不依赖严格的 JSON 解析。
+    """
+    try:
+        import re
+
+        payload = text.split("@@LAUNCH@@", 1)[1]
+        # 引号可能被转义成 `\"`，允许可选反斜杠。
+        m = re.search(r'\\?"pid\\?"\s*:\s*(\d+)', payload)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
 
 
 _CHAN = {"ok": None, "ts": 0.0}
@@ -387,10 +416,14 @@ def _run_one(tgt, out_dir, job, timeout=1800):
 
     argv = [job.get("blender") or BLENDER, "--background", "--factory-startup",
             "--python", job.get("driver") or DRIVER, "--",
-            "--pmx", tgt["pmx"], "--out", out_dir,
+            "--out", out_dir,
             "--mode", job.get("mode", "faithful"),
-            "--material-policy", "strict",
-            "--resolve", job.get("source_blend") or SOURCE_BLEND,
+            # 材质准入口径来自 job 文件（入口脚本按 --material-policy 写入）；
+            # 不传默认 strict，与主脚本口径一致。
+            "--material-policy", job.get("material_policy") or "strict",
+            "--lighting", job.get("lighting") or "volume_fog",
+            "--fog-density", str(job.get("fog_density")
+                                 if job.get("fog_density") is not None else 0.018),
             "--script", job.get("script") or SCRIPT,
             "--auto-frame", str(int(job.get("auto_frame") or 0)),
             # ★ F6：把映射目录一路带到驱动与主脚本。以前这里只传 --material-map（且是在
@@ -398,6 +431,20 @@ def _run_one(tgt, out_dir, job, timeout=1800):
             #   现在两条路都给：显式文件优先，目录兜底（渲染时按指纹重查）。
             "--maps-dir", job.get("maps_dir") or STATE.get("maps_dir") or DEFAULT_MAPS_DIR,
             "--log", logp, "--done", done]
+    # 目标种类决定驱动的二选一开关：.blend 直开且以自身为源工程（--resolve 指向自己）；
+    # PMX 导入 + job/环境里的源工程。与 开始渲染.py 的 render() 口径一致。
+    blend = tgt.get("blend")
+    if blend:
+        argv += ["--blend", blend, "--resolve", blend]
+    else:
+        argv += ["--pmx", tgt["pmx"], "--resolve", job.get("source_blend") or SOURCE_BLEND]
+    # 辉光微调来自 job 文件（入口脚本写入；不传则用主脚本默认修复值）。
+    for key, flag in (("Threshold", "--glow-threshold"), ("Strength", "--glow-strength"),
+                      ("Size", "--glow-size"), ("Smoothness", "--glow-smoothness"),
+                      ("Quality", "--glow-quality")):
+        v = (job.get("glow") or {}).get(key)
+        if v is not None:
+            argv += [flag, str(v)]
     mf = tgt.get("map_file")
     if mf and os.path.isfile(mf):
         argv += ["--material-map", mf]
@@ -447,7 +494,7 @@ def _render_worker(attempt, targets, job):
     ts = time.strftime("%m%d_%H%M%S")
     try:
         for tgt in targets:
-            label = tgt.get("label") or os.path.basename(tgt["pmx"])
+            label = tgt.get("label") or os.path.basename(tgt.get("blend") or tgt.get("pmx") or "")
             out_dir = tgt.get("out") or os.path.join(
                 out_root, "%s_%s_a%d" % (os.path.splitext(label)[0], ts, attempt))
             lockp = os.path.join(LOCK_DIR, "%s.render.lock" % tgt["fingerprint"][:16])
@@ -572,16 +619,18 @@ def _validate_job(job):
     for t in (job.get("targets") or []):
         fp = (t.get("fingerprint") or "").strip()
         pmx = t.get("pmx")
+        blend = t.get("blend")
+        model = blend or pmx
         if fp not in STATE["models"]:
             continue                                   # ① 必须是本次登记过的会话
-        if not pmx or not os.path.isfile(pmx):
+        if not model or not os.path.isfile(model):
             continue
         try:
-            if sha256_of(pmx) != fp:
+            if sha256_of(model) != fp:
                 continue                               # ② 内容指纹必须对上
         except Exception:
             continue
-        if not ROOT or not _under(pmx, ROOT):
+        if not ROOT or not _under(model, ROOT):
             continue                                   # ③ 必须位于素材根目录下
         out = t.get("out")
         allowed_out_root = job.get("out_root") or os.path.join(RUNTIME_DIR, "output")
@@ -593,8 +642,8 @@ def _validate_job(job):
             cand = map_path_for(None, fp, maps_dir)
             if os.path.isfile(cand) and _under(cand, maps_dir):
                 mf = cand
-        tgs.append({"fingerprint": fp, "pmx": pmx,
-                    "label": t.get("label") or os.path.basename(pmx),
+        tgs.append({"fingerprint": fp, "pmx": pmx, "blend": blend,
+                    "label": t.get("label") or os.path.basename(model),
                     "out": out, "map_file": mf})
     job["targets"] = tgs
     if not job.get("out_root"):
@@ -607,11 +656,21 @@ def _derive_job_from_conf():
     tgs = []
     for fp in STATE["order"]:
         m = STATE["models"][fp]
-        p = (m["conf"].get("model") or {}).get("path")
-        if p:
-            tgs.append({"fingerprint": fp, "pmx": p, "label": m["file"]})
+        conf_model = m["conf"].get("model") or {}
+        p = conf_model.get("path")
+        if not p:
+            continue
+        # ★ .blend 目标必须落在 blend 键上：确认服务拼 argv 时按 pmx/blend 二选一，
+        #   把 .blend 塞进 pmx 会让驱动走 PMX 导入分支（读不了二进制就报错）。
+        is_blend = conf_model.get("model_kind") == "blend" or \
+            str(p).lower().endswith(".blend")
+        tgs.append({"fingerprint": fp,
+                    "pmx": None if is_blend else p,
+                    "blend": p if is_blend else None,
+                    "label": m["file"]})
     return {"schema": "toon-render-job/1", "auto_render": False,
             "mode": "faithful", "auto_frame": 0,
+            "material_policy": "strict",
             "source_blend": SOURCE_BLEND, "blender": BLENDER,
             "driver": DRIVER, "script": SCRIPT,
             "out_root": os.path.join(RUNTIME_DIR, "output"),

@@ -70,6 +70,19 @@ FRONTEND_NOT_BUILT = "FRONTEND_NOT_BUILT"
 SURFACE_APPLY_FAILED = "SURFACE_APPLY_FAILED"
 #: `/assets/*` 的静态资源不存在（含路径越界；两种情况刻意不区分）。
 ASSET_NOT_FOUND = "ASSET_NOT_FOUND"
+#: 渲染工作流（HTTP 编排层）
+MODEL_NOT_FOUND = "MODEL_NOT_FOUND"
+RENDER_PREFLIGHT_FAILED = "RENDER_PREFLIGHT_FAILED"
+RENDER_OUTPUT_MISSING = "RENDER_OUTPUT_MISSING"
+RENDER_SUBPROCESS_FAILED = "RENDER_SUBPROCESS_FAILED"
+RENDER_EXECUTOR_LOCKED = "RENDER_EXECUTOR_LOCKED"
+#: 固定脚本写出了**四个正式终态之外**的 token。单独一个码：契约升级时必须被发现，
+#: 而不是被静默归成「普通失败」。（规格 §3.3：未知终态 token 一律失败。）
+RENDER_UNKNOWN_TERMINAL = "RENDER_UNKNOWN_TERMINAL"
+#: 固定脚本终态为 DIAGNOSTIC：产出的是诊断图，**不是成品**。（规格 §3.2）
+RENDER_DIAGNOSTIC = "RENDER_DIAGNOSTIC"
+#: 固定脚本终态为 REJECTED：渲染前被准入检查拦下，需完成材质确认后重试。（规格 §3.2）
+RENDER_REJECTED = "RENDER_REJECTED"
 
 #: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，
 #: 便于调用方直接读到 ``parameter`` / ``value`` / ``depends_on`` / ``allowed``。
@@ -315,6 +328,48 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         404,
         False,
         "前端静态资源不存在。若页面白屏，请重新执行 npm run build 后再刷新。",
+    ),
+    MODEL_NOT_FOUND: (
+        404,
+        False,
+        "模型不存在或尚未被扫描到。请先在「模型」列表刷新，或确认模型放在受信任的模型目录内。",
+    ),
+    RENDER_PREFLIGHT_FAILED: (
+        502,
+        True,
+        "渲染预检失败（模型无法解析或分类）。请确认模型文件完整后重试。",
+    ),
+    RENDER_OUTPUT_MISSING: (
+        502,
+        True,
+        "渲染子进程结束但未产出任何产物文件。请查看任务日志与 Blender 侧报错后重试。",
+    ),
+    RENDER_SUBPROCESS_FAILED: (
+        502,
+        True,
+        "渲染子进程异常退出。请查看任务日志后重试。",
+    ),
+    RENDER_EXECUTOR_LOCKED: (
+        409,
+        True,
+        "同一模型已有渲染在进行，已拒绝重复启动（跨进程锁保证单渲染者）。请等待当前任务结束或先取消。",
+    ),
+    RENDER_UNKNOWN_TERMINAL: (
+        502,
+        True,
+        "固定脚本返回了无法识别的运行终态。这通常是版本不匹配：请更新渲染脚本后重试，"
+        "并把这个任务的日志反馈给维护者。",
+    ),
+    RENDER_DIAGNOSTIC: (
+        200,
+        False,
+        "本次只产出了诊断图（含未识别材质的洋红标识），不是正式成品。"
+        "请先在材质确认里逐项选择，确认完成后重新渲染。",
+    ),
+    RENDER_REJECTED: (
+        200,
+        True,
+        "渲染前的材质准入检查未通过，尚未开始正式渲染。请按页面提示完成材质确认后重试。",
     ),
 }
 

@@ -22,12 +22,27 @@
 
 用法：
     python 开始渲染.py --pmx "模型.pmx"
+    python 开始渲染.py --blend "场景.blend"          # .blend 直开（自身即源工程）
     python 开始渲染.py --fingerprint 545a9ba0        # 按指纹反查（推荐，免手写路径）
     python 开始渲染.py --pmx "模型.pmx" --mode enhanced --auto-frame
 
-参数（除 --pmx/--fingerprint 外都有默认值）：
+.blend 直开与 PMX 的差别（驱动 --pmx/--blend 二选一）：
+    * --blend 场景以**自身**为源工程（--resolve 指向自己），不再要求 TOON_SRC_BLEND；
+    * 材质清单只能在 Blender 里读，Python 侧预检（PMX 解析器）不适用，
+      因此 .blend 跳过预检/确认页直接渲染，分类与严格准入由主脚本在 Blender 内完成；
+    * 未解决材质在严格模式下会被拒绝（REJECTED），并在输出目录留下待确认模板。
+
+参数（除 --pmx/--blend/--fingerprint 外都有默认值）：
     --out <目录>          输出目录，默认 output/<模型名>_<时间戳>（每次运行都是新目录）
     --mode faithful|enhanced
+    --material-policy strict|diagnostic
+                          材质准入，默认 strict（未解决材质在重建前拒绝）；
+                          diagnostic = 未解决材质换洋红棋盘诊断图，产物记 diagnostic
+    --lighting volume_fog|legacy   灯光配置，默认 volume_fog（7 灯体积雾方案）
+    --fog-density <f>              体积雾雾密度，默认 0.018（范围 0.0–0.1）
+    --glow-threshold <f> --glow-strength <f> --glow-size <f>
+    --glow-smoothness <f> --glow-quality High|Medium|Low
+                                  辉光微调（仅 enhanced 模式生效；不传用主脚本修复默认值）
     --auto-frame 0|1      构图
     --no-confirm-ui       即使需要确认也不开页面（只打印缺什么）
     --port <n>            本地确认页端口，默认 8770
@@ -153,13 +168,36 @@ def sha256_of(path):
     return h.hexdigest()
 
 
-def locate(fingerprint=None, pmx=None, name=None):
+#: 支持的模型扩展名 —— 与 Web 模型注册表（src/server/models_scan.py 的 _MODEL_EXTS）
+#: 保持一致：注册表里能选到的文件，入口脚本的反查也必须能找到。
+MODEL_EXTS = (".pmx", ".pmd", ".blend", ".x")
+
+
+def model_kind(path):
+    """模型种类：``blend`` / ``pmx`` / ``unsupported``。
+
+    驱动里 --pmx/--blend 是**二选一**：.blend 必须走 --blend 直开，且以自身为源工程
+    （--resolve 指向自己）。2026-10-14 凌晨 91.blend 三连跑实证该口径：
+    strict 无映射 → REJECTED；diagnostic → DIAGNOSTIC；
+    strict + 侧车映射（按整文件 sha256 命中）→ SUCCESS。
+    """
+    ext = os.path.splitext(str(path))[1].lower()
+    if ext == ".blend":
+        return "blend"
+    if ext == ".pmx":
+        return "pmx"
+    return "unsupported"
+
+
+def locate(fingerprint=None, pmx=None, blend=None, name=None):
     """按指纹/文件名反查真实路径 —— 禁止手写路径（踩过三次坑）。"""
     if pmx:
         return pmx if os.path.isfile(pmx) else None
+    if blend:
+        return blend if os.path.isfile(blend) else None
     for r, _ds, fs in os.walk(ROOT):
         for f in sorted(fs):
-            if not f.lower().endswith(".pmx"):
+            if not f.lower().endswith(MODEL_EXTS):
                 continue
             p = os.path.join(r, f)
             if name and f == name:
@@ -218,20 +256,59 @@ def send(cmd, timeout=60):
 
 
 def launch_blender(argv, log_path):
+    """经 MCP 在**常驻 Blender** 里派发一个后台 Blender 进程。
+
+    返回 MCP 响应 ``r``。**关键**：真实 Blender 的 PID 在 ``r`` 里（``@@LAUNCH@@``），
+    但它是**在常驻 Blender 进程**里启动的，不属于本入口脚本的子进程 —— 因此必须把
+    PID 显式转发到本进程 stdout，HTTP 编排层才能登记并纳入 Job Object / 兜底终止。
+    这里统一打印稳定事件 ``@@BLENDER_PID@@{"pid": N}``。
+    """
     code = ("import subprocess, json\n"
             "p = subprocess.Popen(%r, stdout=open(%r,'w',encoding='utf-8',errors='replace'),"
             " stderr=subprocess.STDOUT)\n"
             "print('@@LAUNCH@@' + json.dumps({'pid': p.pid}))\n" % (argv, log_path))
-    return send({"type": "execute_code", "params": {"code": code}}, timeout=60)
+    r = send({"type": "execute_code", "params": {"code": code}}, timeout=60)
+    report_blender_pid(r)
+    return r
+
+
+def report_blender_pid(mcp_response):
+    """从 MCP 响应里解析真实 Blender PID，并转发到本进程 stdout。
+
+    在常驻 Blender 里启动的进程不属于本入口脚本的子进程，必须显式上报 PID，
+    否则调用方无法终止它。解析失败时打印 ``@@BLENDER_PID@@{"pid": null}``，
+    让调用方明确知道「未能取得 PID，不保证可终止」，而不是静默当作成功。
+    """
+    pid = None
+    try:
+        text = mcp_response if isinstance(mcp_response, str) else json.dumps(mcp_response)
+        marker = "@@LAUNCH@@"
+        if marker in text:
+            payload = text.split(marker, 1)[1]
+            # 用正则直接抓 pid：payload 可能是被 json.dumps 转义过的（引号前带 `\`），
+            # 因此不能依赖严格的 JSON 解析。
+            import re
+
+            # 引号可能被 json.dumps 转义成 `\"`，因此允许引号前有可选反斜杠。
+            m = re.search(r'\\?"pid\\?"\s*:\s*(\d+)', payload)
+            if m:
+                pid = int(m.group(1))
+    except Exception:
+        pid = None
+    out("@@BLENDER_PID@@%s" % json.dumps({"pid": pid}))
 
 
 # ---------------------------------------------------------------- 各步骤
-def preflight(pmx, maps_dir=None):
-    """预检 + 分级，产出确认清单。返回 (conf_path, payload)。"""
+def preflight(model, maps_dir=None):
+    """预检 + 分级，产出确认清单。返回 (conf_path, payload)。
+
+    ★ 仅支持 PMX：底层 build_confirmation 用 PMX 二进制解析器读材质清单。
+      .blend 的材质只能在 Blender 里读，走不到这里（main() 对 blend 直接渲染）。
+    """
     import build_confirmation as BC
     from material_classifier import MaterialClassifier
     clf = MaterialClassifier()
-    payload = BC.build_one(pmx, clf, maps_dir or default_maps_dir())
+    payload = BC.build_one(model, clf, maps_dir or default_maps_dir())
     if not payload:
         return None, None
     os.makedirs(CONF_DIR, exist_ok=True)
@@ -242,8 +319,94 @@ def preflight(pmx, maps_dir=None):
     return jp, payload
 
 
-def ensure_previews(pmx, conf_path):
-    """缺预览图就补（串行、按指纹派发）。"""
+def blend_confirmation_from_run(out_dir, model, maps_dir=None):
+    """.blend 被严格模式拒绝后，把主脚本的预检台账反推成**既有确认页**能读的清单。
+
+    .blend 的材质清单只能在 Blender 里读，所以 Python 侧预检（``build_one`` 依赖 PMX
+    二进制解析器）用不上。主脚本在 ``MATERIAL_POLICY == "strict"`` 拒绝时会在输出目录
+    留下 ``material_preflight.json``（逐材质分类台账）与待填映射模板 —— 那里已经有
+    全部所需信息，只是字段名与确认页契约不同。
+
+    本函数**只做字段搬运，不新建确认系统**：产出的 JSON 结构与
+    ``build_confirmation.build_one`` 完全一致（``model.fingerprint`` +
+    ``items[].requires_user``），因此确认页、侧车映射落盘、确认服务自动续跑
+    全部原样复用。返回 ``(conf_path, payload)``；没有待确认项时返回 ``(None, None)``。
+
+    ★ ``previews`` 三张图对 .blend 不存在（遮罩/高亮要 PMX 槽位信息），确认页对
+      缺图是容错的，这里给空串而不是伪造路径。
+    """
+    src = os.path.join(out_dir, "material_preflight.json")
+    if not os.path.isfile(src):
+        return None, None
+    try:
+        with io.open(src, encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None, None
+
+    import decision as DEC
+
+    mats = rec.get("materials") or []
+    choices = [{"class": c, "label": lb} for c, lb in DEC.CHOICES]
+    items = []
+    for m in mats:
+        unresolved = (m.get("class") == "unresolved") or bool(m.get("needs_review"))
+        if not unresolved:
+            continue
+        items.append({
+            "index": len(items),
+            "material": m.get("original_name"),
+            "proposed_class": m.get("group") or None,
+            "requires_user": True,
+            "stage": "UNRESOLVED" if m.get("class") == "unresolved" else "SUGGESTED",
+            "confidence": m.get("confidence"),
+            "note": m.get("note"),
+            "matched_by": m.get("matched_by"),
+            "reasons": [x for x in (m.get("note"),) if x],
+            "structure_rules": [],
+            "evidence": {"matched_by": m.get("matched_by"), "rule": m.get("rule")},
+            "choices": choices,
+            "previews": {"mask_only": "", "overview_highlighted": "", "proposed_group": ""},
+        })
+    if not items:
+        return None, None
+
+    raw_fp = str(rec.get("model_fingerprint") or "")
+    fp = raw_fp.split(":", 1)[1] if raw_fp.startswith("sha256:") else raw_fp
+    if not fp:
+        fp = sha256_of(model)
+    # 统计口径与 build_one 一致：直接用 decision.summarize，不自己数 ——
+    # 否则 .blend 与 PMX 两份清单的 summary 键会漂移，确认页指标就不可信了。
+    all_stages = [("UNRESOLVED" if m.get("class") == "unresolved" else "SUGGESTED")
+                  if ((m.get("class") == "unresolved") or bool(m.get("needs_review")))
+                  else "AUTO_CONFIRMED" for m in mats]
+    payload = {
+        "schema": "toon-confirmation/1",
+        "model": {
+            "file": os.path.basename(model),
+            "path": model,
+            "display_name": os.path.splitext(os.path.basename(model))[0],
+            "fingerprint": "sha256:" + fp,
+            "model_kind": "blend",
+            "morph_available": False,
+        },
+        "summary_all": DEC.summarize(all_stages),
+        "summary_requiring_user": DEC.summarize([x["stage"] for x in items]),
+        "items": items,
+        "_auto": [],
+        "_requiring": items,
+        "targets": rec.get("targets") or [],
+        "source": "blend-run-preflight",
+    }
+    os.makedirs(CONF_DIR, exist_ok=True)
+    jp = os.path.join(CONF_DIR, "%s_confirmation.json" % fp[:16])
+    with io.open(jp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=1)
+    return jp, payload
+
+
+def ensure_previews(model, conf_path):
+    """缺预览图就补（串行、按指纹派发）。仅 PMX 确认路径会走到这里。"""
     # ★ F7：预览目录以前从不创建（preflight 只建 CONF_DIR），派发后 Blender 侧
     #   open(log_path,'w') 直接 FileNotFoundError → 只打印「预览图派发失败」。
     #   出厂默认配置首次运行必然踩到，确认页因此拿不到遮罩 / 透视高亮 / 推荐图。
@@ -263,7 +426,7 @@ def ensure_previews(pmx, conf_path):
     # ★ F6：完成标记以前写在仓库代码目录（_tools/_preview_run.done）——那是运行数据，
     #   会把仓库工作树弄脏。改到 PREVIEW_DIR（运行目录）下。
     done = os.path.join(PREVIEW_DIR, "_preview_run.done")
-    logp = os.path.join(PREVIEW_DIR, "_%s.log" % hashlib.sha256(pmx.encode()).hexdigest()[:8])
+    logp = os.path.join(PREVIEW_DIR, "_%s.log" % hashlib.sha256(model.encode()).hexdigest()[:8])
     for p in (done, logp):
         try:
             os.remove(p)
@@ -271,7 +434,7 @@ def ensure_previews(pmx, conf_path):
             pass
     argv = [BLENDER, "--background", "--factory-startup", "--python",
             os.path.join(HERE, "_tools", "preview_gen.py"), "--",
-            "--pmx", pmx, "--confirmation", conf_path, "--out", PREVIEW_DIR,
+            "--pmx", model, "--confirmation", conf_path, "--out", PREVIEW_DIR,
             "--resolve", SOURCE_BLEND, "--log", logp, "--done", done]
     r = launch_blender(argv, logp)
     if "@@LAUNCH@@" not in json.dumps(r):
@@ -287,9 +450,12 @@ def ensure_previews(pmx, conf_path):
     return st.startswith("OK")
 
 
-def write_job(pmx, out_dir, mode, auto_frame, maps_dir=None):
+def write_job(model, out_dir, mode, auto_frame, maps_dir=None,
+              lighting="volume_fog", fog_density=0.018, glow=None,
+              policy="strict"):
     """把渲染任务写成 job 文件 —— 只有本地进程能写，浏览器无法提供。"""
-    fp = sha256_of(pmx)
+    kind = model_kind(model)
+    fp = sha256_of(model)
     os.makedirs(JOB_DIR, exist_ok=True)
     job_path = os.path.join(JOB_DIR, "%s.job.json" % fp[:16])
     job = {
@@ -297,22 +463,31 @@ def write_job(pmx, out_dir, mode, auto_frame, maps_dir=None):
         "auto_render": True,
         "mode": mode,
         "auto_frame": 1 if auto_frame else 0,
+        "lighting": lighting,
+        "fog_density": fog_density,
+        "glow": glow or {},
+        "material_policy": policy,
         "source_blend": SOURCE_BLEND,
         "blender": BLENDER,
         "driver": os.path.join(HERE, "一键渲染_通用驱动.py"),
         "script": os.path.join(HERE, "一键卡通渲染.py"),
         "out_root": os.path.dirname(out_dir),
         "maps_dir": maps_dir or default_maps_dir(),
-        "session_label": os.path.basename(pmx),
-        "targets": [{"fingerprint": fp, "pmx": pmx,
-                     "label": os.path.basename(pmx), "out": out_dir}],
+        "model_kind": kind,
+        "session_label": os.path.basename(model),
+        "targets": [{"fingerprint": fp,
+                     "pmx": model if kind == "pmx" else None,
+                     "blend": model if kind == "blend" else None,
+                     "label": os.path.basename(model), "out": out_dir}],
     }
     with io.open(job_path, "w", encoding="utf-8") as f:
         json.dump(job, f, ensure_ascii=False, indent=1)
     return job_path
 
 
-def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps_dir=None):
+def run_confirm_and_render(model, conf_path, out_dir, mode, auto_frame, port, maps_dir=None,
+                           lighting="volume_fog", fog_density=0.018, glow=None,
+                           policy="strict"):
     """
     启动确认页 → 等用户确认 → **服务端自动续跑渲染** → 轮询终态。
     本进程全程不启动渲染，因此不可能与页面按钮产生两个 Blender。
@@ -323,18 +498,27 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
     ok, err = ensure_out_dir(out_dir)
     if not ok:
         return "FAILED", {"status": "FAILED", "stage": "准备输出目录", "error": err}
-    job_path = write_job(pmx, out_dir, mode, auto_frame, maps_dir)
+    job_path = write_job(model, out_dir, mode, auto_frame, maps_dir,
+                         lighting=lighting, fog_density=fog_density, glow=glow,
+                         policy=policy)
     logp = os.path.join(out_dir, "confirm_server.log")
     buf = open(logp, "w", encoding="utf-8", errors="replace")
-    srv = subprocess.Popen([PY, os.path.join(HERE, "_tools", "confirm_server.py"),
-                            "--confirmation", conf_path, "--port", str(port),
-                            "--auto-render", "--job", job_path,
-                            "--model-root", ROOT,
-                            "--source-blend", SOURCE_BLEND,
-                            "--blender", BLENDER,
-                            "--runtime-dir", RUNTIME_DIR,
-                            "--maps-dir", maps_dir or default_maps_dir()],
-                           stdout=buf, stderr=subprocess.STDOUT)
+    # ★ ROOT 可能为空（.blend 用 --blend 显式给路径时不需要模型根目录）。
+    #   传空串会被 argparse 当成「没给 --model-root」→ 确认服务直接退出 2，
+    #   于是**所有 .blend 的确认闭环都起不来**。不给力时回退到模型所在目录：
+    #   job 校验只要求目标位于素材根目录下，而 .blend 的目标就在自己所在目录。
+    model_root = ROOT or os.path.dirname(os.path.abspath(model))
+    srv_argv = [PY, os.path.join(HERE, "_tools", "confirm_server.py"),
+                "--confirmation", conf_path, "--port", str(port),
+                "--auto-render", "--job", job_path,
+                "--model-root", model_root,
+                "--source-blend", SOURCE_BLEND,
+                "--blender", BLENDER,
+                "--runtime-dir", RUNTIME_DIR,
+                "--maps-dir", maps_dir or default_maps_dir()]
+    if SOURCE_BLEND:
+        srv_argv += ["--source-blend", SOURCE_BLEND]
+    srv = subprocess.Popen(srv_argv, stdout=buf, stderr=subprocess.STDOUT)
     url = "http://127.0.0.1:%d/" % port
     try:
         sid = None
@@ -367,6 +551,7 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
         out("  请在页面上逐条确认；全部确认后服务端会自动继续渲染，无需再点任何按钮。")
 
         prev = None
+        reported_pid = None
         while True:
             try:
                 st = http_json("%sapi/session/%s/status" % (url, sid), timeout=5)
@@ -379,6 +564,12 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
                                                            % srv.returncode}}
                 time.sleep(1.5)
                 continue
+            # 确认服务自动续跑时启动的真实 Blender：其 PID 由服务端持有并通过 status
+            # 暴露。必须转发到本进程 stdout —— 它是常驻 Blender 派发的，不是本脚本子进程。
+            pid = st.get("blender_pid")
+            if pid and pid != reported_pid:
+                reported_pid = pid
+                out("@@BLENDER_PID@@%s" % json.dumps({"pid": pid}))
             key = (st.get("state"), st.get("attempt"), st.get("pending"))
             if key != prev:
                 prev = key
@@ -421,9 +612,17 @@ def run_confirm_and_render(pmx, conf_path, out_dir, mode, auto_frame, port, maps
             pass
 
 
-def render(pmx, out_dir, mode, auto_frame, maps_dir=None):
+def render(model, out_dir, mode, auto_frame, maps_dir=None,
+           lighting="volume_fog", fog_density=0.018, glow=None,
+           policy="strict"):
     """
     无需确认时的直接渲染。带跨进程锁，防止重复起 Blender。
+
+    .blend 与 PMX 的驱动参数不同：--blend 直开且以自身为源工程（--resolve 指向自己）；
+    PMX 走 --pmx 导入 + TOON_SRC_BLEND 源工程。
+
+    ``policy`` 是材质准入口径（strict|diagnostic）：strict 未解决材质在重建前拒绝；
+    diagnostic 换洋红棋盘诊断图出图（产物记 diagnostic，不可交付）。
 
     返回 ``(rc, outcome)``。``outcome`` 是**结构化终态**：
 
@@ -436,7 +635,7 @@ def render(pmx, out_dir, mode, auto_frame, maps_dir=None):
     if not ok:
         return 1, {"status": "FAILED", "stage": "准备输出目录", "error": err}
     os.makedirs(LOCK_DIR, exist_ok=True)
-    lockp = os.path.join(LOCK_DIR, "%s.render.lock" % sha256_of(pmx)[:16])
+    lockp = os.path.join(LOCK_DIR, "%s.render.lock" % sha256_of(model)[:16])
     try:
         lk = RenderLock(lockp, tag="direct:start-render").acquire()
     except LockBusy as e:
@@ -455,15 +654,29 @@ def render(pmx, out_dir, mode, auto_frame, maps_dir=None):
                 pass
         argv = [BLENDER, "--background", "--factory-startup", "--python",
                 os.path.join(HERE, "一键渲染_通用驱动.py"), "--",
-                "--pmx", pmx, "--out", out_dir, "--mode", mode,
-                "--material-policy", "strict",
-                "--resolve", SOURCE_BLEND,
+                "--out", out_dir, "--mode", mode,
+                "--material-policy", policy,
+                "--lighting", lighting,
+                "--fog-density", str(fog_density),
                 "--script", os.path.join(HERE, "一键卡通渲染.py"),
                 "--auto-frame", "1" if auto_frame else "0",
                 # ★ F6：直渲路径过去完全不传映射目录 —— 于是已确认过的模型
                 #   （预检「映射命中 1 / 需确认 0」→ 走这条路）会把确认结果丢掉。
                 "--maps-dir", maps_dir or default_maps_dir(),
                 "--log", logp, "--done", done]
+        if model_kind(model) == "blend":
+            # .blend 直开：驱动走 --blend；它以自身为源工程（--resolve 指向自己），
+            # 不能再套 PMX 的 SOURCE_BLEND —— 两者语义不同。
+            argv += ["--blend", model, "--resolve", model]
+        else:
+            argv += ["--pmx", model, "--resolve", SOURCE_BLEND]
+        # 辉光微调（仅 enhanced 模式有意义；不传则用主脚本默认修复值）。
+        for key, flag in (("Threshold", "--glow-threshold"), ("Strength", "--glow-strength"),
+                          ("Size", "--glow-size"), ("Smoothness", "--glow-smoothness"),
+                          ("Quality", "--glow-quality")):
+            v = (glow or {}).get(key)
+            if v is not None:
+                argv += [flag, str(v)]
         out("  渲染中…（日志 %s）" % logp)
         r = launch_blender(argv, logp)
         if "@@LAUNCH@@" not in json.dumps(r):
@@ -482,6 +695,11 @@ def render(pmx, out_dir, mode, auto_frame, maps_dir=None):
         token = lines[0] if lines else ""
         if token == "SUCCESS":
             return 0, {"status": "SUCCESS", "token": token}
+        # ★ rejected / diagnostic 是 run_contract 的**正式终态**，不是 FAILED：
+        #   严格模式拒绝（待确认）与诊断出图都必须原样透出，否则上层会把「待人工
+        #   确认」误报成「渲染失败」，也无法接既有确认闭环。
+        if token.lower() in ("rejected", "diagnostic"):
+            return 1, {"status": token.upper(), "token": token.upper(), "stage": "材质准入"}
         return 1, {"status": "FAILED", "stage": "渲染",
                    "error": {"code": token or "RENDER_TIMEOUT",
                              "message": "渲染终态：%s（按契约不可交付）"
@@ -494,15 +712,30 @@ def main():
     global ROOT, SOURCE_BLEND, BLENDER, RUNTIME_DIR, CONF_DIR, PREVIEW_DIR, JOB_DIR, LOCK_DIR
     ap = argparse.ArgumentParser(description="开始渲染（v3.1 唯一入口）")
     ap.add_argument("--pmx")
+    ap.add_argument("--blend")
     ap.add_argument("--fingerprint")
     ap.add_argument("--name")
     ap.add_argument("--out")
     ap.add_argument("--mode", default="faithful", choices=("faithful", "enhanced"))
+    ap.add_argument("--material-policy", default="strict",
+                    choices=("strict", "diagnostic"),
+                    help="材质准入：strict=未解决材质在重建前拒绝（默认）；"
+                         "diagnostic=未解决材质换洋红棋盘诊断图，产物记 diagnostic（不可交付）")
+    ap.add_argument("--lighting", default="volume_fog", choices=("volume_fog", "legacy"),
+                    help="灯光配置：volume_fog=7 灯体积雾方案（默认）；legacy=旧版 21+6 复刻灯组")
+    ap.add_argument("--fog-density", type=float, default=0.018,
+                    help="体积雾雾密度，默认 0.018（范围 0.0–0.1）")
+    ap.add_argument("--glow-threshold", type=float, default=None)
+    ap.add_argument("--glow-strength", type=float, default=None)
+    ap.add_argument("--glow-size", type=float, default=None)
+    ap.add_argument("--glow-smoothness", type=float, default=None)
+    ap.add_argument("--glow-quality", default=None, choices=("High", "Medium", "Low"))
     ap.add_argument("--auto-frame", type=int, default=0)
     ap.add_argument("--no-confirm-ui", action="store_true")
     ap.add_argument("--port", type=int, default=8770)
     ap.add_argument("--model-root", default=ROOT,
-                    help="按名称/指纹查找 PMX 的素材根目录；也可设 TOON_MODEL_ROOT")
+                    help="按名称/指纹查找模型文件（.pmx/.pmd/.blend/.x）的素材根目录；"
+                         "也可设 TOON_MODEL_ROOT")
     ap.add_argument("--source-blend", default=SOURCE_BLEND,
                     help="提供节点组的源 .blend；也可设 TOON_SRC_BLEND")
     ap.add_argument("--blender", default=BLENDER,
@@ -520,22 +753,36 @@ def main():
     BLENDER = os.path.abspath(a.blender) if a.blender else ""
     RUNTIME_DIR = os.path.abspath(a.runtime_dir)
     a.maps_dir = os.path.abspath(a.maps_dir) if a.maps_dir else default_maps_dir()
+    if not (0.0 <= a.fog_density <= 0.1):
+        out("--fog-density 必须在 0.0–0.1 之间，收到 %r" % a.fog_density)
+        return 2
+    glow = {k: v for k, v in (("Threshold", a.glow_threshold),
+                              ("Strength", a.glow_strength),
+                              ("Size", a.glow_size),
+                              ("Smoothness", a.glow_smoothness),
+                              ("Quality", a.glow_quality)) if v is not None}
     CONF_DIR = os.path.join(RUNTIME_DIR, "confirmation")
     PREVIEW_DIR = os.path.join(CONF_DIR, "previews")
     JOB_DIR = os.path.join(CONF_DIR, "jobs")
     LOCK_DIR = os.path.join(CONF_DIR, ".locks")
 
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    if not a.pmx and not ROOT:
+    if not a.pmx and not a.blend and not ROOT:
         out("缺少模型根目录：使用 --model-root 或设置 TOON_MODEL_ROOT。")
         return 2
-    pmx = locate(a.fingerprint, a.pmx, a.name)
-    if not pmx:
-        out("找不到模型。请用 --pmx <路径> 或 --fingerprint <指纹前若干位>。")
+    model = a.blend or locate(a.fingerprint, a.pmx, None, a.name)
+    if not model:
+        out("找不到模型。请用 --pmx <路径> / --blend <路径> 或 --fingerprint <指纹前若干位>。")
+        return 2
+    kind = model_kind(model)
+    if kind == "unsupported":
+        out("暂不支持的模型格式：%s（当前支持 .pmx 与 .blend）"
+            % os.path.splitext(model)[1])
         return 2
 
-    model_name = os.path.splitext(os.path.basename(pmx))[0]
-    if not SOURCE_BLEND or not os.path.isfile(SOURCE_BLEND):
+    model_name = os.path.splitext(os.path.basename(model))[0]
+    if kind == "pmx" and (not SOURCE_BLEND or not os.path.isfile(SOURCE_BLEND)):
+        # .blend 以自身为源工程，不要求 TOON_SRC_BLEND；PMX 导入才需要节点组源工程。
         out("缺少有效源工程：使用 --source-blend 或设置 TOON_SRC_BLEND。")
         return 2
     if not BLENDER or not os.path.isfile(BLENDER):
@@ -544,16 +791,57 @@ def main():
     out_dir = a.out or os.path.join(RUNTIME_DIR, "output",
                                     "%s_%s" % (model_name, time.strftime("%m%d_%H%M%S")))
     out("=" * 72)
-    out("开始渲染：%s" % os.path.basename(pmx))
-    out("  %s" % pmx)
+    out("开始渲染：%s" % os.path.basename(model))
+    out("  %s" % model)
     out("=" * 72)
     if not channel_ready():
         out("  ！提示：常驻 Blender 通道（127.0.0.1:9876）当前不可用。")
         out("           渲染依赖该通道，请先在 Blender 中开启 MCP 监听。")
         out("           请先在 Blender 中开启 MCP 监听，否则渲染阶段会直接失败。")
 
+    if kind == "blend":
+        # .blend 直开：材质清单只能在 Blender 里读，Python 侧预检（PMX 解析器）不适用。
+        # 分类与严格准入由主脚本在 Blender 内完成；未解决材质会 REJECTED 并在输出目录
+        # 留下 material_preflight.json 台账 —— 那份台账就是既有确认页要的清单，
+        # 所以这里被拒后**接既有确认闭环**（确认 → 侧车映射 → 服务端自动续跑），
+        # 而不是直接终止。注意 diagnostic 口径不做确认（本来就允许出图）。
+        out("[1/3] .blend 直开模式：材质分类在 Blender 内进行（Python 侧预检仅支持 PMX）")
+        out("[2/3] 渲染（材质准入 %s）" % a.material_policy)
+        rc, outcome = render(model, out_dir, a.mode, bool(a.auto_frame), a.maps_dir,
+                             lighting=a.lighting, fog_density=a.fog_density, glow=glow,
+                             policy=a.material_policy)
+        if outcome.get("token") != "REJECTED" or a.material_policy != "strict":
+            report_final(outcome, out_dir)
+            return rc
+
+        conf_path, payload = blend_confirmation_from_run(out_dir, model, a.maps_dir)
+        if not payload:
+            # 没有待确认项 → REJECTED 就是真终态（例如冲突/低置信度），照实报。
+            report_final(outcome, out_dir)
+            return rc
+        requiring = [x for x in payload["items"] if x["requires_user"]]
+        # ★ 关键词必须是「材质需要确认」：适配层靠这行把任务切到 waiting_confirmation
+        #   并挂上确认页入口与待确认清单，两条路径（PMX 预检 / .blend 拒绝后反推）共用它。
+        out("  ✗ 严格模式拒绝：%d 个材质需要确认，转入确认流程" % len(requiring))
+        for x in requiring:
+            out("      · %s → 建议 %s（%s）"
+                % (x["material"], x["proposed_class"] or "—", x["stage"]))
+        if a.no_confirm_ui:
+            report_final({"status": "FAILED", "stage": "等待人工确认",
+                          "error": {"code": "CONFIRMATION_REQUIRED",
+                                    "message": "有 %d 个材质需要人工确认，"
+                                               "--no-confirm-ui 下只报告不渲染" % len(requiring)}},
+                         out_dir)
+            return 1
+        token, outcome2 = run_confirm_and_render(
+            model, conf_path, out_dir, a.mode, bool(a.auto_frame), a.port, a.maps_dir,
+            lighting=a.lighting, fog_density=a.fog_density, glow=glow,
+            policy=a.material_policy)
+        report_final(outcome2, out_dir, confirm_path=True)
+        return 0 if token == "SUCCESS" else 1
+
     out("[1/3] 预检与自动分类…")
-    conf_path, payload = preflight(pmx, a.maps_dir)
+    conf_path, payload = preflight(model, a.maps_dir)
     if not payload:
         report_final({"status": "FAILED", "stage": "预检与自动分类",
                       "error": {"code": "PREFLIGHT_FAILED",
@@ -567,7 +855,9 @@ def main():
     requiring = [x for x in payload["items"] if x["requires_user"]]
     if not requiring:
         out("[2/3] 无需人工确认 —— 直接渲染")
-        rc, outcome = render(pmx, out_dir, a.mode, bool(a.auto_frame), a.maps_dir)
+        rc, outcome = render(model, out_dir, a.mode, bool(a.auto_frame), a.maps_dir,
+                             lighting=a.lighting, fog_density=a.fog_density, glow=glow,
+                             policy=a.material_policy)
         report_final(outcome, out_dir)
         return rc
 
@@ -585,9 +875,12 @@ def main():
                      out_dir)
         return 1
 
-    ensure_previews(pmx, conf_path)
-    token, outcome = run_confirm_and_render(pmx, conf_path, out_dir, a.mode,
-                                            bool(a.auto_frame), a.port, a.maps_dir)
+    ensure_previews(model, conf_path)
+    token, outcome = run_confirm_and_render(model, conf_path, out_dir, a.mode,
+                                            bool(a.auto_frame), a.port, a.maps_dir,
+                                            lighting=a.lighting,
+                                            fog_density=a.fog_density, glow=glow,
+                                            policy=a.material_policy)
     report_final(outcome, out_dir, confirm_path=True)
     return 0 if token == "SUCCESS" else 1
 

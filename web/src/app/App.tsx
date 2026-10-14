@@ -1,4 +1,4 @@
-import { useEffect } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
 import { useWorkspace } from "./useWorkspace";
 import { useStore } from "../state/useStore";
 import { ActionBar } from "../components/ActionBar";
@@ -9,12 +9,30 @@ import { PreviewCanvas } from "../components/PreviewCanvas";
 import { StatusBar } from "../components/StatusBar";
 import { PresetPanel } from "../features/save/PresetPanel";
 import { SaveDialog } from "../features/save/SaveDialog";
+import { RenderWizard } from "../features/render/RenderWizard";
 import type { Workspace } from "../state/workspace";
+import type { RenderStore } from "../state/render-store";
 
-/** v4 工作台。三栏：导航 / 固定预览 / 检查器，加顶部状态栏与底部操作栏。 */
-export function App({ workspace, autoBootstrap = true }: { workspace: Workspace; autoBootstrap?: boolean }) {
+export type WorkspaceView = "tune" | "render";
+
+/**
+ * v4 工作台。三栏：导航 / 固定预览 / 检查器，加顶部状态栏与底部操作栏。
+ *
+ * `renderController` 可选：提供了才显示「调参 / 渲染」切换与渲染向导。
+ * 既有测试只传 `workspace`，因此默认行为与之前**完全一致**。
+ */
+export function App({
+  workspace,
+  autoBootstrap = true,
+  renderController,
+}: {
+  workspace: Workspace;
+  autoBootstrap?: boolean;
+  renderController?: RenderStore;
+}) {
   const state = useWorkspace(workspace);
   const externalChanges = useStore(workspace.store, (snapshot) => snapshot.externalChanges);
+  const [view, setView] = useState<WorkspaceView>("tune");
 
   useEffect(() => {
     if (!autoBootstrap) {
@@ -28,6 +46,27 @@ export function App({ workspace, autoBootstrap = true }: { workspace: Workspace;
   return (
     <div class="workspace">
       <StatusBar workspace={workspace} />
+
+      {renderController ? (
+        <nav class="view-switch" data-testid="view-switch">
+          <button
+            type="button"
+            class={view === "tune" ? "chip chip-on" : "chip"}
+            data-testid="view-tune"
+            onClick={() => setView("tune")}
+          >
+            参数工作台
+          </button>
+          <button
+            type="button"
+            class={view === "render" ? "chip chip-on" : "chip"}
+            data-testid="view-render"
+            onClick={() => setView("render")}
+          >
+            一键渲染
+          </button>
+        </nav>
+      ) : null}
 
       <div class="banners">
         {state.historyBlocked ? (
@@ -94,18 +133,26 @@ export function App({ workspace, autoBootstrap = true }: { workspace: Workspace;
         ) : null}
       </div>
 
-      <main class="workbench">
-        <NavPanel workspace={workspace} />
-        <PreviewCanvas workspace={workspace} />
-        <Inspector workspace={workspace} />
-      </main>
+      {view === "render" && renderController ? (
+        <main class="workbench render-workbench">
+          <RenderWizard controller={renderController} />
+        </main>
+      ) : (
+        <>
+          <main class="workbench">
+            <NavPanel workspace={workspace} />
+            <PreviewCanvas workspace={workspace} />
+            <Inspector workspace={workspace} />
+          </main>
 
-      {/* 保存闭环的两块面板：预设（参数集合）与保存（写进 .blend）。
-          两者刻意分开 —— 预设不落盘、保存才落盘，混在一起最误导人。 */}
-      <PresetPanel workspace={workspace} />
-      <SaveDialog workspace={workspace} />
+          {/* 保存闭环的两块面板：预设（参数集合）与保存（写进 .blend）。
+              两者刻意分开 —— 预设不落盘、保存才落盘，混在一起最误导人。 */}
+          <PresetPanel workspace={workspace} />
+          <SaveDialog workspace={workspace} />
 
-      <ActionBar workspace={workspace} />
+          <ActionBar workspace={workspace} />
+        </>
+      )}
     </div>
   );
 }

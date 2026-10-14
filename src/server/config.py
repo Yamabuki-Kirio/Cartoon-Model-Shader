@@ -51,6 +51,49 @@ class ServerConfig:
 
 
 @dataclass(frozen=True)
+class RenderConfig:
+    """渲染工作流所需的本地固定资源（只由服务端决定，前端绝不可指定路径/脚本）。
+
+    路径解析优先级：``TOON_<NAME>`` 环境变量（与 render_pipeline/开始渲染.py 一致）
+    > ``TOON_TUNER_<NAME>`` 环境变量 > config 文件 > 默认 ``None``（由固定脚本回退）。
+    ``pipeline_script`` 缺省为仓库内 ``render_pipeline/开始渲染.py``，永不被前端覆盖。
+    """
+
+    model_root: Path | None = None
+    source_blend: Path | None = None
+    blender: Path | None = None
+    runtime_dir: Path | None = None
+    maps_dir: Path | None = None
+    output_dir: Path | None = None
+    pipeline_script: Path | None = None
+    # 资源治理默认保留策略（规格《资源治理》第 2 节）
+    max_jobs: int = 30
+    max_age_days: int = 14
+    max_total_gb: float = 20.0
+    max_memory_jobs: int = 200
+    keep_failed_logs: bool = True
+
+    @property
+    def pipeline_script_path(self) -> Path:
+        if self.pipeline_script is not None:
+            return Path(self.pipeline_script)
+        return REPO_ROOT / "render_pipeline" / "开始渲染.py"
+
+    @property
+    def retention_policy(self):
+        """构造保留策略对象（延迟导入避免循环依赖）。"""
+        from .render_storage import RetentionPolicy
+
+        return RetentionPolicy(
+            max_jobs=self.max_jobs,
+            max_age_days=self.max_age_days,
+            max_total_gb=self.max_total_gb,
+            max_memory_jobs=self.max_memory_jobs,
+            keep_failed_logs=self.keep_failed_logs,
+        )
+
+
+@dataclass(frozen=True)
 class AppConfig:
     blender_mcp: BlenderMCPConfig
     server: ServerConfig
@@ -61,6 +104,9 @@ class AppConfig:
     #: v4 前端构建产物目录（``web`` 的上一级 + ``dist``）。
     #: ``None`` 表示用默认位置（``<仓库根>/web``）。同样只影响服务端自己。
     web_dir: Path | None = None
+    #: 渲染工作流配置（模型根目录、源工程、Blender、运行目录、映射目录、输出目录）。
+    #: 所有路径只由服务端决定，接口层从不接受客户端路径。
+    render: RenderConfig = RenderConfig()
 
 
 def _read_json(path: Path) -> dict:
@@ -85,6 +131,16 @@ def _as_float(value: object, field: str) -> float:
         raise ConfigError(f"{field} 必须是数字，收到 {value!r}") from exc
     if parsed <= 0:
         raise ConfigError(f"{field} 必须为正数，收到 {parsed}")
+    return parsed
+
+
+def _as_int(value: object, field: str, *, minimum: int = 0) -> int:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field} 必须是整数，收到 {value!r}") from exc
+    if parsed < minimum:
+        raise ConfigError(f"{field} 必须 >= {minimum}，收到 {parsed}")
     return parsed
 
 
@@ -130,6 +186,45 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
     raw_web_dir = _env("WEB_DIR") or web_raw.get("dir")
     web_dir = Path(str(raw_web_dir)).expanduser() if raw_web_dir else None
 
+    # 渲染工作流：env（TOON_* 优先，兼容固定脚本；其次 TOON_TUNER_*）> config.render
+    render_raw = merged.get("render", {}) or {}
+
+    def _env_render(name: str) -> str | None:
+        v = os.environ.get("TOON_" + name)
+        if v:
+            return v
+        return _env(name)
+
+    raw_model_root = _env_render("MODEL_ROOT") or render_raw.get("model_root")
+    raw_source_blend = _env_render("SOURCE_BLEND") or render_raw.get("source_blend")
+    raw_blender = _env_render("BLENDER") or render_raw.get("blender")
+    raw_runtime_dir = _env_render("RUNTIME_DIR") or render_raw.get("runtime_dir")
+    raw_maps_dir = _env_render("MAPS_DIR") or render_raw.get("maps_dir")
+    raw_output_dir = _env_render("OUTPUT_DIR") or render_raw.get("output_dir")
+    raw_pipeline_script = _env_render("PIPELINE_SCRIPT") or render_raw.get("pipeline_script")
+    render = RenderConfig(
+        model_root=Path(str(raw_model_root)).expanduser() if raw_model_root else None,
+        source_blend=Path(str(raw_source_blend)).expanduser() if raw_source_blend else None,
+        blender=Path(str(raw_blender)).expanduser() if raw_blender else None,
+        runtime_dir=Path(str(raw_runtime_dir)).expanduser() if raw_runtime_dir else None,
+        maps_dir=Path(str(raw_maps_dir)).expanduser() if raw_maps_dir else None,
+        output_dir=Path(str(raw_output_dir)).expanduser() if raw_output_dir else None,
+        pipeline_script=Path(str(raw_pipeline_script)).expanduser() if raw_pipeline_script else None,
+        max_jobs=_as_int(_env_render("MAX_JOBS") or render_raw.get("max_jobs", 30), "max_jobs", minimum=0),
+        max_age_days=_as_int(
+            _env_render("MAX_AGE_DAYS") or render_raw.get("max_age_days", 14), "max_age_days", minimum=0
+        ),
+        max_total_gb=float(_env_render("MAX_TOTAL_GB") or render_raw.get("max_total_gb", 20.0)),
+        max_memory_jobs=_as_int(
+            _env_render("MAX_MEMORY_JOBS") or render_raw.get("max_memory_jobs", 200),
+            "max_memory_jobs",
+            minimum=1,
+        ),
+        keep_failed_logs=bool(
+            int(_env_render("KEEP_FAILED_LOGS") or render_raw.get("keep_failed_logs", 1))
+        ),
+    )
+
     mcp = BlenderMCPConfig(
         host=str(_env("MCP_HOST") or mcp_raw.get("host", MCP_DEFAULT_HOST)),
         port=_as_port(_env("MCP_PORT") or mcp_raw.get("port", MCP_DEFAULT_PORT), "blender_mcp.port"),
@@ -152,5 +247,5 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
     _validate_loopback(mcp.host, "blender_mcp.host")
     _validate_loopback(server.host, "server.host")
     return AppConfig(
-        blender_mcp=mcp, server=server, presets_dir=presets_dir, web_dir=web_dir
+        blender_mcp=mcp, server=server, presets_dir=presets_dir, web_dir=web_dir, render=render
     )
