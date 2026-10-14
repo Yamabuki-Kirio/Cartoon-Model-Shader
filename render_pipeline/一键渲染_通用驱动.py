@@ -23,8 +23,12 @@ v3 相对 v2 的变化：
       --allow-low-confidence               # 允许低置信度分类继续（默认不允许）
       --report-dir <目录>                  # 预检/台账落盘目录（默认 = --out）
       --mode faithful|enhanced
-      --lighting volume_fog|legacy         # 灯光配置，默认 volume_fog（7 灯体积雾方案）
-      --fog-density <f>                    # volume_fog 的雾密度，默认 0.018（范围 0.0–0.1）
+      --scheme classic|volume_fog           # 灯光方案（PR #8 固定注册表）
+      --scheme-params '{"fog_density":0.018}'   # 结构化方案参数（JSON）
+      --scheme-param fog_density=0.018      # 单参数形式，可重复
+      # ---- 以下为旧参数，保留兼容但已弃用（冲突时拒绝，不静默二选一）----
+      --lighting volume_fog|legacy          # legacy → classic；volume_fog → volume_fog
+      --fog-density <f>                     # → scheme_parameters.fog_density
       --resolve <源工程.blend> --script <主脚本.py>
       --scale 0.08 --min-polys 100 --auto-frame 0|1 --transparent 0|1 --hair-ref 0|1
       --glow-threshold <f> --glow-strength <f> --glow-size <f>
@@ -114,9 +118,13 @@ GLOW_STRENGTH = arg("--glow-strength")
 GLOW_SIZE = arg("--glow-size")
 GLOW_SMOOTHNESS = arg("--glow-smoothness")
 GLOW_QUALITY = arg("--glow-quality")
-# 灯光配置（2026-10-11 体积雾灯光增量）：volume_fog=7 灯体积雾方案；legacy=旧版 21+6 灯。
-LIGHTING = (arg("--lighting", "volume_fog") or "volume_fog").strip().lower()
-FOG_DENSITY = float(arg("--fog-density", "0.018"))
+# 灯光方案（PR #8）：新参数 --scheme / --scheme-param；旧 --lighting / --fog-density
+# 保留兼容并标记弃用。翻译与冲突判定统一交给固定注册表（schemes.registry），
+# 不在这里再实现一份 —— 否则两边规则迟早会漂移。
+SCHEME = arg("--scheme")
+SCHEME_PARAMS_RAW = arg("--scheme-params")     # 结构化 JSON（受信任任务文件路径更安全）
+LIGHTING = arg("--lighting")                    # 旧参数（弃用）
+FOG_DENSITY = arg("--fog-density")              # 旧参数（弃用）
 LOG_PATH = arg("--log", os.path.join(HERE, "一键渲染.stdout.log"))
 DONE = arg("--done", os.path.join(HERE, "一键渲染.done"))
 
@@ -141,10 +149,64 @@ if POLICY is None:
 POLICY = str(POLICY).strip().lower()
 if POLICY not in ("strict", "diagnostic"):
     raise SystemExit("--material-policy 只能是 strict 或 diagnostic，收到 %r" % POLICY)
-if LIGHTING not in ("volume_fog", "legacy"):
-    raise SystemExit("--lighting 必须是 volume_fog 或 legacy，收到 %r" % LIGHTING)
-if not (0.0 <= FOG_DENSITY <= 0.1):
-    raise SystemExit("--fog-density 必须在 0.0–0.1 之间，收到 %r" % FOG_DENSITY)
+
+# ---- 灯光方案归一（PR #8 规格 §四）------------------------------------------------
+# 新字段 --scheme / --scheme-param 优先；旧 --lighting / --fog-density 保留但弃用。
+# 冲突判定与翻译一律走固定注册表，保证与主脚本、后端适配层是同一份规则。
+sys.path.insert(0, HERE)
+from schemes import registry as SCHEME_REG          # noqa: E402
+from schemes.base import SchemeError as SchemeError  # noqa: E402
+
+_scheme_params = {}
+if SCHEME_PARAMS_RAW:
+    try:
+        _scheme_params = json.loads(SCHEME_PARAMS_RAW)
+    except ValueError as exc:
+        raise SystemExit("--scheme-params 不是合法 JSON：%s" % exc)
+    if not isinstance(_scheme_params, dict):
+        raise SystemExit("--scheme-params 必须是 JSON 对象")
+# --scheme-param key=value（可重复）。逐对读，避免调用方为了一个数字去拼 JSON。
+_i = 0
+while _i < len(sys.argv):
+    if sys.argv[_i] == "--scheme-param" and _i + 1 < len(sys.argv):
+        kv = sys.argv[_i + 1]
+        if "=" not in kv:
+            raise SystemExit("--scheme-param 需要 key=value 形式，收到 %r" % kv)
+        k, _, v = kv.partition("=")
+        _scheme_params[k.strip()] = v.strip()
+        _i += 2
+        continue
+    _i += 1
+
+try:
+    SCHEME_ID, SCHEME_DEPRECATION = SCHEME_REG.resolve_scheme_id(
+        scheme=SCHEME, lighting=LIGHTING
+    )
+    if FOG_DENSITY is not None:
+        # 旧 --fog-density：翻译成 scheme_parameters.fog_density，同样标弃用。
+        _fd = float(FOG_DENSITY)
+        if SCHEME_ID != "volume_fog":
+            raise SchemeError(
+                "RENDER_SCHEME_PARAM_INVALID",
+                "--fog-density 只适用于 volume_fog 方案，当前是 %s" % SCHEME_ID,
+            )
+        if "fog_density" in _scheme_params \
+                and float(_scheme_params["fog_density"]) != _fd:
+            raise SchemeError(
+                "RENDER_SCHEME_PARAM_INVALID",
+                "新旧雾密度冲突：scheme_params.fog_density=%r 与 --fog-density=%r"
+                % (_scheme_params["fog_density"], _fd),
+            )
+        _scheme_params.setdefault("fog_density", _fd)
+        SCHEME_DEPRECATION = (SCHEME_DEPRECATION + "；" if SCHEME_DEPRECATION else "") \
+            + "--fog-density 已弃用，请改用 --scheme-param fog_density=<f>"
+    # 归一化在驱动层就做一次：非法参数必须在起 Blender **之前**失败。
+    SCHEME_PARAMS = SCHEME_REG.normalize_parameters(SCHEME_ID, _scheme_params)
+except SchemeError as _exc:
+    raise SystemExit("灯光方案参数非法（%s）：%s" % (_exc.code, _exc.message))
+except ValueError as _exc:
+    raise SystemExit("--fog-density 必须是数字：%s" % _exc)
+
 if GLOW_QUALITY is not None:
     GLOW_QUALITY = str(GLOW_QUALITY).strip().capitalize()
     if GLOW_QUALITY not in ("High", "Medium", "Low"):
@@ -292,7 +354,8 @@ def main():
     log("blend    = %s" % BLEND)
     log("out      = %s" % OUT_DIR)
     log("mode     = %s" % MODE)
-    log("lighting = %s  fog_density=%s" % (LIGHTING, FOG_DENSITY))
+    log("scheme   = %s  params=%s"
+        % (SCHEME_ID, json.dumps(SCHEME_PARAMS, ensure_ascii=False)))
     log("policy   = %s%s" % (POLICY, "（由已弃用的 --strict 映射而来）" if _deprecated else ""))
     if _deprecated:
         log("  ⚠ --strict 已弃用：请改用 --material-policy strict|diagnostic。"
@@ -380,9 +443,25 @@ def main():
     os.environ["TOON_MATERIAL_POLICY"] = POLICY
     os.environ["TOON_RULES"] = RULES_PATH
     os.environ["TOON_ALLOW_LOW_CONFIDENCE"] = "1" if ALLOW_LOW_CONF else "0"
-    # 灯光配置同样走环境变量（主脚本顶部读取，exec 前必须设好）。
-    os.environ["TOON_LIGHTING_PROFILE"] = LIGHTING
-    os.environ["TOON_FOG_DENSITY"] = str(FOG_DENSITY)
+    # 灯光方案走环境变量（主脚本顶部读取，exec 前必须设好）。
+    # ★ 同时设旧变量：主脚本的冲突检测需要看到「新旧是否同时出现」。
+    #   TOON_FOG_DENSITY_EXPLICIT 标记这个雾密度是**显式给过**的，
+    #   而不是 os.environ.get 的缺省值 —— 否则无法区分「用户没给」与「用户给了默认值」。
+    os.environ["TOON_SCHEME"] = SCHEME_ID
+    os.environ["TOON_SCHEME_PARAMS"] = json.dumps(SCHEME_PARAMS, ensure_ascii=False)
+    if LIGHTING is not None:
+        os.environ["TOON_LIGHTING_PROFILE"] = str(LIGHTING)
+    elif "TOON_LIGHTING_PROFILE" in os.environ:
+        # 显式清掉，避免上一个任务的环境变量串到本次。
+        del os.environ["TOON_LIGHTING_PROFILE"]
+    if "fog_density" in SCHEME_PARAMS:
+        os.environ["TOON_FOG_DENSITY"] = str(SCHEME_PARAMS["fog_density"])
+        os.environ["TOON_FOG_DENSITY_EXPLICIT"] = "1" if FOG_DENSITY is not None else "0"
+    elif "TOON_FOG_DENSITY" in os.environ:
+        del os.environ["TOON_FOG_DENSITY"]
+        os.environ.pop("TOON_FOG_DENSITY_EXPLICIT", None)
+    if SCHEME_DEPRECATION:
+        log("  ⚠ %s" % SCHEME_DEPRECATION)
     # ★ F6：把映射目录贯穿到主脚本（它顶部读 TOON_MAPS_DIR），否则渲染侧只能去
     #        仓库内的 model_material_maps/ 找 —— 用户确认结果就永远到不了渲染侧。
     os.environ["TOON_MAPS_DIR"] = MAPS_DIR
@@ -424,9 +503,9 @@ def main():
         [("driver", os.path.abspath(__file__)), ("main_script", SCRIPT),
          ("rules", RULES_PATH)])
 
-    log("config: PIPELINE_MODE=%s POLICY=%s LIGHTING=%s AUTO_FRAME=%s "
+    log("config: PIPELINE_MODE=%s POLICY=%s SCHEME=%s AUTO_FRAME=%s "
         "FILM_TRANSPARENT=%s HAIRREF=%s"
-        % (MODE, POLICY, LIGHTING, AUTO_FRAME, TRANSPARENT, HAIR_REF))
+        % (MODE, POLICY, SCHEME_ID, AUTO_FRAME, TRANSPARENT, HAIR_REF))
 
     log("=== run one-click pipeline ===")
     ns["main"]()

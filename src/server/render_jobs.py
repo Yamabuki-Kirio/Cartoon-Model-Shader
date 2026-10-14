@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -40,6 +41,10 @@ class RenderJob:
     model_name: str
     settings: dict[str, Any]
     output_dir: str
+    #: 去重键（PR #8）：模型指纹 + 设置指纹的合成键。
+    #: ★ 与 ``fingerprint`` 分开存：指纹是「模型身份」，要去前端展示；
+    #:   去重键是内部判定，两者混用会让前端看到一个拼接过的怪字符串。
+    dedup_key: str = ""
     state: str = "queued"
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
@@ -125,12 +130,31 @@ class RenderJob:
             "error_code": self.error_code,
             "degraded": self.degraded,
             "cancel_reason": self.cancel_reason,
+            # ★ PR #8 规格 §五「任务响应」：任务详情要能展示使用的方案、版本与
+            #   实际生效参数。settings 里已存着它们 —— 这里取出来单独成块，
+            #   前端不必去猜 settings 的键名。
+            "scheme": self.scheme_block(),
         }
         if include_logs:
             out["logs"] = list(self.logs)
         if include_artifacts:
             out["artifacts"] = self.list_artifacts()
         return out
+
+    def scheme_block(self) -> dict[str, Any] | None:
+        """任务使用的渲染方案（id / version / 规范化参数）。
+
+        没有方案信息时返回 None（例如旧任务记录），前端据此显示「未记录方案」——
+        而不是显示一个看起来正常的空块。
+        """
+        sid = self.settings.get("scheme")
+        if not sid:
+            return None
+        return {
+            "id": str(sid),
+            "version": self.settings.get("scheme_version"),
+            "parameters": dict(self.settings.get("scheme_parameters") or {}),
+        }
 
     @property
     def retention_state(self) -> str:
@@ -204,9 +228,45 @@ class RenderJobManager:
             Path(history_index_path) if history_index_path else (self._output_root / ".jobs_index.json")
         )
 
-    # -- 建任务（同模型去重） -------------------------------------------
+    # -- 建任务（同模型 + 同设置去重） -----------------------------------
+    @staticmethod
+    def settings_key(settings: dict[str, Any]) -> str:
+        """设置指纹（PR #8 规格 §五）。
+
+        规格点名去重指纹必须包含：模型身份、方案 ID、方案版本、规范化方案参数、
+        画面模式、辉光参数、自动构图设置。
+
+        「模型身份」由调用方通过 ``fingerprint`` 传入（与 ``_by_fingerprint`` 并置），
+        这里负责把**其余**部分算成一个稳定字符串。
+
+        ★ 为什么必须包含方案：过去去重只看模型指纹，于是「同一个模型先出经典灯光、
+          再出体积雾」会被判定为同一任务而复用 —— 用户改了方案，却拿到上一版方案的
+          产物。不同方案**绝不**能复用同一任务。
+        排序的 key 保证字段顺序不影响结果；``scheme_parameters`` 已由注册表归一化
+        （缺省项也补齐），因此「没给参数」与「显式给了默认值」指纹一致 —— 这是对的，
+        两者跑出来的画面确实相同。
+        """
+        payload = {
+            "scheme": str(settings.get("scheme") or ""),
+            "scheme_version": settings.get("scheme_version"),
+            "scheme_parameters": dict(settings.get("scheme_parameters") or {}),
+            "mode": settings.get("mode"),
+            "glow": {
+                k: settings.get(k) for k in (
+                    "glow_threshold", "glow_strength", "glow_size",
+                    "glow_smoothness", "glow_quality",
+                )
+            },
+            "auto_frame": bool(settings.get("auto_frame", False)),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
     def active_for_fingerprint(self, fingerprint: str) -> RenderJob | None:
-        """返回该指纹下**仍在活动**的任务（用于在生成 ID/目录**之前**判断能否复用）。"""
+        """返回该去重键下**仍在活动**的任务（用于在生成 ID/目录**之前**判断能否复用）。
+
+        ★ 参数是「模型指纹 + 设置指纹」的合成键（见 :meth:`dedup_key`）——
+        只传模型指纹会让不同方案错误复用。
+        """
         existing = self._by_fingerprint.get(fingerprint)
         if not existing:
             return None
@@ -214,6 +274,11 @@ class RenderJobManager:
         if old is not None and not old.is_terminal:
             return old
         return None
+
+    @classmethod
+    def dedup_key(cls, fingerprint: str, settings: dict[str, Any]) -> str:
+        """模型身份 + 设置指纹的合成去重键。"""
+        return "%s|%s" % (fingerprint, cls.settings_key(settings))
 
     def create(
         self,
@@ -223,13 +288,20 @@ class RenderJobManager:
         model_name: str,
         settings: dict[str, Any],
         output_dir: str,
+        *,
+        dedup_key: str | None = None,
     ) -> tuple[RenderJob, bool]:
         """建任务，返回 ``(job, created)``。
 
-        ``created=False`` 表示同模型已有活跃任务，本次**复用**旧任务 —— 调用方据此
-        决定是否入队（绝不能对复用任务重复入队，否则同一任务会被执行两次）。
+        ``created=False`` 表示**同模型 + 同设置**已有活跃任务，本次复用旧任务 ——
+        调用方据此决定是否入队（绝不能对复用任务重复入队，否则同一任务会被执行两次）。
+
+        ``fingerprint`` 是模型身份（前端展示用）；``dedup_key`` 是含方案与参数的
+        合成键（PR #8）。不传 ``dedup_key`` 时退化为仅按模型指纹去重 ——
+        那只适用于「设置无关」的调用方，渲染路径一律显式传。
         """
-        existing = self._by_fingerprint.get(fingerprint)
+        key = dedup_key or fingerprint
+        existing = self._by_fingerprint.get(key)
         if existing:
             old = self._jobs.get(existing)
             if old is not None and not old.is_terminal:
@@ -241,9 +313,10 @@ class RenderJobManager:
             model_name=model_name,
             settings=settings,
             output_dir=output_dir,
+            dedup_key=key,
         )
         self._jobs[job_id] = job
-        self._by_fingerprint[fingerprint] = job_id
+        self._by_fingerprint[key] = job_id
         self._enforce_memory_cap()
         return job, True
 
@@ -263,8 +336,9 @@ class RenderJobManager:
         for job in evicted:
             self._append_history_index(job)
             self._jobs.pop(job.job_id, None)
-            if self._by_fingerprint.get(job.fingerprint) == job.job_id:
-                self._by_fingerprint.pop(job.fingerprint, None)
+            key = job.dedup_key or job.fingerprint
+            if self._by_fingerprint.get(key) == job.job_id:
+                self._by_fingerprint.pop(key, None)
 
     def _append_history_index(self, job: RenderJob) -> None:
         """把一条任务摘要追加到小型 JSON 索引（失败不影响主流程）。"""
@@ -447,8 +521,9 @@ class RenderJobManager:
     def purge(self, job_id: str) -> None:
         """从内存中移除任务记录（磁盘清理由调用方负责）。"""
         job = self._jobs.pop(job_id, None)
-        if job is not None and self._by_fingerprint.get(job.fingerprint) == job_id:
-            self._by_fingerprint.pop(job.fingerprint, None)
+        key = (job.dedup_key or job.fingerprint) if job is not None else None
+        if job is not None and self._by_fingerprint.get(key) == job_id:
+            self._by_fingerprint.pop(key, None)
         self._active.pop(job_id, None)
 
     def active_procs(self) -> list[Any]:

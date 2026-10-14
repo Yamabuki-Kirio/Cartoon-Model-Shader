@@ -76,6 +76,8 @@ export interface RenderJob {
   degraded: boolean;
   /** 取消原因（仅 cancelled 有值）。 */
   cancel_reason: string | null;
+  /** 使用的渲染方案（PR #8）：id / 版本 / 实际生效参数。旧任务记录可能为 null。 */
+  scheme: RenderJobScheme | null;
   logs?: string[] | null;
   artifacts?: RenderArtifact[] | null;
 }
@@ -155,9 +157,19 @@ export interface CreateRenderJobBody {
   model_id: string;
   mode: "faithful" | "enhanced";
   auto_frame: boolean;
-  /** 灯光配置（2026-10-11 体积雾灯光增量）：volume_fog=7 灯体积雾方案（默认）；legacy=旧版 21+6 复刻灯组。 */
+  /**
+   * 固定方案 id（PR #8）。不传 = 用服务端注册表的默认方案。
+   * ★ 前端**不硬编码**默认方案 —— 从 `GET /api/render/schemes` 的 `default` 取。
+   */
+  scheme?: string;
+  /**
+   * 方案参数。**只有服务端 schema 声明为可调的参数**才能放进来；
+   * 未知参数会被服务端拒绝（不是忽略）。
+   */
+  scheme_parameters?: Record<string, unknown>;
+  /** 【已弃用】灯光配置别名：legacy → classic。新代码请用 scheme。 */
   lighting?: "volume_fog" | "legacy";
-  /** 体积雾雾密度，范围 0.0–0.1，默认 0.018。 */
+  /** 【已弃用】体积雾雾密度别名。新代码请用 scheme_parameters.fog_density。 */
   fog_density?: number;
   /** 辉光微调（仅 enhanced 模式有意义；不传则用主脚本默认修复值 0.55/0.85/0.62/0.35/High）。 */
   glow_threshold?: number | null;
@@ -165,6 +177,61 @@ export interface CreateRenderJobBody {
   glow_size?: number | null;
   glow_smoothness?: number | null;
   glow_quality?: "High" | "Medium" | "Low" | null;
+}
+
+/**
+ * 方案参数定义（`GET /api/render/schemes`，PR #8 规格 §一）。
+ *
+ * **所有字段由服务端生成**，客户端不得自定义。前端只按 `kind` 渲染控件：
+ * `number` → 数字框 + 滑块；`boolean` → 开关；`enum` → 下拉框。
+ * `readonly=true` 的参数只展示值与说明，不参与提交。
+ */
+export interface RenderSchemeParam {
+  id: string;
+  kind: "number" | "boolean" | "enum";
+  label: string;
+  default: unknown;
+  description: string;
+  /** 只读项：展示但不提交（未经真实 Blender 标定的参数属此类）。 */
+  readonly: boolean;
+  minimum?: number;
+  maximum?: number;
+  step?: number;
+  choices?: string[];
+}
+
+/** 一个可选渲染方案（前端方案卡片的所有展示项都来自这里）。 */
+export interface RenderScheme {
+  id: string;
+  version: number;
+  label: string;
+  description: string;
+  /** 默认方案由服务端标记，前端不硬编码。 */
+  recommended: boolean;
+  /** 推荐用途。 */
+  recommended_use: string;
+  /** 是否包含体积雾。 */
+  has_volume_fog: boolean;
+  /** 性能影响提示。 */
+  performance_note: string;
+  /** 可调整参数数量（只读项不计）。 */
+  adjustable_count: number;
+  parameters: RenderSchemeParam[];
+}
+
+/** `GET /api/render/schemes` 响应（只读接口，不需要写令牌）。 */
+export interface RenderSchemesResponse {
+  ok: true;
+  /** 默认方案 id —— 由服务端决定。 */
+  default: string;
+  schemes: RenderScheme[];
+}
+
+/** 任务实际使用的方案（任务详情展示：方案 / 版本 / 实际生效参数）。 */
+export interface RenderJobScheme {
+  id: string;
+  version: number | null;
+  parameters: Record<string, unknown>;
 }
 
 /** 成功路径的 6 步（规格 §5）。 */

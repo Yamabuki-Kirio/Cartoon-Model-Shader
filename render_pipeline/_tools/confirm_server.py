@@ -414,14 +414,26 @@ def _run_one(tgt, out_dir, job, timeout=1800):
                 "error": "自检模式（--self-test）：未启动 Blender，仅验证流程状态机",
                 "pid_source": None, "log": None}
 
+    # ★ 灯光方案一律优先走 job 文件里的**结构化**字段（PR #8 规格 §四：
+    #   「更安全的实现是由任务文件传递结构化参数」）。旧 lighting / fog_density
+    #   仅在 job 文件是旧 schema（无 scheme 字段）时兜底，保证老任务仍能续跑。
+    _scheme = job.get("scheme")
+    if _scheme:
+        _scheme_args = ["--scheme", str(_scheme)]
+        _params = job.get("scheme_parameters")
+        if isinstance(_params, dict) and _params:
+            _scheme_args += ["--scheme-params",
+                             json.dumps(_params, ensure_ascii=False)]
+    else:
+        _scheme_args = ["--lighting", job.get("lighting") or "volume_fog",
+                        "--fog-density", str(job.get("fog_density")
+                                             if job.get("fog_density") is not None else 0.018)]
+
     argv = [job.get("blender") or BLENDER, "--background", "--factory-startup",
             "--python", job.get("driver") or DRIVER, "--",
             "--out", out_dir,
             "--mode", job.get("mode", "faithful"),
-            "--material-policy", "strict",
-            "--lighting", job.get("lighting") or "volume_fog",
-            "--fog-density", str(job.get("fog_density")
-                                 if job.get("fog_density") is not None else 0.018),
+            "--material-policy", "strict"] + _scheme_args + [
             "--script", job.get("script") or SCRIPT,
             "--auto-frame", str(int(job.get("auto_frame") or 0)),
             # ★ F6：把映射目录一路带到驱动与主脚本。以前这里只传 --material-map（且是在
@@ -657,13 +669,28 @@ def _derive_job_from_conf():
         p = (m["conf"].get("model") or {}).get("path")
         if p:
             tgs.append({"fingerprint": fp, "pmx": p, "label": m["file"]})
-    return {"schema": "toon-render-job/1", "auto_render": False,
+    return {"schema": "toon-render-job/2", "auto_render": False,
             "mode": "faithful", "auto_frame": 0,
+            # PR #8：方案字段显式写上（job schema 2）。独立打开确认页时没有方案上下文，
+            # 用注册表默认值，而不是在这里硬编码第二个「默认方案」字符串。
+            "scheme": _default_scheme_id(),
+            "scheme_parameters": {},
+            "lighting": "volume_fog", "fog_density": 0.018,
             "source_blend": SOURCE_BLEND, "blender": BLENDER,
             "driver": DRIVER, "script": SCRIPT,
             "out_root": os.path.join(RUNTIME_DIR, "output"),
             "maps_dir": STATE["maps_dir"],
             "targets": tgs}
+
+
+def _default_scheme_id():
+    """默认方案 id —— 从固定注册表取，不在工具里再写一份。"""
+    try:
+        from schemes import registry as _R   # noqa: PLC0415 - V31 已在 sys.path 里
+
+        return _R.DEFAULT_SCHEME_ID
+    except Exception:  # noqa: BLE001 - 工具不该因为注册表不可用而崩
+        return "volume_fog"
 
 
 # =====================================================================================

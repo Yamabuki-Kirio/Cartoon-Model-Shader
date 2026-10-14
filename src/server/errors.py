@@ -84,6 +84,16 @@ RENDER_DIAGNOSTIC = "RENDER_DIAGNOSTIC"
 #: 固定脚本终态为 REJECTED：渲染前被准入检查拦下，需完成材质确认后重试。（规格 §3.2）
 RENDER_REJECTED = "RENDER_REJECTED"
 
+# ---- PR #8 渲染方案（固定方案注册表） ------------------------------------
+#: 方案 id 不在固定注册表里（含任何试图提交脚本/模块路径的请求）。
+RENDER_SCHEME_INVALID = "RENDER_SCHEME_INVALID"
+#: 方案参数不合法：未知参数、只读参数、类型不符或越界。
+RENDER_SCHEME_PARAM_INVALID = "RENDER_SCHEME_PARAM_INVALID"
+#: 方案在场景里应用失败（Blender 侧）。
+RENDER_SCHEME_APPLY_FAILED = "RENDER_SCHEME_APPLY_FAILED"
+#: 渲染结束后的场景恢复未通过回读确认（场景可能仍带方案痕迹）。
+RENDER_SCHEME_RESTORE_FAILED = "RENDER_SCHEME_RESTORE_FAILED"
+
 #: 这些错误码在响应里把 ``details`` **平铺**到 error 顶层，
 #: 便于调用方直接读到 ``parameter`` / ``value`` / ``depends_on`` / ``allowed``。
 _FLATTEN_DETAILS_CODES = frozenset({INVALID_DEPENDENT_ENUM})
@@ -370,6 +380,27 @@ _ERROR_META: dict[str, tuple[int, bool, str]] = {
         200,
         True,
         "渲染前的材质准入检查未通过，尚未开始正式渲染。请按页面提示完成材质确认后重试。",
+    ),
+    RENDER_SCHEME_INVALID: (
+        400,
+        False,
+        "提交的渲染方案不在可用清单里。请刷新页面，从方案卡片中重新选择。",
+    ),
+    RENDER_SCHEME_PARAM_INVALID: (
+        400,
+        False,
+        "渲染方案参数不合法（未知参数、只读参数或取值越界）。请修正后重试。",
+    ),
+    RENDER_SCHEME_APPLY_FAILED: (
+        502,
+        True,
+        "灯光方案在 Blender 场景里应用失败。请查看任务日志后重试。",
+    ),
+    RENDER_SCHEME_RESTORE_FAILED: (
+        500,
+        True,
+        "渲染已结束，但场景恢复未通过回读确认，当前场景可能仍带方案痕迹。"
+        "建议在 Blender 里撤销（Ctrl+Z）或重新打开工程后再继续。",
     ),
 }
 

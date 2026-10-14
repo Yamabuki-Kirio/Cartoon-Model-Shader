@@ -24,14 +24,24 @@ from . import errors, render_contract
 from .file_lock import FileLockHolder, LockBusy
 from .proc_cleanup import WindowsJobObject, terminate_job_processes
 from .render_jobs import RenderJobManager
+from .scheme_bridge import (
+    DEFAULT_SCHEME_ID,
+    normalize_scheme_parameters,
+    resolve_scheme_request,
+    scheme_public_list,
+    scheme_to_legacy_lighting,
+    scheme_version,
+)
 
 logger = logging.getLogger("toon_tuner")
 
 CONFIRM_PORT = 8770
 _VALID_MODES = ("faithful", "enhanced")
-_VALID_LIGHTING = ("volume_fog", "legacy")
 _VALID_GLOW_QUALITY = ("High", "Medium", "Low")
-_WHITELIST = {"mode", "auto_frame", "lighting", "fog_density",
+#: 渲染设置白名单（PR #8）：新增 scheme / scheme_parameters；
+#: lighting / fog_density 保留为**弃用别名**，不删除（规格 §四）。
+_WHITELIST = {"mode", "auto_frame", "scheme", "scheme_parameters",
+              "lighting", "fog_density",
               "glow_threshold", "glow_strength", "glow_size",
               "glow_smoothness", "glow_quality"}
 #: 设置键 → 驱动 CLI 开关（辉光增量；仅 enhanced 模式有意义）。
@@ -47,6 +57,22 @@ _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
 #: 入口脚本（开始渲染.py）驱动的二选一开关：.blend 直开，其余按 PMX 导入。
 _BLEND_SUFFIX = ".blend"
+
+
+def _quote_scheme_id(scheme_id: str) -> str:
+    """方案 id 只允许注册表里那两个 —— 传进命令行前再挡一次。
+
+    规格要求「固定入口」：即便上游被改坏，也不该有非方案 id 的字符串流进命令行。
+    这里不 import 注册表（保持本模块不依赖渲染侧），改用一张显式小表。
+    """
+    sid = str(scheme_id).strip()
+    if sid not in ("classic", "volume_fog"):
+        raise errors.ToonTunerError(
+            "RENDER_SCHEME_INVALID",
+            f"非法渲染方案 id：{sid!r}",
+            retryable=False,
+        )
+    return sid
 
 
 def _sha256_file(path: str | Path) -> str:
@@ -77,38 +103,54 @@ def _deliverable_images(job: Any) -> list[dict[str, Any]]:
 
 
 def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    """严格白名单：mode / auto_frame + 灯光辉光增量参数。多余键一律拒绝。"""
+    """严格白名单 + 方案校验（规格 §五「校验顺序」）。
+
+    顺序与规格一致：
+
+    1. （会话令牌：由路由依赖 ``require_token`` 在前一步完成）
+    2. （模型 ID：由 ``create_job`` 的注册表解析完成）
+    3. 方案 ID
+    4. 方案允许的参数集合
+    5. 参数类型和范围
+    6. 合成模式
+    7. 辉光参数
+    8. （环境诊断状态：由路由在创建前检查）
+
+    **未知参数一律拒绝，不能忽略**；新旧灯光字段冲突同样拒绝。
+    """
     extra = set(settings) - _WHITELIST
     if extra:
         raise errors.ToonTunerError(
             errors.PARAM_INVALID, f"渲染设置含未知字段：{sorted(extra)}", retryable=False
         )
+
+    # ---- 3–5 方案 id + 参数集合 + 类型范围（统一由固定注册表判定）----
+    scheme_id, scheme_params, deprecation = resolve_scheme_request(settings)
+
+    # ---- 6 合成模式 ----
     mode = settings.get("mode", "faithful")
     if mode not in _VALID_MODES:
         raise errors.ToonTunerError(
             errors.PARAM_INVALID, f"mode 必须是 {_VALID_MODES}，收到 {mode!r}", retryable=False
         )
     auto_frame = bool(settings.get("auto_frame", False))
-    lighting = settings.get("lighting", "volume_fog")
-    if lighting not in _VALID_LIGHTING:
-        raise errors.ToonTunerError(
-            errors.PARAM_INVALID,
-            f"lighting 必须是 {_VALID_LIGHTING}，收到 {lighting!r}", retryable=False,
-        )
-    try:
-        fog_density = float(settings.get("fog_density", 0.018))
-    except (TypeError, ValueError):
-        raise errors.ToonTunerError(
-            errors.PARAM_INVALID,
-            f"fog_density 必须是数字，收到 {settings.get('fog_density')!r}", retryable=False,
-        )
-    if not (0.0 <= fog_density <= 0.1):
-        raise errors.ToonTunerError(
-            errors.PARAM_INVALID,
-            f"fog_density 必须在 0.0–0.1 之间，收到 {fog_density!r}", retryable=False,
-        )
-    out: dict[str, Any] = {"mode": mode, "auto_frame": auto_frame,
-                           "lighting": lighting, "fog_density": fog_density}
+
+    # ---- 7 辉光参数 ----
+    out: dict[str, Any] = {
+        "mode": mode,
+        "auto_frame": auto_frame,
+        "scheme": scheme_id,
+        # ★ 方案版本进任务设置，因此也进去重指纹（规格 §五）。
+        #   改灯组数值但忘了升版本时，这里至少能让指纹跟着注册表走。
+        "scheme_version": scheme_version(scheme_id),
+        "scheme_parameters": scheme_params,
+        # ★ 兼容写出：job 文件里同时带旧字段，既有排查工具仍能读。
+        #   值由方案决定，不参与判定。
+        "lighting": scheme_to_legacy_lighting(scheme_id),
+        "fog_density": scheme_params.get("fog_density", 0.018),
+    }
+    if deprecation:
+        out["deprecation"] = deprecation
     for key in ("glow_threshold", "glow_strength", "glow_size", "glow_smoothness"):
         v = settings.get(key)
         if v is None:
@@ -333,7 +375,11 @@ class RenderPipelineService:
             )
         # 先查活跃任务：能复用就**不生成新 ID、也不创建空目录**（否则并发/重复请求
         # 会留下一堆垃圾目录）。
-        existing = self._manager.active_for_fingerprint(fingerprint)
+        # ★ PR #8：去重键必须含「方案 id + 版本 + 归一化参数 + 画面模式 + 辉光 +
+        #   自动构图」（规格 §五）。只按模型指纹去重会让「同一模型换个方案」被错误
+        #   复用成同一个任务 —— 用户改了方案却拿到上一版方案的产物。
+        dedup = self._manager.dedup_key(fingerprint, settings)
+        existing = self._manager.active_for_fingerprint(dedup)
         if existing is not None:
             return existing, False
 
@@ -349,6 +395,7 @@ class RenderPipelineService:
             model_name=name,
             settings=settings,
             output_dir=out_dir,
+            dedup_key=dedup,
         )
         self._registry.remember_last_job(model_id, job.job_id)
         return job, created
@@ -358,7 +405,7 @@ class RenderPipelineService:
         job = self._manager.get(job_id)
         if job is None:
             raise errors.ToonTunerError(errors.JOB_NOT_FOUND, f"任务不存在：{job_id}")
-        fp = job.fingerprint
+        fp = job.dedup_key or job.fingerprint
         lock_path = self._lock_path(fp)
         try:
             holder = await asyncio.to_thread(
@@ -419,6 +466,11 @@ class RenderPipelineService:
                 errors.MODEL_NOT_FOUND, f"模型已不在注册表中：{job.model_id}", retryable=False
             )
         kind_blend = Path(model_path).suffix.lower() == _BLEND_SUFFIX
+        # ★ PR #8 规格 §四：更安全的做法是由任务文件传递结构化参数、命令行只传受信任
+        #   任务文件路径。本层已把方案参数归一化并**序列化成 JSON 一个参数**传下去，
+        #   而不是让调用方拼命令行片段 —— 前端永远碰不到这里的任何字符串。
+        scheme_id = str(job.settings.get("scheme") or DEFAULT_SCHEME_ID)
+        scheme_params = job.settings.get("scheme_parameters") or {}
         cmd: list[str] = [
             sys.executable,
             str(self._fixed),
@@ -428,10 +480,10 @@ class RenderPipelineService:
             out_dir,
             "--mode",
             str(job.settings.get("mode", "faithful")),
-            "--lighting",
-            str(job.settings.get("lighting", "volume_fog")),
-            "--fog-density",
-            str(job.settings.get("fog_density", 0.018)),
+            "--scheme",
+            _quote_scheme_id(scheme_id),
+            "--scheme-params",
+            json.dumps(dict(scheme_params), ensure_ascii=False),
             "--auto-frame",
             "1" if job.settings.get("auto_frame") else "0",
             "--port",

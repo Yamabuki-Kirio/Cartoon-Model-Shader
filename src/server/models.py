@@ -485,9 +485,18 @@ class RenderSettingsRequest(BaseModel):
     """提交渲染任务：只接受 opaque model_id + 白名单设置；绝不接受路径/脚本/命令。
 
     ``mode`` 仅 faithful | enhanced；``auto_frame`` 是否自动构图。
-    ``lighting`` / ``fog_density`` / ``glow_*`` 是 2026-10-11 体积雾灯光与辉光修复增量
-    （自 Z:/B-Model/渲染方法复刻 新版脚本移植）：辉光项只在 enhanced 模式有意义，
-    不传则用主脚本默认修复值（阈值 0.55 / 平滑度 0.35 / 强度 0.85 / 尺寸 0.62 / High）。
+
+    **PR #8 渲染方案系统**：
+
+    * ``scheme`` —— 固定方案 id（``classic`` | ``volume_fog``），由服务端注册表校验；
+    * ``scheme_parameters`` —— 方案参数对象。**参数定义完全由服务端生成**，
+      客户端只能提交「id → 值」，提交不了参数定义本身；未知参数一律拒绝。
+    * ``lighting`` / ``fog_density`` —— **已弃用别名**，保留兼容
+      （``legacy → classic``、``fog_density → scheme_parameters.fog_density``）。
+      新旧字段同时出现且冲突时拒绝，不静默二选一。
+
+    辉光项只在 enhanced 模式有意义，不传则用主脚本默认修复值
+    （阈值 0.55 / 平滑度 0.35 / 强度 0.85 / 尺寸 0.62 / High）。
     其余字段一律 422 拒绝。
     """
 
@@ -496,8 +505,15 @@ class RenderSettingsRequest(BaseModel):
     model_id: str
     mode: Literal["faithful", "enhanced"] = "faithful"
     auto_frame: bool = False
-    lighting: Literal["volume_fog", "legacy"] = "volume_fog"
-    fog_density: float = Field(default=0.018, ge=0.0, le=0.1)
+    #: 固定方案 id。None = 用注册表默认方案（服务端决定，前端不硬编码）。
+    scheme: Literal["classic", "volume_fog"] | None = None
+    #: 方案参数。类型故意宽（dict）—— 具体校验交给固定注册表，
+    #: 因为「哪些参数合法」是方案自己的知识，不该在请求模型里复制一份。
+    scheme_parameters: dict[str, Any] | None = None
+    #: 【已弃用】灯光配置别名。
+    lighting: Literal["volume_fog", "legacy"] | None = None
+    #: 【已弃用】体积雾雾密度别名。
+    fog_density: float | None = Field(default=None, ge=0.0, le=0.1)
     glow_threshold: float | None = Field(default=None, ge=0.0, le=10.0)
     glow_strength: float | None = Field(default=None, ge=0.0, le=10.0)
     glow_size: float | None = Field(default=None, ge=0.0, le=10.0)
@@ -544,8 +560,26 @@ class RenderJobResponse(BaseModel):
     degraded: bool = False
     #: 取消原因（仅 cancelled 有值；供结果区说明为什么被取消）。
     cancel_reason: str | None = None
+    #: 使用的渲染方案（PR #8 规格 §五「任务响应」）：id / version / 规范化参数。
+    #: 任务是**临时**应用方案，任务记录里带上方案身份，产物才能自证来源。
+    scheme: dict[str, Any] | None = None
+    #: 方案参数在当前请求里是否被弃用别名替代（有值则前端提示迁移）。
+    scheme_deprecation: str | None = None
     logs: list[str] | None = None
     artifacts: list[dict[str, Any]] | None = None
+
+
+class RenderSchemeListResponse(BaseModel):
+    """``GET /api/render/schemes``（PR #8 规格 §五）。
+
+    **只读接口，不需要写令牌。** 响应**绝不**包含本机路径、脚本路径、
+    Python 模块路径或任何可执行命令 —— 方案描述由服务端渲染生成，
+    前端拿到的只有 id / 版本 / 展示文案与参数定义。
+    """
+
+    ok: Literal[True] = True
+    default: str
+    schemes: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class RenderMaterialsResponse(BaseModel):
