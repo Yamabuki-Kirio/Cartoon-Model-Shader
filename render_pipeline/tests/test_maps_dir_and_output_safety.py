@@ -18,6 +18,7 @@ F6 / F7 回归：侧车映射目录贯穿 + 输出目录不可用的结构化错
 import importlib.util
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -122,7 +123,13 @@ class TestMapsDirIsThreadedThrough:
     def test_entry_passes_maps_dir_to_driver(self):
         src = _text(ENTRY)
         assert '"--maps-dir", maps_dir or default_maps_dir()' in src
-        assert "def render(pmx, out_dir, mode, auto_frame, maps_dir=None)" in src
+        # render() 的首个形参曾叫 pmx，后按「模型」语义改名为 model（同一位置参数）；
+        # 签名也因新增参数变成多行。这里只守住 maps_dir 仍在前 5 个形参里，
+        # 不锁死首个形参的名字 —— 锁死形参名正是这条用例当初变红的根因。
+        m = re.search(
+            r"def render\((\w+), out_dir, mode, auto_frame, maps_dir=None", src
+        )
+        assert m, "render() 签名应保留 (model, out_dir, mode, auto_frame, maps_dir=None)"
 
     def test_entry_passes_maps_dir_to_confirm_server(self):
         assert '"--maps-dir", maps_dir or default_maps_dir()' in _text(ENTRY)
