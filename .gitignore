@@ -55,10 +55,13 @@ render_pipeline/model_material_maps/*.json
 *.render-result.json
 *.render.lock
 
-# ===== 编辑器 / IDE =====
+# ===== 编辑器 / IDE / 本地 AI 助手缓存 =====
 .vscode/
 .idea/
 *.swp
+# `codebuddy` 之类的助手会把会话记忆写在工程根下，里面的绝对路径属于本机信息，
+# 与 `.pytest_cache/` 同一性质：既不是源码也不是配置，不该有机会被 `git add .` 带进去。
+.codebuddy/
 
 # ===== 密钥与本地配置（绝不入库）=====
 .env

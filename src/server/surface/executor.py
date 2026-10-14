@@ -697,7 +697,14 @@ def _literal(value: Any, binding: binding_module.Binding) -> str:
         binding_module.assert_no_client_path(value)
         return repr(str(value))
 
-    if binding.object_type == "COLOR_RAMP" and binding.field == "elements":
+    # 色带整体替换：两个色带族都要走同一套校验与归一化。
+    # 漏掉材质图（PR #7）那一种的后果很隐蔽 —— 已归一化的 `[{"position":…,"color":[…]}]`
+    # 会落到下面的列表分支，被 `_normalise_item` 当成「复合取值里的 dict」而拒绝，
+    # 表现为**材质图色带根本写不进去**，而错误信息完全看不出是少了这一条。
+    if binding.field == "elements" and binding.object_type in (
+        "COLOR_RAMP",
+        "MATERIAL_GRAPH_RAMP",
+    ):
         return repr(normalise_ramp_elements(value))
 
     if isinstance(value, bool):

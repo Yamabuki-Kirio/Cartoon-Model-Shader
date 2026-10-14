@@ -687,8 +687,20 @@ export function graphRampFixture(
       position: { value: position, baseline: position, minimum: 0, maximum: 1, step: 0.001 },
       color: { value: color, baseline: color },
     })),
-    interpolation,
-    element_count: pairs.length,
+    // `interpolation` 与 `element_count` 是 `surface.schema` 的**复合形状**，
+    // 不是裸标量 —— 夹具必须同形，否则「解析层少读一层」这类缺陷会被夹具抹平。
+    interpolation: { value: interpolation, baseline: interpolation, options: [] },
+    element_count: {
+      value: pairs.length,
+      baseline: pairs.length,
+      structural: true,
+      cost: "L3",
+      supported: true,
+      editable: false,
+      readonly_reason: "rollback_unavailable",
+      minimum: 2,
+      maximum: 32,
+    },
     binding: { object_type: "MATERIAL_GRAPH_RAMP", field: "elements" },
   });
 }

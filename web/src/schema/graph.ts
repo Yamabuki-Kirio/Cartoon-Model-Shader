@@ -372,6 +372,27 @@ function baseOf(
   };
 }
 
+/**
+ * `to_spec` 里的 `interpolation` 与 `element_count` 是 `surface.schema` 的**复合形状**
+ * （`{value, baseline, …}`），不是裸标量 —— 它们直接取自 `RampNode.to_public()`。
+ * 这里两种形状都认：标量形态用于兼容更早/更简单的实现，读不懂就回落到当前值。
+ */
+function interpolationOf(raw: unknown): { value: string; baseline: string | null } {
+  if (typeof raw === "string") {
+    return { value: raw || "LINEAR", baseline: raw || null };
+  }
+  const record = asRecord(raw);
+  const value = asString(record["value"]) || "LINEAR";
+  return { value, baseline: asString(record["baseline"]) || value };
+}
+
+function elementCountOf(raw: unknown, fallback: number): number {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return raw;
+  }
+  return asFiniteNumber(asRecord(raw)["value"]) ?? fallback;
+}
+
 function rampNodeOf(
   spec: GraphParamPublic,
   base: NodeBase,
@@ -395,16 +416,17 @@ function rampNodeOf(
       },
     };
   });
-  const count = asFiniteNumber(spec.element_count) ?? parsed.length;
+  const interpolation = interpolationOf(spec.interpolation);
+  const count = elementCountOf(spec.element_count, parsed.length);
   return {
     ...base,
     kind: "ramp",
     elements: parsed,
     interpolation: {
-      value: asString(spec.interpolation) || "LINEAR",
-      baseline: asString(spec.interpolation) || null,
-      // 后端**不**下发可选插值清单（与 Cel 的受管组不同），因此这里如实给空数组；
-      // 界面回落成「当前值」单选项，而不是编一份清单出来。
+      value: interpolation.value,
+      baseline: interpolation.baseline,
+      // 后端**不**下发可选插值清单（`_ramp_node` 不填 `interpolation_options`），
+      // 因此这里如实给空数组；界面回落成只读展示，而不是编一份 Blender 枚举出来。
       options: [],
     },
     element_count: {

@@ -1,4 +1,4 @@
-﻿"""材质图执行（提交 3）：binding 白名单、执行顺序、失败语义与保存接入。
+"""材质图执行（提交 3）：binding 白名单、执行顺序、失败语义与保存接入。
 
 钉住规格「提交 3」验收条目：
 * 每种 Binding 的成功写入与回读；
@@ -20,6 +20,7 @@ import pytest
 from src.server import errors, surface_probe
 from src.server.material_graph import schema as mg_schema
 from src.server.material_graph.execution import (
+    GraphParam,
     baseline_ops,
     baseline_values,
     build_param_index,
@@ -199,16 +200,47 @@ def test_non_finite_rejected() -> None:
 
 
 def test_out_of_range_rejected() -> None:
-    """值域越界（例如混��系数不在 0–1）一律拒绝。"""
+    """值域越界一律拒绝 —— 用**显式声明了值域**的参数验证这条闸门本身。
+
+    为什么不依赖 fixture 里现成的参数：``_bounds`` 只给 ``mix`` 与 ``hue_saturation``
+    两个语义声明值域，而这两个语义在 ``classify`` 里恒为 ``inferred`` ⇒ 一律降级成
+    只读占位，因此**当前没有任何可写参数带值域**。旧写法在这种情况下直接 skip，
+    于是这条闸门实际上从来没被执行过。这里自己造一个带值域的参数，把闸门钉死。
+    """
     service = capture(build_two_materials())
     index = _index_of(service)
-    bounded = [p for p in index.params.values() if p.maximum is not None]
-    if not bounded:
-        pytest.skip("当前 fixture 未生成带值域的参数")
-    param = bounded[0]
-    with pytest.raises(errors.ToonTunerError) as excinfo:
-        validate_graph_draft({param.param_id: param.maximum + 10.0}, index)
-    assert excinfo.value.code == errors.PARAM_INVALID
+    template = next(p for p in index.params.values() if p.kind == "float")
+    index.params[template.param_id] = GraphParam(
+        param_id=template.param_id,
+        binding=template.binding,
+        kind="float",
+        identity=template.identity,
+        minimum=0.0,
+        maximum=1.0,
+        baseline_value=template.baseline_value,
+    )
+
+    with pytest.raises(errors.ToonTunerError) as above:
+        validate_graph_draft({template.param_id: 1.5}, index)
+    assert above.value.code == errors.PARAM_INVALID
+    with pytest.raises(errors.ToonTunerError) as below:
+        validate_graph_draft({template.param_id: -0.5}, index)
+    assert below.value.code == errors.PARAM_INVALID
+    # 边界内正常通过（越界拒绝不能变成「带值域就一律拒绝」）
+    assert validate_graph_draft({template.param_id: 0.5}, index)
+
+
+def test_writable_material_graph_params_declare_no_range() -> None:
+    """现状：材质图**可写**参数一律不下发值域（已知限制，见 docs/技术设计.md）。
+
+    这条用例把现状钉住而不是假装它不存在：一旦后端开始给可写参数下发值域，
+    它会红，提醒把 HTTP 层的越界断言补上、并把前端滑块打开。
+    """
+    service = capture(build_two_materials())
+    index = _index_of(service)
+    writable = [p for p in index.params.values() if p.kind in ("float", "int")]
+    assert writable, "夹具应当至少有一个可写标量"
+    assert all(p.minimum is None and p.maximum is None for p in writable)
 
 
 def test_ramp_element_count_change_is_structure_change() -> None:

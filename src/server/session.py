@@ -243,7 +243,13 @@ def _restore_suffix(restore: dict[str, Any]) -> str:
     （例如基线已丢失）—— 那才是真正的「未能恢复」，必须明说。
     """
     if restore.get("verified"):
-        return "已恢复到提交前的基线（L0 与 Cel 均回读校验通过）。"
+        text = "已恢复到提交前的基线（L0 与 Cel 均回读校验通过"
+        # 材质图（PR #7）是**第三段独立写入**：它也被恢复了就必须说出来，
+        # 否则用户看到「L0 与 Cel 均通过」会以为材质节点没被这次失败碰过。
+        material = restore.get("material_graph") or {}
+        if material.get("attempted"):
+            text += "；材质图亦已回读校验通过"
+        return text + "）。"
     if restore.get("attempted"):
         return (
             "**恢复基线后回读不一致或恢复失败**（rollback.code = "
